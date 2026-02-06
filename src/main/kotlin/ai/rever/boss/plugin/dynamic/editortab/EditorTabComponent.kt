@@ -113,7 +113,7 @@ class EditorTabComponent(
     override fun Content() {
         // Get tab update provider for this tab
         val tabUpdateProvider = remember(config.id) {
-            tabUpdateProviderFactory?.getProvider(config.id)
+            tabUpdateProviderFactory?.createProvider(config.id, CodeEditorTabType.typeId)
         }
 
         // Collect states

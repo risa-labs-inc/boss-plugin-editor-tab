@@ -43,10 +43,10 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         }
 
         // Register as a main panel TAB TYPE
-        context.tabRegistry.registerTabType(CodeEditorTabType) { tabInfo, ctx ->
+        context.tabRegistry.registerTabType(CodeEditorTabType) { config, componentContext ->
             EditorTabComponent(
-                ctx = ctx,
-                tabInfo = tabInfo,
+                ctx = componentContext,
+                config = config,
                 editorContentProvider = editorContentProvider,
                 tabUpdateProviderFactory = tabUpdateProviderFactory
             )
