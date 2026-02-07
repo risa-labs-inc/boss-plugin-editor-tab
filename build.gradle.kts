@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.1"
+version = "1.0.2"
 
 java {
     toolchain {
@@ -44,7 +44,7 @@ dependencies {
         implementation(files("$bossConsolePath/bosseditor/build/libs/bosseditor-desktop.jar"))
     } else {
         // Plugin API from Maven Central (for release)
-        implementation("com.risaboss:plugin-api-desktop:1.0.11")
+        implementation("com.risaboss:plugin-api-desktop:1.0.12")
         // BossEditor - code editor library from Maven Central
         implementation("com.risaboss:bosseditor-compose-desktop:1.0.1")
     }
