@@ -2,7 +2,6 @@ package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
-import ai.rever.boss.plugin.tab.codeeditor.CodeEditorTabType
 
 /**
  * Code Editor Tab dynamic plugin - Loaded from external JAR.
@@ -34,28 +33,15 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     override fun register(context: PluginContext) {
         pluginContext = context
 
-        val editorContentProvider = context.editorContentProvider
-        val tabUpdateProviderFactory = context.tabUpdateProviderFactory
-
-        if (editorContentProvider == null) {
-            // Editor content provider not available - cannot register
-            return
-        }
-
-        // Register as a main panel TAB TYPE
-        context.tabRegistry.registerTabType(CodeEditorTabType) { config, componentContext ->
-            EditorTabComponent(
-                ctx = componentContext,
-                config = config,
-                editorContentProvider = editorContentProvider,
-                tabUpdateProviderFactory = tabUpdateProviderFactory
-            )
+        // Register as a main panel TAB TYPE (not a sidebar panel!)
+        context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
+            EditorTabComponent(ctx, tabInfo, context)
         }
     }
 
     override fun dispose() {
         // Unregister tab type when plugin is unloaded
-        pluginContext?.tabRegistry?.unregisterTabType(CodeEditorTabType.typeId)
+        pluginContext?.tabRegistry?.unregisterTabType(EditorTabType.typeId)
         pluginContext = null
     }
 }
