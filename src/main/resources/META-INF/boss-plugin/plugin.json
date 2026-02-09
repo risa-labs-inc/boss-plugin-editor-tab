@@ -7,6 +7,9 @@
   "minBossVersion": "8.16.27",
   "mainClass": "ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin",
   "type": "tab",
+  "systemPlugin": true,
+  "loadPriority": 10,
+  "canUnload": false,
   "tab": {
     "typeId": "editor",
     "displayName": "Code Editor"
