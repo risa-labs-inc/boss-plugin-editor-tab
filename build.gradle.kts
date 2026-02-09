@@ -36,7 +36,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.18.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.20.jar"))
         // BossEditor - local development version
         compileOnly(files("$bossConsolePath/bosseditor/build/libs/bosseditor-desktop.jar"))
     } else {

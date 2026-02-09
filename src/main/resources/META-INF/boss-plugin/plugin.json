@@ -3,7 +3,7 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.editortab",
   "displayName": "Code Editor Tab",
   "version": "1.0.4",
-  "apiVersion": "1.0.18",
+  "apiVersion": "1.0.20",
   "minBossVersion": "8.16.30",
   "mainClass": "ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin",
   "type": "tab",
