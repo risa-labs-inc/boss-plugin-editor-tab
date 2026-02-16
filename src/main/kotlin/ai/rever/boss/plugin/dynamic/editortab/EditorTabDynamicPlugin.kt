@@ -23,7 +23,7 @@ import ai.rever.boss.plugin.api.PluginContext
 class EditorTabDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.editortab"
     override val displayName: String = "Code Editor Tab"
-    override val version: String = "1.0.0"
+    override val version: String = "1.0.4"
     override val description: String = "Code editor tab with syntax highlighting, code folding, and run gutter icons"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-editor-tab"
