@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.7"
+version = "1.0.8"
 
 java {
     toolchain {
@@ -37,13 +37,13 @@ dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
         compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.24.jar"))
-        // BossEditor - local development version
-        compileOnly(files("$bossConsolePath/bosseditor/build/libs/bosseditor-desktop.jar"))
+        // BossEditor - use Maven Central (matches BossConsole's version)
+        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
         // BossEditor - code editor library from Maven Central
-        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.1")
+        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
     }
 
     // Compose dependencies
