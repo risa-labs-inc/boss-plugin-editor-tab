@@ -4,6 +4,8 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.TabComponentWithUI
 import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.api.TabTypeInfo
+import ai.rever.boss.plugin.ui.BossTheme
+import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.bosseditor.compose.BossEditor
 import ai.rever.bosseditor.features.UsagesPopup
 import ai.rever.bosseditor.features.UsagesPopupState
@@ -323,6 +325,13 @@ class EditorTabComponent(
 
     @Composable
     override fun Content() {
+        BossTheme {
+            EditorTabContent()
+        }
+    }
+
+    @Composable
+    private fun EditorTabContent() {
         val scope = rememberCoroutineScope()
 
         // Reactive settings - updates automatically when settings file changes (like bundled editor)
@@ -342,7 +351,7 @@ class EditorTabComponent(
             ) {
                 Text(
                     text = loadError ?: "",
-                    color = Color(0xFFFF6B6B)
+                    color = BossThemeColors.ErrorColor
                 )
             }
             return
@@ -1426,7 +1435,7 @@ private fun EditorStatusBar(
             if (error != null) {
                 Text(
                     text = error,
-                    color = Color(0xFF_FF6B6B),
+                    color = BossThemeColors.ErrorColor,
                     fontSize = 11.sp
                 )
             }

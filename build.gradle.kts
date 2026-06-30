@@ -36,7 +36,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.24.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.47.jar"))
         // BossEditor - use Maven Central (matches BossConsole's version)
         compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
     } else {
