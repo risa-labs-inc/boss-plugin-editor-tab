@@ -38,12 +38,12 @@ dependencies {
         // Local development: use boss-plugin-api JAR from sibling repo
         compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.47.jar"))
         // BossEditor - use Maven Central (matches BossConsole's version)
-        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
+        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.4")
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
         // BossEditor - code editor library from Maven Central
-        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
+        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.4")
     }
 
     // Compose dependencies
