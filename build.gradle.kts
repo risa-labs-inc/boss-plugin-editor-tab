@@ -93,9 +93,12 @@ dependencies {
 // The default :jar task would otherwise write build/libs/boss-plugin-editor-tab-<version>.jar —
 // the exact archive buildPluginJar produces — and whichever task runs last wins.
 // A thin-jar clobber ships a plugin missing all of ai.rever.bosseditor + the
-// bundled compiler (this exact failure bit fluck-browser). Classify it away.
+// bundled compiler (this exact failure bit fluck-browser). Disabled rather than
+// classified as "-thin": the release workflow uploads build/libs/*.jar and both
+// the host's GitHub-asset regex and the plugin store's server-side asset pick
+// would happily grab a thin jar if one were attached to the release.
 tasks.named<Jar>("jar") {
-    archiveClassifier.set("thin")
+    enabled = false
 }
 
 // Task to build plugin JAR with compiled classes only
