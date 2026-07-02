@@ -15,7 +15,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // and owns the PSI stack (kotlin-compiler-embeddable is bundled).
 // 1.3.0: contributes MCP tools (editor_read_file/write_file/detect_language)
 // via boss-plugin-api 1.0.51's McpToolProvider, surfaced on the `boss` MCP server.
-version = "1.4.0"
+version = "1.4.1"
 
 java {
     toolchain {
