@@ -5,9 +5,6 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.bosseditor.psi.PSIBootstrap
 import ai.rever.bosseditor.psi.PSIThreadBridge
 import ai.rever.bosseditor.psi.ProjectIndexer
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 /**
  * Code Editor Tab dynamic plugin - Loaded from external JAR.
@@ -29,7 +26,7 @@ import kotlinx.coroutines.launch
 class EditorTabDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.editortab"
     override val displayName: String = "Code Editor Tab"
-    override val version: String = "1.0.4"
+    override val version: String = "1.4.0"
     override val description: String = "Code editor tab with syntax highlighting, code folding, and run gutter icons"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-editor-tab"
@@ -62,10 +59,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
         // Warm up the bundled PSI stack off the UI thread. The host did this at
         // startup while BossEditor was on its classpath; the plugin owns it now.
-        // Semantic analysis skips gracefully until initialization completes.
-        CoroutineScope(Dispatchers.Default).launch {
-            runCatching { PSIBootstrap.initialize() }
-        }
+        // Single-flight: semantic analysis awaits the same deferred, so files
+        // opened while the warm-up runs still get colors when it completes.
+        PluginSemanticTokenProvider.warmUp()
     }
 
     override fun dispose() {

@@ -10,6 +10,7 @@ import ai.rever.bosseditor.psi.PSIThreadBridge
 import ai.rever.bosseditor.psi.SemanticCache
 import ai.rever.bosseditor.psi.SemanticType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import org.jetbrains.kotlin.psi.KtTreeVisitorVoid
 import org.jetbrains.kotlin.psi.KtCallExpression
@@ -37,6 +38,34 @@ private val logger = BossLogger.forComponent("PluginSemanticTokenProvider")
  */
 internal class PluginSemanticTokenProvider : SemanticTokenProvider {
 
+    companion object {
+        /**
+         * Single-flight PSI initialization. PSIBootstrap.initialize() is heavy
+         * (KotlinCoreEnvironment) and not synchronized in BossEditor 1.0.4, so
+         * exactly one coroutine runs it; analyzeFile awaits the result so files
+         * opened while it is still running (session restore, first seconds after
+         * plugin load) still get semantic colors instead of silently skipping.
+         */
+        private val psiInit: kotlinx.coroutines.Deferred<Unit> by lazy {
+            kotlinx.coroutines.CoroutineScope(Dispatchers.Default).async {
+                try {
+                    PSIBootstrap.initialize()
+                } catch (e: Throwable) {
+                    logger.error(LogCategory.EDITOR, "PSI initialization failed — semantic highlighting disabled", error = e)
+                }
+            }
+        }
+
+        /** Kick off PSI initialization without waiting for it. */
+        fun warmUp() {
+            psiInit
+        }
+
+        private suspend fun awaitPsiInitialized() {
+            psiInit.await()
+        }
+    }
+
     override fun getSemanticElements(filePath: String): List<SemanticElement>? {
         // Only support Kotlin files
         if (!filePath.endsWith(".kt") && !filePath.endsWith(".kts")) {
@@ -62,6 +91,10 @@ internal class PluginSemanticTokenProvider : SemanticTokenProvider {
             return
         }
 
+        // Wait for the warm-up rather than skipping: callers bump their
+        // semanticVersion right after this returns, so returning early would
+        // leave the first-opened files permanently uncolored until edited.
+        awaitPsiInitialized()
         if (!PSIBootstrap.isInitialized) {
             logger.warn(LogCategory.EDITOR, "PSI not initialized, skipping semantic analysis")
             return

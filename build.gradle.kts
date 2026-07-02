@@ -90,6 +90,14 @@ dependencies {
     compileOnly(kotlin("reflect"))
 }
 
+// The default :jar task would otherwise write build/libs/boss-plugin-editor-tab-<version>.jar —
+// the exact archive buildPluginJar produces — and whichever task runs last wins.
+// A thin-jar clobber ships a plugin missing all of ai.rever.bosseditor + the
+// bundled compiler (this exact failure bit fluck-browser). Classify it away.
+tasks.named<Jar>("jar") {
+    archiveClassifier.set("thin")
+}
+
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {
     archiveFileName.set("boss-plugin-editor-tab-${version}.jar")
