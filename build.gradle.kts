@@ -8,7 +8,9 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.1"
+// 1.3.0: contributes MCP tools (editor_read_file/write_file/detect_language)
+// via boss-plugin-api 1.0.51's McpToolProvider, surfaced on the `boss` MCP server.
+version = "1.3.0"
 
 java {
     toolchain {
@@ -36,7 +38,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.47.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.51.jar"))
         // BossEditor - use Maven Central (matches BossConsole's version)
         compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.3")
     } else {
