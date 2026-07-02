@@ -49,7 +49,16 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
         // Serve editor + LSP settings panels to the host: the Settings window's
         // BOSS_EDITOR and LANGUAGE_SERVERS sections delegate through this API.
-        context.registerPluginAPI(EditorTabPluginAPIImpl())
+        //
+        // Guarded: EditorTabPluginAPI is a shared-package (parent-first) class,
+        // so on hosts that predate it the impl class fails to link. Those hosts
+        // still render their own editor settings from their own BossEditor
+        // dependency, so skipping registration degrades nothing there.
+        try {
+            context.registerPluginAPI(EditorTabPluginAPIImpl())
+        } catch (e: LinkageError) {
+            // Host predates EditorTabPluginAPI — skip; everything else works.
+        }
 
         // Warm up the bundled PSI stack off the UI thread. The host did this at
         // startup while BossEditor was on its classpath; the plugin owns it now.
