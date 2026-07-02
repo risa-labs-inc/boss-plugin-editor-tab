@@ -188,6 +188,9 @@ class EditorTabComponent(
     // Language detection
     private val language: String = detectLanguage(filePath)
 
+    // Markdown files get an Edit/Split/Preview toggle (rendered via BrowserService)
+    private val isMarkdown: Boolean = language == "markdown"
+
     init {
         lifecycle.subscribe(
             callbacks = object : Lifecycle.Callbacks {
@@ -441,6 +444,10 @@ class EditorTabComponent(
 
         // Focus requester for keyboard handling
         val editorFocusRequester = remember { FocusRequester() }
+
+        // Markdown preview state (only meaningful when isMarkdown)
+        var viewMode by remember { mutableStateOf(MarkdownViewMode.EDIT) }
+        var markdownText by remember { mutableStateOf(initialContent) }
 
         // State for detected main functions (for run gutter)
         var detectedMainFunctions by remember { mutableStateOf<List<DetectedMainFunction>>(emptyList()) }
@@ -771,7 +778,8 @@ class EditorTabComponent(
                     )
                 }
 
-                // Editor content
+                // Editor content (hidden when a markdown file is in Preview-only mode)
+                if (!(isMarkdown && viewMode == MarkdownViewMode.PREVIEW)) {
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
@@ -798,6 +806,10 @@ class EditorTabComponent(
                     // which has ShowUsages support for clicking on definitions
                     navigationResolver = null,
                     onTextChanged = {
+                        // Feed the live markdown preview (debounced inside the pane)
+                        if (isMarkdown) {
+                            markdownText = editorState.document.getText()
+                        }
                         // Re-trigger PSI semantic analysis after edits and bridge caches
                         if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
                             coroutineScope.launch {
@@ -1219,6 +1231,18 @@ class EditorTabComponent(
                 }
 
             }  // End Box
+            }  // End editor visibility if
+
+                // Markdown preview pane (Split or Preview mode), rendered via BrowserService
+                if (isMarkdown && viewMode != MarkdownViewMode.EDIT) {
+                    MarkdownPreviewPane(
+                        browserService = context.browserService,
+                        markdown = markdownText,
+                        baseDir = filePath.substringBeforeLast('/', projectPath),
+                        darkTheme = settings.themeName != "Light" && settings.themeName != "Solarized Light",
+                        modifier = Modifier.weight(1f).fillMaxHeight()
+                    )
+                }
             }  // End Row
 
             // Status bar (matches bundled editor)
@@ -1229,7 +1253,9 @@ class EditorTabComponent(
                 column = cursorColumn,
                 isModified = isModified,
                 isSaving = isSaving,
-                error = saveError
+                error = saveError,
+                viewMode = if (isMarkdown) viewMode else null,
+                onViewModeChange = { viewMode = it }
             )
         }
     }
@@ -1394,7 +1420,9 @@ private fun EditorStatusBar(
     column: Int,
     isModified: Boolean,
     isSaving: Boolean,
-    error: String?
+    error: String?,
+    viewMode: MarkdownViewMode? = null,
+    onViewModeChange: (MarkdownViewMode) -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -1431,6 +1459,26 @@ private fun EditorStatusBar(
             horizontalArrangement = Arrangement.spacedBy(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // Markdown view-mode toggle (only shown for markdown files)
+            if (viewMode != null) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    MarkdownViewMode.entries.forEach { mode ->
+                        val active = mode == viewMode
+                        Text(
+                            text = mode.name.lowercase().replaceFirstChar { it.uppercase() },
+                            color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
+                            fontSize = 11.sp,
+                            fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
+                                         else androidx.compose.ui.text.font.FontWeight.Normal,
+                            modifier = Modifier.clickable { onViewModeChange(mode) }
+                        )
+                    }
+                }
+            }
+
             // Error message
             if (error != null) {
                 Text(
