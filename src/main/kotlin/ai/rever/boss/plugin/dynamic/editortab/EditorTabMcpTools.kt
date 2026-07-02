@@ -44,7 +44,10 @@ internal class EditorTabMcpToolProvider(
                 val e = editor ?: return@McpToolHandler unavailable()
                 val path = args.string("path")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
-                val content = args.string("content") ?: ""
+                // Error rather than default to "" — a missing/null content must not
+                // silently truncate the target file to empty.
+                val content = args.string("content")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: content", isError = true)
                 if (e.writeFileContent(path, content)) McpToolResult("Wrote ${content.length} chars to $path.")
                 else McpToolResult("Write failed for $path.", isError = true)
             },
