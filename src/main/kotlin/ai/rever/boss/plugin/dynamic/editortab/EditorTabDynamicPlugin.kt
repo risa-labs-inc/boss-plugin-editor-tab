@@ -37,6 +37,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
             EditorTabComponent(ctx, tabInfo, context)
         }
+
+        // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
+        context.registerMcpToolProvider(EditorTabMcpToolProvider(pluginId, context.editorContentProvider))
     }
 
     override fun dispose() {
