@@ -139,10 +139,12 @@ tasks.register<Jar>("buildPluginJar") {
                 p.contains("/org.jetbrains.kotlin/kotlin-script-runtime/") ||
                 p.contains("/org.jetbrains.kotlin/kotlin-daemon-embeddable/") ||
                 p.contains("/org.jetbrains.intellij.deps/trove4j/") ||
-                // material3 (used by BossEditor's UI): the host ships material
-                // (M2) only. androidx.compose.* is parent-first, but
-                // PluginClassLoader's super.loadClass falls back to the plugin
-                // JAR when the host misses a class, so bundling works.
+                // material3 (used by BossEditor's UI): the current host happens
+                // to ship material3 (plugin-sandbox pulls it), so this copy is
+                // normally inert — androidx.compose.* is parent-first. It is
+                // bundled defensively: PluginClassLoader's super.loadClass falls
+                // back to the plugin JAR on a parent miss, so the editor keeps
+                // working if the host ever drops material3.
                 p.contains("/org.jetbrains.compose.material3/") ||
                 // Feather icon pack used by the editor UI (not host-shared)
                 p.contains("/br.com.devsrsouza")
