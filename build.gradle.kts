@@ -8,9 +8,14 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
+// 1.4.0 signals the new contract (same inversion terminal-tab 2.1.0 did for
+// BossTerm): the plugin bundles bosseditor-compose-desktop privately; the host
+// no longer carries it. The plugin also implements EditorTabPluginAPI
+// (boss-plugin-api 1.0.53) so the host renders editor/LSP settings through it,
+// and owns the PSI stack (kotlin-compiler-embeddable is bundled).
 // 1.3.0: contributes MCP tools (editor_read_file/write_file/detect_language)
 // via boss-plugin-api 1.0.51's McpToolProvider, surfaced on the `boss` MCP server.
-version = "1.3.2"
+version = "1.4.0"
 
 java {
     toolchain {
@@ -38,39 +43,51 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.51.jar"))
-        // BossEditor - use Maven Central (matches BossConsole's version)
-        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.4")
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.53.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
-        // BossEditor - code editor library from Maven Central
-        compileOnly("com.risaboss:bosseditor-compose-desktop:1.0.4")
     }
 
-    // Compose dependencies
-    implementation(compose.desktop.currentOs)
-    implementation(compose.runtime)
-    implementation(compose.ui)
-    implementation(compose.foundation)
-    implementation(compose.material)
-    implementation(compose.materialIconsExtended)
+    // BossEditor is private to this plugin (bundled into the plugin JAR by
+    // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
+    // requires re-releasing this plugin, not BossConsole.
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.4")
 
-    // Compose Icons - Feather icons (same as bundled editor)
+    // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
+    // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,
+    // so it must be declared for compilation; the runtime copy arrives
+    // transitively and is bundled by buildPluginJar. Keep the version in sync
+    // with BossEditor's.
+    compileOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.21")
+
+    // Compose Multiplatform — provided by the host classloader (parent-first
+    // shared packages); bundling a second Compose runtime would break the
+    // single-runtime invariant.
+    compileOnly(compose.desktop.currentOs)
+    compileOnly(compose.runtime)
+    compileOnly(compose.ui)
+    compileOnly(compose.foundation)
+    compileOnly(compose.material)
+    compileOnly(compose.materialIconsExtended)
+
+    // Compose Icons - Feather icons (same as bundled editor); not host-shared,
+    // bundled into the plugin JAR.
     implementation("br.com.devsrsouza.compose.icons:feather:1.1.1")
 
-    // Decompose for ComponentContext
-    implementation("com.arkivanov.decompose:decompose:3.3.0")
-    implementation("com.arkivanov.essenty:lifecycle:2.5.0")
+    // Decompose for ComponentContext — provided by host (shared package)
+    compileOnly("com.arkivanov.decompose:decompose:3.3.0")
+    compileOnly("com.arkivanov.essenty:lifecycle:2.5.0")
 
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    // Coroutines — provided by host (shared package)
+    compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 
-    // JSON serialization for settings
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    // JSON serialization for settings — provided by host (shared package)
+    compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
-    // Kotlin reflection for extracting filePath from host's EditorTabInfo
-    implementation(kotlin("reflect"))
+    // Kotlin reflection for extracting filePath from host's EditorTabInfo —
+    // kotlin.* is parent-first and the host ships kotlin-reflect
+    compileOnly(kotlin("reflect"))
 }
 
 // Task to build plugin JAR with compiled classes only
@@ -91,10 +108,46 @@ tasks.register<Jar>("buildPluginJar") {
 
     // Include plugin manifest
     from("src/main/resources")
+
+    // Bundle bosseditor-compose-desktop + its plugin-private transitives.
+    // Compose Multiplatform / decompose / kotlinx-coroutines /
+    // kotlinx-serialization / slf4j stay on the host classloader
+    // (parent-first shared packages).
+    //
+    // Filters match the gradle-cache PATH (…/files-2.1/<group>/<module>/…),
+    // not the jar filename: bosseditor-compose-desktop's KMP jar is named
+    // compose-ui-desktop-X.Y.Z.jar — the exact filename bossterm-compose-desktop
+    // publishes under (see terminal-tab's buildPluginJar note), so filename
+    // prefixes are ambiguous between the two libraries.
+    from({
+        configurations.runtimeClasspath.get().filter { jar ->
+            val p = jar.path.replace('\\', '/')
+            // BossEditor itself
+            p.contains("/com.risaboss/bosseditor-compose-desktop/") ||
+                // PSI stack: the embedded Kotlin compiler and its runtime deps.
+                // org.jetbrains.kotlin.* packages are NOT host-shared (only
+                // `kotlin.` is), so these resolve child-first and must ship here.
+                p.contains("/org.jetbrains.kotlin/kotlin-compiler-embeddable/") ||
+                p.contains("/org.jetbrains.kotlin/kotlin-script-runtime/") ||
+                p.contains("/org.jetbrains.kotlin/kotlin-daemon-embeddable/") ||
+                p.contains("/org.jetbrains.intellij.deps/trove4j/") ||
+                // material3 (used by BossEditor's UI): the host ships material
+                // (M2) only. androidx.compose.* is parent-first, but
+                // PluginClassLoader's super.loadClass falls back to the plugin
+                // JAR when the host misses a class, so bundling works.
+                p.contains("/org.jetbrains.compose.material3/") ||
+                // Feather icon pack used by the editor UI (not host-shared)
+                p.contains("/br.com.devsrsouza")
+        }.map { zipTree(it) }
+    })
 }
 
-// Sync version from build.gradle.kts into plugin.json (single source of truth)
+// Sync version from build.gradle.kts into plugin.json (single source of truth).
+// Declare `version` as a task input so a version-only bump invalidates the task —
+// otherwise processResources stays UP-TO-DATE (its file inputs are unchanged) and
+// ships a stale plugin.json whose version disagrees with the JAR filename.
 tasks.processResources {
+    inputs.property("pluginVersion", version)
     filesMatching("**/plugin.json") {
         filter { line ->
             line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")

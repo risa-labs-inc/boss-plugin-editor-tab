@@ -2,6 +2,12 @@ package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.bosseditor.psi.PSIBootstrap
+import ai.rever.bosseditor.psi.PSIThreadBridge
+import ai.rever.bosseditor.psi.ProjectIndexer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Code Editor Tab dynamic plugin - Loaded from external JAR.
@@ -40,11 +46,28 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
         // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
         context.registerMcpToolProvider(EditorTabMcpToolProvider(pluginId, context.editorContentProvider))
+
+        // Serve editor + LSP settings panels to the host: the Settings window's
+        // BOSS_EDITOR and LANGUAGE_SERVERS sections delegate through this API.
+        context.registerPluginAPI(EditorTabPluginAPIImpl())
+
+        // Warm up the bundled PSI stack off the UI thread. The host did this at
+        // startup while BossEditor was on its classpath; the plugin owns it now.
+        // Semantic analysis skips gracefully until initialization completes.
+        CoroutineScope(Dispatchers.Default).launch {
+            runCatching { PSIBootstrap.initialize() }
+        }
     }
 
     override fun dispose() {
         // Unregister tab type when plugin is unloaded
         pluginContext?.tabRegistry?.unregisterTabType(EditorTabType.typeId)
         pluginContext = null
+
+        // Tear down the bundled PSI stack (previously the host main.kt shutdown
+        // hook's job, when BossEditor lived on the host classpath).
+        runCatching { ProjectIndexer.shutdownGlobal() }
+        runCatching { PSIBootstrap.shutdown() }
+        runCatching { PSIThreadBridge.shutdown() }
     }
 }

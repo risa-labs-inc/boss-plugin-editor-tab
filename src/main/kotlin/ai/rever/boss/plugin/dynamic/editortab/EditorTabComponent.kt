@@ -457,16 +457,14 @@ class EditorTabComponent(
         // recreate the lambda, which triggers the editor to re-render with semantic colors.
         var semanticVersion by remember { mutableStateOf(0) }
 
-        // Trigger PSI semantic analysis on initial load and bridge to BossEditor's SemanticCache.
-        // The host's SemanticTokenProvider writes to ai.rever.boss.psi.SemanticCache (host-side),
-        // but the plugin's tokenProvider reads from ai.rever.bosseditor.psi.SemanticCache (library-side).
-        // We bridge by fetching from the host API and storing in the BossEditor cache.
+        // Trigger PSI semantic analysis on initial load. The plugin owns the PSI
+        // stack (BossEditor is bundled in this JAR), so the provider writes
+        // straight into the SemanticCache the editor's tokenProvider reads —
+        // the old host-cache bridge is gone.
         LaunchedEffect(filePath, initialContent) {
             if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
-                context.semanticTokenProvider?.analyzeFile(filePath, initialContent)
-                if (bridgeSemanticCache(filePath, context)) {
-                    semanticVersion++
-                }
+                semanticTokens.analyzeFile(filePath, initialContent)
+                semanticVersion++
             }
         }
 
@@ -810,13 +808,11 @@ class EditorTabComponent(
                         if (isMarkdown) {
                             markdownText = editorState.document.getText()
                         }
-                        // Re-trigger PSI semantic analysis after edits and bridge caches
+                        // Re-trigger PSI semantic analysis after edits
                         if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
                             coroutineScope.launch {
-                                context.semanticTokenProvider?.analyzeFile(filePath, editorState.document.getText())
-                                if (bridgeSemanticCache(filePath, context)) {
-                                    semanticVersion++
-                                }
+                                semanticTokens.analyzeFile(filePath, editorState.document.getText())
+                                semanticVersion++
                             }
                         }
                     },
@@ -1634,40 +1630,14 @@ private fun parseHexColor(hex: String): Color? {
     }
 }
 
-// ========== Semantic Cache Bridge ==========
+// ========== Semantic Analysis ==========
 
 /**
- * Bridges the host's SemanticCache (ai.rever.boss.psi.SemanticCache) to the
- * BossEditor library's SemanticCache (ai.rever.bosseditor.psi.SemanticCache).
- *
- * The host's SemanticTokenProvider.analyzeFile() populates the host-side cache,
- * but the plugin's tokenProvider reads from the library-side cache. This function
- * fetches elements via the plugin API and stores them in the BossEditor cache.
+ * Plugin-owned semantic analysis. Writes directly into the bundled BossEditor's
+ * SemanticCache — the same singleton the editor's tokenProvider reads — so no
+ * host bridge is needed (the host no longer has a PSI stack to bridge from).
  */
-private fun bridgeSemanticCache(filePath: String, context: ai.rever.boss.plugin.api.PluginContext): Boolean {
-    val apiElements = context.semanticTokenProvider?.getSemanticElements(filePath) ?: return false
-    if (apiElements.isEmpty()) return false
-    val bossEditorElements = apiElements.map { e ->
-        ai.rever.bosseditor.psi.SemanticElement(
-            startOffset = e.startOffset,
-            endOffset = e.endOffset,
-            type = when (e.type) {
-                ai.rever.boss.plugin.api.SemanticElementType.FUNCTION_CALL -> SemanticType.FUNCTION_CALL
-                ai.rever.boss.plugin.api.SemanticElementType.PROPERTY_ACCESS -> SemanticType.PROPERTY_ACCESS
-                ai.rever.boss.plugin.api.SemanticElementType.CLASS_REFERENCE -> SemanticType.CLASS_REFERENCE
-                ai.rever.boss.plugin.api.SemanticElementType.OBJECT_REFERENCE -> SemanticType.OBJECT_REFERENCE
-                ai.rever.boss.plugin.api.SemanticElementType.PARAMETER -> SemanticType.PARAMETER
-                ai.rever.boss.plugin.api.SemanticElementType.LOCAL_VARIABLE -> SemanticType.LOCAL_VARIABLE
-                ai.rever.boss.plugin.api.SemanticElementType.ANNOTATION -> SemanticType.ANNOTATION
-                ai.rever.boss.plugin.api.SemanticElementType.LABEL -> SemanticType.LABEL
-                ai.rever.boss.plugin.api.SemanticElementType.TYPE_PARAMETER -> SemanticType.TYPE_PARAMETER
-            },
-            name = e.name
-        )
-    }
-    SemanticCache.put(filePath, bossEditorElements)
-    return true
-}
+private val semanticTokens = PluginSemanticTokenProvider()
 
 // ========== Semantic Highlighting Helpers ==========
 // These functions are copied from BossEditorIntegration.kt to provide
