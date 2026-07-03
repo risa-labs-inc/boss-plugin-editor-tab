@@ -106,6 +106,15 @@ tasks.register<Jar>("buildPluginJar") {
     archiveFileName.set("boss-plugin-editor-tab-${version}.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
+    // No native binaries may ship inside the plugin JAR: the host bundles this
+    // JAR in its .app, and macOS notarization scans bundled JARs and rejects
+    // unsigned Mach-O libs (Apple: "The binary is not signed"). The shaded
+    // kotlin-compiler-embeddable carries jansi .jnilib/.dll (CLI terminal
+    // colors) and lz4 .so (incremental-compilation caches) natives that the
+    // embedded PSI path never loads — and both libraries fall back to
+    // pure-Java when their natives are absent.
+    exclude("**/*.jnilib", "**/*.dylib", "**/*.so", "**/*.dll")
+
     manifest {
         attributes(
             "Implementation-Title" to "BOSS Code Editor Tab Plugin",
