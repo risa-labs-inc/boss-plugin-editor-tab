@@ -11,10 +11,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -36,6 +39,7 @@ class EditorTabPluginAPIImpl(
         val settingsManager = remember { EditorSettingsManager.instance }
         val currentSettings by settingsManager.settings.collectAsState()
         val markdownSettings by markdownSettingsManager.settings.collectAsState()
+        val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
         Column(modifier = modifier.fillMaxSize()) {
             Box(
@@ -60,11 +64,25 @@ class EditorTabPluginAPIImpl(
                     .background(BossDarkBorder)
             )
 
-            MarkdownViewSettingsContent(
-                settings = markdownSettings,
-                onDefaultViewChange = markdownSettingsManager::setDefaultView,
-                modifier = Modifier.fillMaxWidth()
-            )
+            if (markdownSettingsLoaded) {
+                MarkdownViewSettingsContent(
+                    settings = markdownSettings,
+                    onDefaultViewChange = markdownSettingsManager::setDefaultView,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(92.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp
+                    )
+                }
+            }
         }
     }
 

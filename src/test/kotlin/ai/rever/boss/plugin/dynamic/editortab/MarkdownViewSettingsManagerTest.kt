@@ -179,6 +179,53 @@ class MarkdownViewSettingsManagerTest {
         }
     }
 
+    @Test
+    fun `load timeout releases UI with defaults`() = runBlocking {
+        val storage = FakePluginStorageProvider(
+            initialStrings = mapOf(
+                "markdown.defaultView" to "SPLIT",
+                "markdown.lastSelectedView" to "EDIT"
+            ),
+            allowReads = CompletableDeferred()
+        )
+        val manager = MarkdownViewSettingsManager(
+            storage = storage,
+            loadTimeoutMillis = 50
+        )
+
+        try {
+            manager.awaitLoaded()
+
+            assertTrue(manager.isLoaded.value)
+            assertEquals(MarkdownViewSettings(), manager.settings.value)
+        } finally {
+            manager.dispose()
+        }
+    }
+
+    @Test
+    fun `fixed default still tracks last selected view`() = runBlocking {
+        val storage = FakePluginStorageProvider()
+        val manager = MarkdownViewSettingsManager(storage)
+
+        try {
+            manager.awaitLoaded()
+            assertEquals(MarkdownDefaultView.PREVIEW, manager.settings.value.defaultView)
+
+            manager.recordSelectedView(MarkdownViewMode.EDIT)
+            storage.awaitWriteCount(1)
+
+            assertEquals(MarkdownDefaultView.PREVIEW, manager.settings.value.defaultView)
+            assertEquals(MarkdownViewMode.EDIT, manager.settings.value.lastSelectedView)
+            assertEquals(
+                listOf("markdown.lastSelectedView" to "EDIT"),
+                storage.snapshotWrites()
+            )
+        } finally {
+            manager.dispose()
+        }
+    }
+
     private suspend fun MarkdownViewSettingsManager.awaitLoaded() {
         withTimeout(2_000) {
             isLoaded.first { it }
@@ -245,7 +292,7 @@ private class FakePluginStorageProvider(
 
     suspend fun awaitWriteCount(expected: Int) {
         withTimeout(2_000) {
-            while (stringWrites.size < expected) {
+            while (snapshotWrites().size < expected) {
                 delay(10)
             }
         }
