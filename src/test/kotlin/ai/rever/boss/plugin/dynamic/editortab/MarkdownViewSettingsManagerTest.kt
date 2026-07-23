@@ -122,7 +122,7 @@ class MarkdownViewSettingsManagerTest {
     }
 
     @Test
-    fun `pre-load changes are not overwritten by stale storage`() = runBlocking {
+    fun `pre-load default change preserves persisted last selection`() = runBlocking {
         val allowReads = CompletableDeferred<Unit>()
         val storage = FakePluginStorageProvider(
             initialStrings = mapOf(
@@ -138,7 +138,42 @@ class MarkdownViewSettingsManagerTest {
             allowReads.complete(Unit)
             manager.awaitLoaded()
 
-            assertEquals(MarkdownDefaultView.EDIT, manager.settings.value.defaultView)
+            assertEquals(
+                MarkdownViewSettings(
+                    defaultView = MarkdownDefaultView.EDIT,
+                    lastSelectedView = MarkdownViewMode.EDIT
+                ),
+                manager.settings.value
+            )
+        } finally {
+            manager.dispose()
+        }
+    }
+
+    @Test
+    fun `pre-load mode change preserves persisted default`() = runBlocking {
+        val allowReads = CompletableDeferred<Unit>()
+        val storage = FakePluginStorageProvider(
+            initialStrings = mapOf(
+                "markdown.defaultView" to "SPLIT",
+                "markdown.lastSelectedView" to "EDIT"
+            ),
+            allowReads = allowReads
+        )
+        val manager = MarkdownViewSettingsManager(storage)
+
+        try {
+            manager.recordSelectedView(MarkdownViewMode.SPLIT)
+            allowReads.complete(Unit)
+            manager.awaitLoaded()
+
+            assertEquals(
+                MarkdownViewSettings(
+                    defaultView = MarkdownDefaultView.SPLIT,
+                    lastSelectedView = MarkdownViewMode.SPLIT
+                ),
+                manager.settings.value
+            )
         } finally {
             manager.dispose()
         }

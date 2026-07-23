@@ -31,8 +31,12 @@ import kotlinx.coroutines.delay
 import java.io.File
 import java.util.Base64
 
-/** View mode for markdown files: plain editor, side-by-side, or rendered preview only. */
-enum class MarkdownViewMode { EDIT, SPLIT, PREVIEW }
+/** View mode for Markdown files: plain editor, side-by-side, or rendered preview only. */
+enum class MarkdownViewMode(val displayName: String) {
+    EDIT("Edit"),
+    SPLIT("Split"),
+    PREVIEW("Preview")
+}
 
 /**
  * Rendered markdown preview pane backed by the host's BrowserService (JxBrowser),

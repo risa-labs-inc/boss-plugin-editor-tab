@@ -8,7 +8,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Controls which mode a newly opened Markdown tab uses.
@@ -18,15 +20,15 @@ enum class MarkdownDefaultView(
     val description: String
 ) {
     EDIT(
-        displayName = "Edit",
+        displayName = MarkdownViewMode.EDIT.displayName,
         description = "Open Markdown files in the source editor."
     ),
     SPLIT(
-        displayName = "Split",
+        displayName = MarkdownViewMode.SPLIT.displayName,
         description = "Open the source editor and rendered preview side by side."
     ),
     PREVIEW(
-        displayName = "Preview",
+        displayName = MarkdownViewMode.PREVIEW.displayName,
         description = "Open Markdown files in the rendered preview."
     ),
     LAST_SELECTED(
@@ -63,6 +65,8 @@ class MarkdownViewSettingsManager(
         SupervisorJob() + Dispatchers.IO.limitedParallelism(1)
     )
     private val defaultSettings = MarkdownViewSettings()
+    private val defaultViewTouched = AtomicBoolean(false)
+    private val lastSelectedViewTouched = AtomicBoolean(false)
     private val _settings = MutableStateFlow(defaultSettings)
     private val _isLoaded = MutableStateFlow(storage == null)
 
@@ -81,7 +85,20 @@ class MarkdownViewSettingsManager(
                     )
                 }.getOrDefault(defaultSettings)
 
-                _settings.compareAndSet(defaultSettings, loadedSettings)
+                _settings.update { current ->
+                    current.copy(
+                        defaultView = if (defaultViewTouched.get()) {
+                            current.defaultView
+                        } else {
+                            loadedSettings.defaultView
+                        },
+                        lastSelectedView = if (lastSelectedViewTouched.get()) {
+                            current.lastSelectedView
+                        } else {
+                            loadedSettings.lastSelectedView
+                        }
+                    )
+                }
                 _isLoaded.value = true
             }
         }
@@ -90,7 +107,8 @@ class MarkdownViewSettingsManager(
     fun setDefaultView(defaultView: MarkdownDefaultView) {
         if (_settings.value.defaultView == defaultView) return
 
-        _settings.value = _settings.value.copy(defaultView = defaultView)
+        defaultViewTouched.set(true)
+        _settings.update { it.copy(defaultView = defaultView) }
         scope.launch {
             runCatching {
                 storage?.putString(DEFAULT_VIEW_KEY, defaultView.name)
@@ -101,20 +119,11 @@ class MarkdownViewSettingsManager(
     fun recordSelectedView(viewMode: MarkdownViewMode) {
         if (_settings.value.lastSelectedView == viewMode) return
 
-        _settings.value = _settings.value.copy(lastSelectedView = viewMode)
+        lastSelectedViewTouched.set(true)
+        _settings.update { it.copy(lastSelectedView = viewMode) }
         scope.launch {
             runCatching {
                 storage?.putString(LAST_SELECTED_VIEW_KEY, viewMode.name)
-            }
-        }
-    }
-
-    fun resetToDefaults() {
-        _settings.value = defaultSettings
-        scope.launch {
-            runCatching {
-                storage?.putString(DEFAULT_VIEW_KEY, defaultSettings.defaultView.name)
-                storage?.putString(LAST_SELECTED_VIEW_KEY, defaultSettings.lastSelectedView.name)
             }
         }
     }

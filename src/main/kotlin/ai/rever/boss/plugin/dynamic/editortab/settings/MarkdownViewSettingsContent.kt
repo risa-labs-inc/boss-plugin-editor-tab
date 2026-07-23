@@ -110,15 +110,11 @@ internal fun MarkdownViewSettingsContent(
 
         if (settings.defaultView == MarkdownDefaultView.LAST_SELECTED) {
             Text(
-                text = "Current last selection: ${settings.lastSelectedView.displayName()}",
+                text = "Current last selection: ${settings.lastSelectedView.displayName}",
                 color = BossDarkTextMuted,
                 fontSize = 11.sp,
                 modifier = Modifier.padding(top = 8.dp)
             )
         }
     }
-}
-
-private fun ai.rever.boss.plugin.dynamic.editortab.MarkdownViewMode.displayName(): String {
-    return name.lowercase().replaceFirstChar { it.uppercase() }
 }

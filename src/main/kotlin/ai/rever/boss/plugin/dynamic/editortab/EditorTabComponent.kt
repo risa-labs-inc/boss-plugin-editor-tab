@@ -86,6 +86,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import compose.icons.FeatherIcons
@@ -363,6 +364,18 @@ class EditorTabComponent(
             return
         }
 
+        // Wait for the persisted Markdown preference before composing either
+        // editor or preview, avoiding a transient Preview for Edit/Split users.
+        if (isMarkdown && !markdownSettingsLoaded) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
+            }
+            return
+        }
+
         // Create editor state
         val editorState = remember(filePath) {
             EditorState(initialContent, filePath.ifEmpty { null })
@@ -448,27 +461,13 @@ class EditorTabComponent(
         // Focus requester for keyboard handling
         val editorFocusRequester = remember { FocusRequester() }
 
-        // Markdown preview state (only meaningful when isMarkdown). The persisted
-        // default is applied once per tab so "Last selected" affects new tabs
-        // without synchronizing every Markdown tab that is already open.
-        var markdownDefaultApplied by remember { mutableStateOf(markdownSettingsLoaded) }
+        // Markdown preview state (only meaningful when isMarkdown). Settings are
+        // loaded before reaching this point, so the configured mode is the first
+        // mode composed and remains local to this tab afterward.
         var viewMode by remember {
-            mutableStateOf(
-                if (markdownSettingsLoaded) {
-                    markdownViewSettings.initialViewMode()
-                } else {
-                    MarkdownViewMode.PREVIEW
-                }
-            )
+            mutableStateOf(markdownViewSettings.initialViewMode())
         }
         var markdownText by remember { mutableStateOf(initialContent) }
-
-        LaunchedEffect(isMarkdown, markdownSettingsLoaded) {
-            if (isMarkdown && markdownSettingsLoaded && !markdownDefaultApplied) {
-                viewMode = markdownViewSettings.initialViewMode()
-                markdownDefaultApplied = true
-            }
-        }
 
         // State for detected main functions (for run gutter)
         var detectedMainFunctions by remember { mutableStateOf<List<DetectedMainFunction>>(emptyList()) }
@@ -1273,7 +1272,6 @@ class EditorTabComponent(
                 error = saveError,
                 viewMode = if (isMarkdown) viewMode else null,
                 onViewModeChange = { newMode ->
-                    markdownDefaultApplied = true
                     viewMode = newMode
                     markdownSettingsManager.recordSelectedView(newMode)
                 }
@@ -1489,7 +1487,7 @@ private fun EditorStatusBar(
                     MarkdownViewMode.entries.forEach { mode ->
                         val active = mode == viewMode
                         Text(
-                            text = mode.name.lowercase().replaceFirstChar { it.uppercase() },
+                            text = mode.displayName,
                             color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
                             fontSize = 11.sp,
                             fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
