@@ -15,7 +15,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // and owns the PSI stack (kotlin-compiler-embeddable is bundled).
 // 1.3.0: contributes MCP tools (editor_read_file/write_file/detect_language)
 // via boss-plugin-api 1.0.51's McpToolProvider, surfaced on the `boss` MCP server.
-version = "1.4.6"
+version = "1.4.7"
 
 java {
     toolchain {
@@ -41,13 +41,15 @@ repositories {
 }
 
 dependencies {
-    if (useLocalDependencies) {
+    val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.53.jar"))
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.53.jar")
     } else {
         // CI: use downloaded JAR
-        compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
+        files("build/downloaded-deps/boss-plugin-api.jar")
     }
+    compileOnly(bossPluginApi)
+    testImplementation(bossPluginApi)
 
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
@@ -90,6 +92,9 @@ dependencies {
     compileOnly(kotlin("reflect"))
 
     testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    // The Compose compiler plugin also runs for compileTestKotlin and requires
+    // the runtime on that classpath, even when an individual test is pure logic.
     testImplementation(compose.runtime)
 }
 

@@ -48,10 +48,7 @@ class EditorTabPluginAPIImpl(
                     onSettingsChange = { newSettings ->
                         settingsManager.updateSettings(newSettings)
                     },
-                    onResetToDefaults = {
-                        settingsManager.resetToDefaults()
-                        markdownSettingsManager.resetToDefaults()
-                    },
+                    onResetToDefaults = settingsManager::resetToDefaults,
                     modifier = Modifier.fillMaxSize()
                 )
             }
