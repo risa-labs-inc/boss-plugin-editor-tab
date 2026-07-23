@@ -86,6 +86,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import compose.icons.FeatherIcons
@@ -141,7 +142,8 @@ import kotlin.reflect.full.memberProperties
 class EditorTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
-    private val context: PluginContext
+    private val context: PluginContext,
+    private val markdownSettingsManager: MarkdownViewSettingsManager
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = EditorTabType
@@ -339,6 +341,8 @@ class EditorTabComponent(
 
         // Reactive settings - updates automatically when settings file changes (like bundled editor)
         val settings by PluginEditorSettings.settings.collectAsState()
+        val markdownViewSettings by markdownSettingsManager.settings.collectAsState()
+        val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
         // Get tab update provider for title updates
         val tabUpdateProviderFactory = context.tabUpdateProviderFactory
@@ -356,6 +360,18 @@ class EditorTabComponent(
                     text = loadError ?: "",
                     color = BossThemeColors.ErrorColor
                 )
+            }
+            return
+        }
+
+        // Wait for the persisted Markdown preference before composing either
+        // editor or preview, avoiding a transient Preview for Edit/Split users.
+        if (isMarkdown && !markdownSettingsLoaded) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator()
             }
             return
         }
@@ -445,8 +461,12 @@ class EditorTabComponent(
         // Focus requester for keyboard handling
         val editorFocusRequester = remember { FocusRequester() }
 
-        // Markdown preview state (only meaningful when isMarkdown)
-        var viewMode by remember { mutableStateOf(MarkdownViewMode.EDIT) }
+        // Markdown preview state (only meaningful when isMarkdown). Settings are
+        // loaded before reaching this point, so the configured mode is the first
+        // mode composed and remains local to this tab afterward.
+        var viewMode by remember {
+            mutableStateOf(markdownViewSettings.initialViewMode())
+        }
         var markdownText by remember { mutableStateOf(initialContent) }
 
         // State for detected main functions (for run gutter)
@@ -1251,7 +1271,10 @@ class EditorTabComponent(
                 isSaving = isSaving,
                 error = saveError,
                 viewMode = if (isMarkdown) viewMode else null,
-                onViewModeChange = { viewMode = it }
+                onViewModeChange = { newMode ->
+                    viewMode = newMode
+                    markdownSettingsManager.recordSelectedView(newMode)
+                }
             )
         }
     }
@@ -1464,7 +1487,7 @@ private fun EditorStatusBar(
                     MarkdownViewMode.entries.forEach { mode ->
                         val active = mode == viewMode
                         Text(
-                            text = mode.name.lowercase().replaceFirstChar { it.uppercase() },
+                            text = mode.displayName,
                             color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
                             fontSize = 11.sp,
                             fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold

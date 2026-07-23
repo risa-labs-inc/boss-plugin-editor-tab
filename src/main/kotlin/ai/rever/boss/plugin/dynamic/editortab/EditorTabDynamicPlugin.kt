@@ -32,13 +32,22 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-editor-tab"
 
     private var pluginContext: PluginContext? = null
+    private var markdownSettingsManager: MarkdownViewSettingsManager? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
 
+        markdownSettingsManager?.dispose()
+        val markdownSettings = MarkdownViewSettingsManager(
+            storage = runCatching {
+                context.pluginStorageFactory?.createStorage(pluginId)
+            }.getOrNull()
+        )
+        markdownSettingsManager = markdownSettings
+
         // Register as a main panel TAB TYPE (not a sidebar panel!)
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
-            EditorTabComponent(ctx, tabInfo, context)
+            EditorTabComponent(ctx, tabInfo, context, markdownSettings)
         }
 
         // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
@@ -52,7 +61,7 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // still render their own editor settings from their own BossEditor
         // dependency, so skipping registration degrades nothing there.
         try {
-            context.registerPluginAPI(EditorTabPluginAPIImpl())
+            context.registerPluginAPI(EditorTabPluginAPIImpl(markdownSettings))
         } catch (e: LinkageError) {
             // Host predates EditorTabPluginAPI — skip; everything else works.
         }
@@ -68,6 +77,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // Unregister tab type when plugin is unloaded
         pluginContext?.tabRegistry?.unregisterTabType(EditorTabType.typeId)
         pluginContext = null
+
+        markdownSettingsManager?.dispose()
+        markdownSettingsManager = null
 
         // Tear down the bundled PSI stack (previously the host main.kt shutdown
         // hook's job, when BossEditor lived on the host classpath).
