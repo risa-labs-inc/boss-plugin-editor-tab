@@ -141,7 +141,8 @@ import kotlin.reflect.full.memberProperties
 class EditorTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
-    private val context: PluginContext
+    private val context: PluginContext,
+    private val markdownSettingsManager: MarkdownViewSettingsManager
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = EditorTabType
@@ -339,6 +340,8 @@ class EditorTabComponent(
 
         // Reactive settings - updates automatically when settings file changes (like bundled editor)
         val settings by PluginEditorSettings.settings.collectAsState()
+        val markdownViewSettings by markdownSettingsManager.settings.collectAsState()
+        val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
         // Get tab update provider for title updates
         val tabUpdateProviderFactory = context.tabUpdateProviderFactory
@@ -445,9 +448,27 @@ class EditorTabComponent(
         // Focus requester for keyboard handling
         val editorFocusRequester = remember { FocusRequester() }
 
-        // Markdown preview state (only meaningful when isMarkdown)
-        var viewMode by remember { mutableStateOf(MarkdownViewMode.PREVIEW) }
+        // Markdown preview state (only meaningful when isMarkdown). The persisted
+        // default is applied once per tab so "Last selected" affects new tabs
+        // without synchronizing every Markdown tab that is already open.
+        var markdownDefaultApplied by remember { mutableStateOf(markdownSettingsLoaded) }
+        var viewMode by remember {
+            mutableStateOf(
+                if (markdownSettingsLoaded) {
+                    markdownViewSettings.initialViewMode()
+                } else {
+                    MarkdownViewMode.PREVIEW
+                }
+            )
+        }
         var markdownText by remember { mutableStateOf(initialContent) }
+
+        LaunchedEffect(isMarkdown, markdownSettingsLoaded) {
+            if (isMarkdown && markdownSettingsLoaded && !markdownDefaultApplied) {
+                viewMode = markdownViewSettings.initialViewMode()
+                markdownDefaultApplied = true
+            }
+        }
 
         // State for detected main functions (for run gutter)
         var detectedMainFunctions by remember { mutableStateOf<List<DetectedMainFunction>>(emptyList()) }
@@ -1251,7 +1272,11 @@ class EditorTabComponent(
                 isSaving = isSaving,
                 error = saveError,
                 viewMode = if (isMarkdown) viewMode else null,
-                onViewModeChange = { viewMode = it }
+                onViewModeChange = { newMode ->
+                    markdownDefaultApplied = true
+                    viewMode = newMode
+                    markdownSettingsManager.recordSelectedView(newMode)
+                }
             )
         }
     }

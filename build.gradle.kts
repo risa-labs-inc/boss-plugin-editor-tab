@@ -88,6 +88,9 @@ dependencies {
     // Kotlin reflection for extracting filePath from host's EditorTabInfo —
     // kotlin.* is parent-first and the host ships kotlin-reflect
     compileOnly(kotlin("reflect"))
+
+    testImplementation(kotlin("test"))
+    testImplementation(compose.runtime)
 }
 
 // The default :jar task would otherwise write build/libs/boss-plugin-editor-tab-<version>.jar —
