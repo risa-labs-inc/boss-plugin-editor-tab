@@ -446,7 +446,7 @@ class EditorTabComponent(
         val editorFocusRequester = remember { FocusRequester() }
 
         // Markdown preview state (only meaningful when isMarkdown)
-        var viewMode by remember { mutableStateOf(MarkdownViewMode.EDIT) }
+        var viewMode by remember { mutableStateOf(MarkdownViewMode.PREVIEW) }
         var markdownText by remember { mutableStateOf(initialContent) }
 
         // State for detected main functions (for run gutter)
