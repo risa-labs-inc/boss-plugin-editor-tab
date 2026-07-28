@@ -1256,7 +1256,24 @@ class EditorTabComponent(
                         markdown = markdownText,
                         baseDir = filePath.substringBeforeLast('/', projectPath),
                         darkTheme = settings.themeName != "Light" && settings.themeName != "Solarized Light",
-                        modifier = Modifier.weight(1f).fillMaxHeight()
+                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                        allowedRoot = projectPath,
+                        // A link to a neighbouring file opens in BOSS rather than being
+                        // handed to the OS, so nothing the link names can be launched.
+                        // The host picks the surface by filename: a browser tab for
+                        // images and PDFs, the notebook editor for .ipynb, this editor
+                        // for everything else — including another .md, which then gets
+                        // its own preview.
+                        onOpenLocalFile = { path ->
+                            context.splitViewOperations?.openFileInActivePanel(
+                                path,
+                                // File().name, not substringAfterLast('/'): these paths
+                                // are canonical, so on Windows they are backslash-
+                                // separated and splitting on '/' would make the whole
+                                // path the tab title.
+                                java.io.File(path).name,
+                            )
+                        }
                     )
                 }
             }  // End Row

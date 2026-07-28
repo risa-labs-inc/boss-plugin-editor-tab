@@ -406,10 +406,106 @@ async function run() {
        return { count: as.length,
                 hrefs: Array.prototype.map.call(as, function (a) { return a.getAttribute('href'); }),
                 targets: Array.prototype.map.call(as, function (a) { return a.target; }) };`);
-    check('anchor, relative and remote links are kept and routed to a new tab',
+    // A fragment link must stay in-page. It used to be marked _blank along with
+    // everything else, which sent '#heading' to the host and meant a README's
+    // table of contents did nothing at all.
+    check('outbound links are routed to a new tab but fragment links stay in-page',
       links.count === 3 && links.hrefs[0] === '#heading' && links.hrefs[1] === './OTHER.md' &&
       links.hrefs[2] === 'https://example.invalid/x' &&
-      links.targets.every((t) => t === '_blank'), links);
+      links.targets[0] === '' && links.targets[1] === '_blank' && links.targets[2] === '_blank', links);
+
+    // marked v18 emits no heading ids of its own, so the slugs a '#heading' link
+    // resolves against are ours. Duplicate titles are common in a changelog.
+    const slugs = await render(cdp,
+      '# Getting Started\n\n## API: `foo()` & bar!\n\n## Notes\n\n## Notes\n\n## Notes\n\n## ***\n',
+      `var hs = el.querySelectorAll('h1,h2');
+       return { ids: Array.prototype.map.call(hs, function (h) { return h.id; }) };`);
+    check('headings get github-style slug ids, deduped in document order',
+      slugs.ids[0] === 'getting-started' && slugs.ids[1] === 'api-foo-bar' &&
+      slugs.ids[2] === 'notes' && slugs.ids[3] === 'notes-1' && slugs.ids[4] === 'notes-2' &&
+      slugs.ids[5] === '', slugs);
+
+    // \w is ASCII-only, so these all slugged to '' and got no id at all -- a
+    // non-English README's table of contents stayed dead after the fragment fix.
+    const unicodeSlugs = await render(cdp,
+      '# \u65e5\u672c\u8a9e\u306e\u898b\u51fa\u3057\n\n## Caf\u00e9 r\u00e9sum\u00e9\n\n## \u0440\u0430\u0437\u0434\u0435\u043b\n',
+      `var hs = el.querySelectorAll('h1,h2');
+       return { ids: Array.prototype.map.call(hs, function (h) { return h.id; }) };`);
+    check('non-latin and accented headings get real slug ids',
+      unicodeSlugs.ids[0] === '\u65e5\u672c\u8a9e\u306e\u898b\u51fa\u3057' &&
+      unicodeSlugs.ids[1] === 'caf\u00e9-r\u00e9sum\u00e9' &&
+      unicodeSlugs.ids[2] === '\u0440\u0430\u0437\u0434\u0435\u043b', unicodeSlugs);
+
+    // The shell renders into <article id="content">, so a heading slugging to
+    // 'content' would be the second one in the tree and lose getElementById to its
+    // own ancestor -- '#content' would scroll to the top of the pane, not the heading.
+    const collision = await render(cdp,
+      '## Content\n\n' + 'filler\n\n'.repeat(60) + '[toc](#content-1)\n',
+      `var h = el.querySelector('h2');
+       var a = el.querySelector('a[href="#content-1"]');
+       var before = window.scrollY;
+       if (a) a.click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { id: h.id, movedDown: window.scrollY > before, href: location.href };`,
+      { budget: 300 });
+    check('a heading named Content does not collide with the shell container',
+      collision.id === 'content-1' && collision.movedDown, collision);
+
+    // Cheap now the harness exists, and both are ways the preview could still be
+    // thrown away: a link to an id that isn't there, and a bare '#'.
+    const noTarget = await render(cdp,
+      '[gone](#not-here)\n',
+      `var before = location.href;
+       el.querySelector('a').click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { navigated: location.href !== before,
+                stillRendered: !!el.querySelector('a[href="#not-here"]') };`,
+      { budget: 300 });
+    check('a fragment link with no target still keeps the preview alive',
+      !noTarget.navigated && noTarget.stillRendered, noTarget);
+
+    const bareHash = await render(cdp,
+      'filler\n\n'.repeat(60) + '[top](#)\n',
+      `window.scrollTo(0, 400);
+       await new Promise(function (r) { setTimeout(r, 100); });
+       var before = location.href;
+       el.querySelector('a[href="#"]').click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { navigated: location.href !== before, y: window.scrollY };`,
+      { budget: 300 });
+    check('a bare hash scrolls to the top without navigating',
+      !bareHash.navigated && bareHash.y === 0, bareHash);
+
+    // Not marking it _blank is only half the job. The page carries a <base href>
+    // pointing at the markdown file's directory so relative images resolve, and per
+    // spec a bare '#heading' resolves against the BASE, not the document — so a
+    // plain in-page click would navigate to file:///thatdir/#heading, i.e. a
+    // directory listing, rather than scrolling. Assert the click actually stays.
+    const jump = await render(cdp,
+      '## Target Heading\n\n' + 'filler\n\n'.repeat(60) + '[jump](#target-heading)\n',
+      `var a = el.querySelector('a[href="#target-heading"]');
+       var before = { href: location.href, y: window.scrollY };
+       a.click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       var h = document.getElementById('target-heading');
+       return { navigated: location.href !== before.href,
+                movedDown: window.scrollY > before.y,
+                headingExists: !!h,
+                stillRendered: !!el.querySelector('a[href="#target-heading"]') };`,
+      { budget: 300 });
+    check('clicking a fragment link scrolls the preview instead of navigating away',
+      jump.headingExists && !jump.navigated && jump.movedDown && jump.stillRendered, jump);
+
+    // Footnote markers and their back-links are fragment links too, so the same
+    // rule has to hold for the shapes marked-with-footnotes actually emits.
+    const footnoteTargets = await render(cdp,
+      'text<sup id="fnref1"><a href="#fn1">1</a></sup>\n\n' +
+      '<section class="footnotes"><ol><li id="fn1">note <a href="#fnref1">back</a></li></ol></section>\n',
+      `var as = el.querySelectorAll('a[href^="#"]');
+       return { count: as.length,
+                targets: Array.prototype.map.call(as, function (a) { return a.target; }) };`);
+    check('footnote links and back-links scroll in-page rather than leaving',
+      footnoteTargets.count === 2 && footnoteTargets.targets.every((t) => t === ''), footnoteTargets);
 
     const richHtml = await render(cdp,
       '<details><summary>more</summary>\n\nbody\n\n</details>\n\n' +
