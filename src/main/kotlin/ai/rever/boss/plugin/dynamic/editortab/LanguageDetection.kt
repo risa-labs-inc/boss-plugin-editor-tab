@@ -87,7 +87,10 @@ internal object LanguageDetection {
             // Podman/OCI's spelling of the same thing.
             lower == "containerfile" || lower.startsWith("containerfile.") -> "dockerfile"
             lower == "makefile" || lower == "gnumakefile" || lower.startsWith("makefile.") -> "makefile"
-            lower == "cmakelists.txt" -> "makefile"
+            // `CMakeLists.txt` deliberately absent: CMake is not Make. A Make lexer
+            // looks for tab-indented recipes that aren't there and misses
+            // `if()/endif()` and `${VAR}`, so it highlights confidently wrong. It was
+            // also asymmetric — the `.cmake` files beside it were never claimed.
             lower == ".env" || lower.startsWith(".env.") -> "properties"
             lower == "gemfile" || lower == "rakefile" -> "ruby"
             else -> null

@@ -128,4 +128,14 @@ class LanguageDetectionTest {
         assertNull(LanguageDetection.lexerFor("text"))
         assertNull(LanguageDetection.lexerFor("brainfuck"))
     }
+
+    /**
+     * CMake is not Make, so it stays unclaimed rather than being highlighted by a
+     * lexer that expects tab-indented recipes. Kept identical to the host's
+     * EditorLanguages, which made the same call.
+     */
+    @Test
+    fun `CMakeLists is not claimed as makefile`() {
+        assertEquals("text", LanguageDetection.detect("/a/CMakeLists.txt"))
+    }
 }
