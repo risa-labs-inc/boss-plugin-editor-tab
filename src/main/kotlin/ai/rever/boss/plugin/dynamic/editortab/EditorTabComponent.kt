@@ -1302,128 +1302,16 @@ class EditorTabComponent(
         }
 
         /**
-         * Detects the programming language from file extension.
+         * Detects the language for a file path.
+         *
+         * Delegates to [LanguageDetection], which lives outside this Compose
+         * component so the mapping can be unit-tested without loading
+         * `ComponentContext` (a `compileOnly` dependency absent from tests).
          */
-        private fun detectLanguage(filePath: String): String {
-            val extension = filePath.substringAfterLast('.', "").lowercase()
-            return when (extension) {
-                "kt", "kts" -> "kotlin"
-                "java" -> "java"
-                "js", "jsx", "mjs", "cjs" -> "javascript"
-                "ts", "tsx" -> "typescript"
-                "py", "pyw" -> "python"
-                "json" -> "json"
-                "xml" -> "xml"
-                "html", "htm" -> "html"
-                "css", "scss", "sass" -> "css"
-                "md", "markdown" -> "markdown"
-                "toml" -> "toml"
-                "gradle" -> "groovy"
-                "swift" -> "swift"
-                "c", "h" -> "c"
-                "cpp", "cc", "cxx", "hpp" -> "cpp"
-                "cs" -> "csharp"
-                "rs" -> "rust"
-                "go" -> "go"
-                "rb" -> "ruby"
-                "php" -> "php"
-                "pl", "pm" -> "perl"
-                "lua" -> "lua"
-                "sh", "bash", "zsh" -> "shell"
-                "yml", "yaml" -> "yaml"
-                "sql" -> "sql"
-                "r" -> "r"
-                "scala" -> "scala"
-                else -> "text"
-            }
-        }
+        internal fun detectLanguage(filePath: String): String = LanguageDetection.detect(filePath)
 
-        /**
-         * Returns the appropriate lexer for the given language.
-         * Matches bundled editor's getLexerForLanguage exactly.
-         */
-        private fun getLexerForLanguage(language: String): BaseLexer? {
-            return when (language) {
-                // Kotlin
-                "kotlin", "kt", "kts" -> KotlinLexer()
-
-                // Java
-                "java" -> JavaLexer()
-
-                // JavaScript
-                "javascript", "js", "jsx", "mjs", "cjs" -> JavaScriptLexer()
-
-                // TypeScript
-                "typescript", "ts", "tsx", "mts", "cts" -> TypeScriptLexer()
-
-                // Python
-                "python", "py", "pyw", "pyi", "pyx" -> PythonLexer()
-
-                // JSON
-                "json", "jsonc", "json5" -> JsonLexer()
-
-                // XML
-                "xml", "pom", "fxml", "xsd", "xsl", "xslt" -> XmlLexer()
-
-                // HTML
-                "html", "htm", "xhtml" -> HtmlLexer()
-
-                // CSS
-                "css", "scss", "sass", "less" -> CssLexer()
-
-                // YAML
-                "yaml", "yml" -> YamlLexer()
-
-                // Markdown
-                "markdown", "md", "mdx" -> MarkdownLexer()
-
-                // Shell
-                "shell", "sh", "bash", "zsh", "fish" -> ShellLexer()
-
-                // SQL
-                "sql", "mysql", "postgresql", "sqlite" -> SqlLexer()
-
-                // Go
-                "go", "golang" -> GoLexer()
-
-                // Rust
-                "rust", "rs" -> RustLexer()
-
-                // Swift
-                "swift" -> SwiftLexer()
-
-                // C/C++
-                "c", "h" -> CLexer()
-                "cpp", "cc", "cxx", "hpp", "hxx", "c++" -> CLexer()
-
-                // C#
-                "csharp", "cs" -> CSharpLexer()
-
-                // Groovy
-                "groovy", "gradle", "gvy", "gy", "gsh" -> GroovyLexer()
-
-                // Scala
-                "scala", "sc" -> ScalaLexer()
-
-                // Ruby
-                "ruby", "rb", "erb", "rake" -> RubyLexer()
-
-                // PHP
-                "php", "php3", "php4", "php5", "phtml" -> PHPLexer()
-
-                // Perl
-                "perl", "pl", "pm", "pod" -> PerlLexer()
-
-                // Lua
-                "lua" -> LuaLexer()
-
-                // TOML
-                "toml" -> TomlLexer()
-
-                // Unknown
-                else -> null
-            }
-        }
+        /** Lexer for [language], or null for plain text. See [LanguageDetection]. */
+        internal fun getLexerForLanguage(language: String): BaseLexer? = LanguageDetection.lexerFor(language)
     }
 }
 
