@@ -77,7 +77,8 @@ fun MarkdownPreviewPane(
     markdown: String,
     baseDir: String,
     darkTheme: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onOpenLocalFile: ((String) -> Unit)? = null
 ) {
     if (browserService == null || !browserService.isAvailable()) {
         PreviewUnavailableMessage(modifier)
@@ -102,9 +103,9 @@ fun MarkdownPreviewPane(
             )
         )
         if (handle != null) {
-            // External links (forced to target=_blank by the shell's JS) open in the
-            // system browser instead of navigating the preview away.
-            handle.setOpenInNewTabCallback { url -> openInSystemBrowser(url) }
+            // Links the shell marked _blank land here. http/https/mailto go to the
+            // system browser; a link to a neighbouring file opens inside BOSS.
+            handle.setOpenInNewTabCallback { url -> routePreviewLink(url, onOpenLocalFile) }
             browserHandle = handle
             pageReady = true
         }
@@ -195,6 +196,90 @@ internal fun isBrowsableLink(url: String): Boolean {
         null // not a URI at all
     }
     return scheme?.lowercase() in BROWSABLE_LINK_SCHEMES
+}
+
+/**
+ * Decides what a clicked preview link does.
+ *
+ * Three outcomes, and the split is the point:
+ *
+ * - `http`/`https`/`mailto` → the system browser, as before.
+ * - a `file:` URL naming an existing regular file → opened **inside BOSS** via
+ *   [onOpenLocalFile], never handed to the desktop. This is what makes a relative
+ *   link to a neighbouring `.md` work again; the sanitisation pass had to refuse
+ *   those wholesale because `<base href>` resolves them to `file:` URLs and
+ *   `Desktop.browse` would let the OS decide what to *execute* for
+ *   `[docs](./setup.exe)`. Handing the path to the editor removes that: BOSS reads
+ *   the bytes, the OS is never consulted.
+ * - anything else — a `file:` URL pointing at a directory or nothing, `jar:`,
+ *   `smb:`, a scheme some other application registered → dropped.
+ */
+internal sealed interface PreviewLinkRoute {
+    /** Hand to the desktop — only ever an allowlisted outward scheme. */
+    data class SystemBrowser(val url: String) : PreviewLinkRoute
+
+    /** Open inside BOSS. The OS is never asked what this file means. */
+    data class LocalFile(val path: String) : PreviewLinkRoute
+
+    /** Nothing safe to do with it. */
+    data object Refuse : PreviewLinkRoute
+}
+
+/** Where a clicked preview link should go. Pure — [routePreviewLink] acts on it. */
+internal fun previewLinkRoute(url: String): PreviewLinkRoute = when {
+    isBrowsableLink(url) -> PreviewLinkRoute.SystemBrowser(url)
+    else -> localFileFor(url)?.let { PreviewLinkRoute.LocalFile(it) } ?: PreviewLinkRoute.Refuse
+}
+
+private fun routePreviewLink(url: String, onOpenLocalFile: ((String) -> Unit)?) {
+    when (val route = previewLinkRoute(url)) {
+        is PreviewLinkRoute.SystemBrowser -> openInSystemBrowser(route.url)
+        is PreviewLinkRoute.LocalFile ->
+            if (onOpenLocalFile != null) {
+                onOpenLocalFile(route.path)
+            } else {
+                System.err.println("[MarkdownPreview] No host route for a local preview link; ignoring")
+            }
+        PreviewLinkRoute.Refuse ->
+            System.err.println(
+                "[MarkdownPreview] Refusing preview link: not http/https/mailto and not a local file"
+            )
+    }
+}
+
+/**
+ * The path a `file:` URL names, if it is an existing regular file.
+ *
+ * A directory is rejected (nothing sensible to open) and so is a path that does not
+ * exist, which keeps a typo'd link from reaching the host at all.
+ *
+ * The fragment and query are dropped before the path is taken. `[see](./OTHER.md#setup)`
+ * is an ordinary thing to write and `<base href>` resolves it to `file:///…/OTHER.md#setup`;
+ * `java.io.File(URI)` rejects any URI carrying either component, so without this a
+ * cross-file heading link would be refused rather than opened.
+ */
+private fun localFileFor(url: String): String? {
+    val uri = try {
+        java.net.URI(url)
+    } catch (_: Exception) {
+        return null
+    }
+    if (uri.scheme?.lowercase() != "file") return null
+    val bare = if (uri.fragment == null && uri.query == null) {
+        uri
+    } else {
+        try {
+            java.net.URI(uri.scheme, uri.authority, uri.path, null, null)
+        } catch (_: Exception) {
+            return null
+        }
+    }
+    val file = try {
+        java.io.File(bare)
+    } catch (_: Exception) {
+        return null
+    }
+    return file.absolutePath.takeIf { file.isFile }
 }
 
 private fun openInSystemBrowser(url: String) {
@@ -591,9 +676,41 @@ internal fun buildPreviewHtml(
       var fragment = DOMPurify.sanitize(marked.parse(md, { gfm: true }), PURIFY_CONFIG);
       el.textContent = '';
       el.appendChild(fragment);
-      // Route every link through the new-tab path so the host can hand it to
-      // the system browser instead of navigating the preview away.
-      el.querySelectorAll('a[href]').forEach(function(a) { a.target = '_blank'; });
+      // Give headings the slug ids a '#heading' link expects.
+      //
+      // marked used to emit these itself; it dropped heading ids in v8 (they live in
+      // a separate extension now), so with marked v18 nothing in the document has an
+      // id and every table-of-contents link points at something that isn't there.
+      // Assigned after sanitizing, on our own nodes, so it does not depend on the
+      // purify allowlist keeping an id attribute.
+      var usedIds = Object.create(null);
+      el.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h) {
+        if (h.id) { usedIds[h.id] = true; return; }
+        // GitHub's slug: lowercase, drop punctuation, spaces to hyphens. Collisions
+        // get -1, -2 ... in document order, as GitHub numbers them.
+        var base = (h.textContent || '')
+          .trim()
+          .toLowerCase()
+          .replace(/[^\w\- ]+/g, '')
+          .replace(/\s+/g, '-');
+        if (!base) return;
+        var id = base, n = 0;
+        while (usedIds[id]) { n++; id = base + '-' + n; }
+        usedIds[id] = true;
+        h.id = id;
+      });
+      // Route outbound links through the new-tab path so the host decides where
+      // they go, instead of navigating the preview away.
+      //
+      // Fragment-only links are excluded: '#heading' anchors and footnote
+      // back-links are meant to scroll *this* document. Marking them _blank sent
+      // them to the host too, so in-page navigation never worked -- a README's
+      // table of contents did nothing.
+      el.querySelectorAll('a[href]').forEach(function(a) {
+        var href = a.getAttribute('href') || '';
+        if (href.charAt(0) === '#') return;
+        a.target = '_blank';
+      });
       // Turn ```mermaid fences into rendered diagrams. textContent un-escapes the
       // HTML entities marked produced, giving mermaid the raw diagram source.
       var fences = el.querySelectorAll('pre > code.language-mermaid');
@@ -615,6 +732,34 @@ internal fun buildPreviewHtml(
       showRenderError('Markdown render error: ' + String(e));
     }
   };
+
+  // Scroll fragment links ourselves instead of letting the browser navigate.
+  //
+  // The page carries a <base href> pointing at the markdown file's directory so
+  // relative images resolve, and per spec a bare '#heading' resolves against the
+  // BASE rather than the document -- so the default action for '#heading' is a
+  // real navigation to file:///thatdir/#heading, which throws away the preview and
+  // lands on a directory listing. Not marking these _blank is necessary but not
+  // sufficient; the scroll has to be explicit.
+  //
+  // Delegated and installed once, so it survives every re-render.
+  document.addEventListener('click', function(ev) {
+    var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+    if (!a || a.target === '_blank') return;
+    var href = a.getAttribute('href') || '';
+    if (href.charAt(0) !== '#') return;
+    ev.preventDefault();
+    var id = decodeURIComponent(href.slice(1));
+    if (!id) {
+      window.scrollTo(0, 0);
+      return;
+    }
+    // getElementById first: a heading slug is an id. getElementsByName covers the
+    // '<a name=...>' anchors older hand-written markdown still uses. Neither is a
+    // selector, so a slug containing CSS metacharacters cannot break the lookup.
+    var t = document.getElementById(id) || document.getElementsByName(id)[0];
+    if (t) t.scrollIntoView({ block: 'start' });
+  });
 
   // Test seam: `src/test/js/preview-dom.test.mjs` drives these directly so the
   // sanitize and scrub paths are asserted against a real DOM.

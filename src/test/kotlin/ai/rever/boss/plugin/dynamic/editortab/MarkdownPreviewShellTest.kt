@@ -301,6 +301,104 @@ class MarkdownPreviewShellTest {
         ).forEach { assertFalse(isBrowsableLink(it), "$it must not be handed to the desktop") }
     }
 
+    // ---------- where a clicked link goes ----------
+
+    @Test
+    fun `outward schemes route to the system browser`() {
+        listOf("https://example.invalid/x", "http://example.invalid/x", "mailto:a@example.invalid")
+            .forEach {
+                assertEquals(
+                    PreviewLinkRoute.SystemBrowser(it), previewLinkRoute(it),
+                    "$it should go to the system browser"
+                )
+            }
+    }
+
+    @Test
+    fun `a link to a neighbouring file opens inside BOSS`() {
+        // The whole point of the local-file route: a relative link, which <base href>
+        // has already turned into a file: URL, reaches the editor as a path. The OS is
+        // never asked what the file means, so `[docs](./setup.exe)` cannot launch.
+        val dir = Files.createTempDirectory("boss-preview-link-test")
+        val neighbour = dir.resolve("OTHER.md").toFile().apply { writeText("# other\n") }
+        val exe = dir.resolve("setup.exe").toFile().apply { writeText("MZ") }
+        try {
+            assertEquals(
+                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
+                previewLinkRoute(neighbour.toURI().toString())
+            )
+            assertEquals(
+                PreviewLinkRoute.LocalFile(exe.absolutePath),
+                previewLinkRoute(exe.toURI().toString()),
+                "an executable must route into BOSS as a file, never to the desktop"
+            )
+        } finally {
+            neighbour.delete()
+            exe.delete()
+            dir.toFile().delete()
+        }
+    }
+
+    @Test
+    fun `a heading link into another file keeps working`() {
+        // `[see](./OTHER.md#setup)` is ordinary markdown, and File(URI) rejects any URI
+        // carrying a fragment — so the fragment has to be stripped or the link is refused.
+        val dir = Files.createTempDirectory("boss-preview-frag-test")
+        val neighbour = dir.resolve("OTHER.md").toFile().apply { writeText("# setup\n") }
+        try {
+            assertEquals(
+                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
+                previewLinkRoute("${neighbour.toURI()}#setup")
+            )
+            assertEquals(
+                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
+                previewLinkRoute("${neighbour.toURI()}?v=1")
+            )
+        } finally {
+            neighbour.delete()
+            dir.toFile().delete()
+        }
+    }
+
+    @Test
+    fun `a path with a space still resolves`() {
+        val dir = Files.createTempDirectory("boss preview space test")
+        val neighbour = dir.resolve("my notes.md").toFile().apply { writeText("# notes\n") }
+        try {
+            assertEquals(
+                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
+                previewLinkRoute(neighbour.toURI().toString()),
+                "a percent-encoded path must be decoded back to the real file"
+            )
+        } finally {
+            neighbour.delete()
+            dir.toFile().delete()
+        }
+    }
+
+    @Test
+    fun `everything else is refused`() {
+        val dir = Files.createTempDirectory("boss-preview-refuse-test")
+        try {
+            listOf(
+                "file://${dir.toFile().absolutePath}", // a directory: nothing to open
+                "file:///nonexistent/boss/never/here.md", // a typo must not reach the host
+                "jar:file:///tmp/x.jar!/y",
+                "smb://host/share/x",
+                "javascript:alert(1)",
+                "data:text/html,<script>alert(1)</script>",
+                "vbscript:msgbox(1)",
+                "custom-handler:payload",
+                "",
+                "not a uri at all"
+            ).forEach {
+                assertEquals(PreviewLinkRoute.Refuse, previewLinkRoute(it), "$it must be refused")
+            }
+        } finally {
+            dir.toFile().delete()
+        }
+    }
+
     // ---------- where the sanitizer is extracted to ----------
 
     @Test
