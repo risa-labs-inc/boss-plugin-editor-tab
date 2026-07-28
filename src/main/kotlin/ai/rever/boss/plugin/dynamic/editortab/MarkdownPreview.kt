@@ -227,7 +227,9 @@ internal fun newScriptNonce(): String {
 }
 
 /**
- * Escapes a value for use inside a double-quoted HTML attribute.
+ * Escapes a value for use inside a double-quoted HTML attribute. Every attribute
+ * the shell interpolates into is double-quoted, so an apostrophe is left alone —
+ * which keeps the policy's `'none'` and `'nonce-…'` readable in the emitted page.
  *
  * The URIs the shell interpolates come from [File.toURI], which already
  * percent-encodes the characters that would end an attribute. Escaping here as
@@ -237,7 +239,6 @@ internal fun newScriptNonce(): String {
 private fun htmlAttr(value: String): String = value
     .replace("&", "&amp;")
     .replace("\"", "&quot;")
-    .replace("'", "&#39;")
     .replace("<", "&lt;")
     .replace(">", "&gt;")
 
@@ -398,7 +399,7 @@ internal fun buildPreviewHtml(
   // stays out so the page's own stylesheet remains the only one, and <form> stays
   // out because a preview has nothing to submit. RETURN_DOM_FRAGMENT hands back
   // nodes instead of a markup string, so the sanitized result is never re-parsed
-  // and the page needs no innerHTML.
+  // and no markup string is ever assigned to this document.
   var PURIFY_CONFIG = {
     USE_PROFILES: { html: true },
     FORBID_TAGS: ['style', 'form'],
@@ -409,14 +410,24 @@ internal fun buildPreviewHtml(
     mermaid.initialize({
       startOnLoad: false,
       // Mermaid renders a diagram by building an SVG string and writing it into
-      // the page itself, which is a path the sanitize call above never sees. Its
-      // 'strict' level is what keeps that output tame: label text is entity-encoded
-      // and run through mermaid's own bundled DOMPurify, and click directives are
-      // ignored. It is also mermaid's default, but a diagram may carry an
-      // `%%{init: …}%%` directive, so the level is stated here rather than assumed
-      // — mermaid keeps securityLevel in its 'secure' list, meaning a value set on
-      // the site config cannot be lowered from inside a diagram.
+      // the page itself — a path the sanitize call above never sees. Two settings
+      // keep what it writes to drawing instructions:
+      //
+      // securityLevel 'strict' entity-encodes label text, runs it through
+      // mermaid's own bundled DOMPurify and ignores click directives. It is also
+      // mermaid's default, but it is stated rather than assumed because a diagram
+      // may carry an `%%{init: …}%%` directive; mermaid keeps securityLevel in its
+      // 'secure' list, so a level set here cannot be lowered from inside a diagram.
       securityLevel: 'strict',
+      // htmlLabels false is the one that settles it. With HTML labels on — the
+      // flowchart default — a quoted label is placed in a foreignObject as live
+      // HTML, and 'strict' does not prevent that: a label of
+      // `A["<img src=x onerror=…>"]` really does become an img element in the
+      // page. With them off, every label is drawn as SVG <text>, so a label can
+      // carry no markup at all. Diagrams render the same either way; labels lose
+      // only HTML formatting inside them.
+      htmlLabels: false,
+      flowchart: { htmlLabels: false },
       theme: ${if (dark) "'dark'" else "'default'"}
     });
   }

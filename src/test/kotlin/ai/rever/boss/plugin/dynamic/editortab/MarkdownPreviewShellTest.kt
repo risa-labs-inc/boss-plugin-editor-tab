@@ -186,6 +186,18 @@ class MarkdownPreviewShellTest {
     }
 
     @Test
+    fun `mermaid draws labels as svg text rather than html`() {
+        val html = shell()
+        // Verified in preview-dom.test.mjs: with HTML labels on, 'strict' still lets
+        // a quoted label become live HTML in a foreignObject.
+        assertTrue(html.contains("htmlLabels: false"), "label HTML must be off globally")
+        assertTrue(
+            html.contains("flowchart: { htmlLabels: false }"),
+            "the flowchart default re-enables label HTML, so it must be set too"
+        )
+    }
+
+    @Test
     fun `rendered diagrams are scrubbed on both mermaid outcomes`() {
         val html = shell()
         assertTrue(
