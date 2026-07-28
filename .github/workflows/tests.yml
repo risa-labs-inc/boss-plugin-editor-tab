@@ -1,0 +1,72 @@
+name: Tests
+
+# The release workflow only runs on main, so until this existed nothing ran the
+# tests before a merge — and the preview page's invariants (what reaches its DOM,
+# what its policy permits) are exactly the kind that regress silently.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      # CI=true switches build.gradle.kts off the local sibling checkout (absent
+      # here) and onto this jar, the same way the release workflow does.
+      - name: Download boss-plugin-api
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p build/downloaded-deps
+          API_VERSION=$(gh api repos/risa-labs-inc/boss-plugin-api/releases/latest --jq '.tag_name' | sed 's/^v//')
+          echo "boss-plugin-api: $API_VERSION"
+          curl -fsSL -o build/downloaded-deps/boss-plugin-api.jar \
+            "https://github.com/risa-labs-inc/boss-plugin-api/releases/download/v${API_VERSION}/boss-plugin-api-${API_VERSION}.jar"
+
+      # Also lays down build/preview-fixture/preview.html — the real preview page
+      # the DOM test below opens.
+      - name: Kotlin tests
+        run: ./gradlew test
+
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      # Node 22 for the global WebSocket the DOM test drives the DevTools protocol
+      # over; on 20 it is still behind a flag.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Preview DOM tests
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+        run: node src/test/js/preview-dom.test.mjs
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            build/reports/tests/
+            build/test-results/
+          if-no-files-found: ignore

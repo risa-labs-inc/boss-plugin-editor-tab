@@ -185,6 +185,17 @@ tasks.processResources {
     }
 }
 
+// MarkdownPreviewFixtureTest lays down the real preview page for
+// src/test/js/preview-dom.test.mjs to open in a headless browser. Pass the
+// destination explicitly rather than letting it resolve a relative path against
+// the test JVM's working directory.
+tasks.test {
+    systemProperty(
+        "preview.fixture.dir",
+        layout.buildDirectory.dir("preview-fixture").get().asFile.absolutePath
+    )
+}
+
 tasks.build {
     dependsOn("buildPluginJar")
 }
