@@ -25,9 +25,19 @@ class MarkdownPreviewFixtureTest {
     private val onePixelPng =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 
+    /**
+     * Where to write the fixture. `build.gradle.kts` passes this as
+     * `preview.fixture.dir` so the location does not silently depend on the test
+     * JVM's working directory (correct under Gradle, surprising from an IDE run
+     * configuration); the relative fallback keeps a bare `mvn`-style invocation
+     * working.
+     */
+    private fun fixtureRoot(): File =
+        System.getProperty("preview.fixture.dir")?.let(::File) ?: File("build/preview-fixture")
+
     @Test
     fun `writes the preview page fixture for the DOM test`() {
-        val root = File("build/preview-fixture")
+        val root = fixtureRoot()
         val libDir = File(root, "lib").apply { mkdirs() }
         val docDir = File(root, "doc").apply { mkdirs() }
 

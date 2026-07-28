@@ -155,6 +155,10 @@ async function openBrowser(browserBin, port, userDataDir, fileUrl) {
   ];
   // chrome-headless-shell is headless by design and rejects the flag.
   if (!browserBin.includes('headless-shell')) args.unshift('--headless=new');
+  // CI runners restrict the unprivileged user namespaces Chromium's sandbox needs
+  // and give containers a small /dev/shm. Neither matters for a local file opened
+  // in a throwaway profile.
+  if (process.env.CI) args.unshift('--no-sandbox', '--disable-dev-shm-usage');
 
   const child = spawn(browserBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
@@ -525,6 +529,35 @@ async function run() {
       scrub.keptForeignObject === true && scrub.keptUse === '#marker-1' &&
       scrub.keptDataImage === true && scrub.keptCircle === true &&
       scrub.keptStyleAttr === 'fill:red', scrub);
+
+    // Two shapes a plain `^javascript:` test does not catch, both reachable only
+    // through mermaid's output — DOMPurify normalizes attribute whitespace and
+    // drops animation elements itself, so the sanitized path never sees either.
+    // The policy is what actually stops them from running; these checks keep the
+    // second line from being the layer that quietly does not hold.
+    const evasion = await cdp.eval(`
+      var host = document.createElement('div');
+      host.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg">' +
+        '<a id="tabbed" xlink:href="java&#9;script:window.__ran=true"><circle r="3"/></a>' +
+        '<a id="animated" xlink:href="#ok">' +
+        '<animate attributeName="xlink:href" to="javascript:window.__ran=true"/>' +
+        '<set attributeName="xlink:href" to="javascript:window.__ran=true"/></a>' +
+        '</svg>';
+      document.getElementById('content').appendChild(host);
+      window.__previewInternals.scrubRendered(host);
+      var result = {
+        tabbedHref: host.querySelector('#tabbed').getAttribute('xlink:href'),
+        animations: host.querySelectorAll('animate, set, animateTransform, animateMotion').length,
+        keptAnchor: host.querySelector('#animated') !== null,
+        keptCircle: host.querySelector('circle') !== null
+      };
+      host.remove();
+      return result;
+    `);
+    check('a control character inside the scheme name does not smuggle it past the scrub',
+      evasion.tabbedHref === null, evasion);
+    check('an animation element cannot re-point an attribute after the scrub',
+      evasion.animations === 0 && evasion.keptAnchor === true && evasion.keptCircle === true, evasion);
 
     // ---- fail closed ------------------------------------------------------
     console.log('\nfail closed');

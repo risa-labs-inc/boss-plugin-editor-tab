@@ -16,7 +16,23 @@ Code editor tab with syntax highlighting, code folding, and run gutter icons
 ./gradlew buildPluginJar    # Build plugin JAR (output: build/libs/)
 ./gradlew build              # Full build
 ./gradlew processResources   # Process resources (syncs version)
+./gradlew test               # Kotlin tests
 ```
+
+### Markdown preview DOM tests
+
+The preview pane is a JavaScript page, so its behaviour is tested by running it
+in a headless browser rather than by grepping its source. Two steps, because the
+JS test opens the page the Kotlin test writes:
+
+```bash
+./gradlew test --tests '*MarkdownPreviewFixtureTest'   # writes build/preview-fixture/
+node src/test/js/preview-dom.test.mjs                  # opens it, asserts on the DOM
+```
+
+No npm dependencies; needs Node ≥ 22 and a Chromium binary, taken from `$CHROME`
+if set and otherwise found in the usual Playwright/Puppeteer cache locations.
+Both suites run on every PR via `.github/workflows/tests.yml`.
 
 ## Workflow Rules
 

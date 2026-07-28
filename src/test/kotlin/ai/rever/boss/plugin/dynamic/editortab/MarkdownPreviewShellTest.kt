@@ -1,9 +1,13 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -50,8 +54,16 @@ class MarkdownPreviewShellTest {
 
     // ---------- how markdown-derived HTML reaches the DOM ----------
 
+    /**
+     * Scope note: this greps **the shell**, which is the code that decides how
+     * markdown-derived HTML reaches the document. It says nothing about the
+     * vendored libraries — `mermaid.min.js` writes markup strings internally, as
+     * its own business. What keeps *mermaid's* output from carrying markup a
+     * diagram supplied is `htmlLabels: false` plus the policy plus `scrubRendered`,
+     * asserted separately below and in `preview-dom.test.mjs`.
+     */
     @Test
-    fun `page never assigns a markup string to the DOM`() {
+    fun `the shell never assigns a markup string to the DOM`() {
         val html = shell()
         listOf("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "createContextualFragment")
             .forEach { sink ->
@@ -68,8 +80,10 @@ class MarkdownPreviewShellTest {
         val html = shell()
         val parses = Regex("""marked\.parse\(""").findAll(html).count()
         assertEquals(1, parses, "expected exactly one marked.parse call to audit")
+        // Whitespace-tolerant: the guarantee is that marked's output is the
+        // sanitizer's argument, not the exact formatting of the call.
         assertTrue(
-            html.contains("DOMPurify.sanitize(marked.parse(md, { gfm: true }), PURIFY_CONFIG)"),
+            Regex("""DOMPurify\.sanitize\(\s*marked\.parse\(""").containsMatchIn(html),
             "marked's output must be handed straight to DOMPurify"
         )
         assertTrue(html.contains("RETURN_DOM_FRAGMENT: true"), "sanitizer must return nodes, not markup")
@@ -140,11 +154,17 @@ class MarkdownPreviewShellTest {
         }
     }
 
+    /**
+     * No count assertion here on purpose: the guarantee is that *every* script the
+     * page carries is nonced, which holds for any number of them. The count is
+     * load-bearing only in the interpolation test below, where it is what shows an
+     * injected script tag did not appear.
+     */
     @Test
     fun `every script the page carries is nonced`() {
         val html = shell()
         val scriptTags = Regex("""<script(\s[^>]*)?>""").findAll(html).toList()
-        assertEquals(4, scriptTags.size, "expected the three vendored libraries plus the shell's own script")
+        assertTrue(scriptTags.isNotEmpty(), "page carries no script tags at all")
         scriptTags.forEach { tag ->
             assertTrue(
                 tag.value.contains("""nonce="$nonce""""),
@@ -202,14 +222,113 @@ class MarkdownPreviewShellTest {
     fun `rendered diagrams are scrubbed on both mermaid outcomes`() {
         val html = shell()
         assertTrue(
-            html.contains("mermaid.run({ nodes: el.querySelectorAll('pre.mermaid') }).then(scrub, scrub)"),
+            Regex("""mermaid\.run\(\{\s*nodes:\s*diagrams\s*\}\)\.then\(scrub,\s*scrub\)""")
+                .containsMatchIn(html),
             "mermaid's output must be scrubbed whether the run resolves or rejects"
         )
         assertTrue(html.contains("function scrubRendered(root)"))
+        // Scoped to the diagram roots, not the whole article: that is the output
+        // path the scrub exists for, and it keeps a document with one mermaid fence
+        // from re-walking every element in it on every debounced re-render.
+        assertTrue(
+            html.contains("var diagrams = el.querySelectorAll('pre.mermaid')") &&
+                html.contains("diagrams.forEach(function(d) { scrubRendered(d); })"),
+            "the scrub must run over the diagram roots rather than all of #content"
+        )
+    }
+
+    @Test
+    fun `the scrub drops the elements that can re-point an attribute later`() {
+        val html = shell()
+        // SMIL can set an attribute after a one-pass scrub has been over the tree,
+        // so <animate>/<set> and friends are removed outright. Verified against a
+        // real DOM in preview-dom.test.mjs.
+        listOf("'animate'", "'animatemotion'", "'animatetransform'", "'set'").forEach { name ->
+            assertTrue(html.contains("name === $name"), "scrub does not remove $name elements")
+        }
+    }
+
+    @Test
+    fun `the scrub tests the scheme with url whitespace removed`() {
+        val html = shell()
+        // A browser strips TAB/LF/CR out of a URL before parsing its scheme, so
+        // `java<TAB>script:` runs while `/^javascript:/` does not match it.
+        assertTrue(
+            html.contains("""replace(/[\u0000-\u0020]/g, '')"""),
+            "the scheme test must run against a value with control characters removed"
+        )
+        assertTrue(html.contains("""/^(?:javascript|vbscript):/i"""))
     }
 
     @Test
     fun `theme choice does not change the policy`() {
         assertEquals(cspDirectives(shell(dark = false)), cspDirectives(shell(dark = true)))
+    }
+
+    // ---------- what a clicked link may reach ----------
+
+    @Test
+    fun `only outward-pointing schemes are handed to the desktop`() {
+        listOf(
+            "https://example.invalid/x",
+            "http://example.invalid/x",
+            "HTTPS://example.invalid/x",
+            "mailto:someone@example.invalid"
+        ).forEach { assertTrue(isBrowsableLink(it), "$it should open in the system browser") }
+    }
+
+    @Test
+    fun `a resolved local path is not handed to the desktop`() {
+        // Every link in the preview is routed through the new-tab callback, and a
+        // relative href — which DOMPurify keeps by design — has already resolved
+        // against <base href> into an absolute file: URL by the time it arrives.
+        // Desktop.browse on one of these is a local-file open, and on Windows goes
+        // through ShellExecute, which for some target types launches rather than
+        // views.
+        listOf(
+            "file:///Users/someone/.ssh/id_rsa",
+            "file:///Users/someone/docs/setup.exe",
+            "file:///etc/passwd",
+            "jar:file:///tmp/x.jar!/y",
+            "smb://host/share/x",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "custom-handler:payload",
+            "",
+            "not a uri at all",
+            "./OTHER.md"
+        ).forEach { assertFalse(isBrowsableLink(it), "$it must not be handed to the desktop") }
+    }
+
+    // ---------- where the sanitizer is extracted to ----------
+
+    @Test
+    fun `the extraction directory is unguessable and owner-only`() {
+        // The sanitizer every guarantee above rests on is extracted to this
+        // directory. A fixed name under the system temp dir is one another local
+        // account can create first — mkdirs() succeeds silently on a directory it
+        // does not own — and populate with a passthrough purify.min.js that still
+        // reports isSupported.
+        val first = createPreviewTmpDir()
+        val second = createPreviewTmpDir()
+        try {
+            assertTrue(first.isDirectory, "temp dir was not created")
+            assertNotEquals(
+                first.name, second.name,
+                "the extraction directory name must not be predictable"
+            )
+            val posix = FileSystems.getDefault().supportedFileAttributeViews().contains("posix")
+            if (posix) {
+                assertEquals(
+                    "rwx------",
+                    PosixFilePermissions.toString(Files.getPosixFilePermissions(first.toPath())),
+                    "nothing but this user may write into the directory holding the sanitizer"
+                )
+            }
+        } finally {
+            first.delete()
+            second.delete()
+        }
     }
 }

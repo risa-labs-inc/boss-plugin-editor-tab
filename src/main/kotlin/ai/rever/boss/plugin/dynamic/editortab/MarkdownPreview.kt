@@ -29,6 +29,11 @@ import compose.icons.FeatherIcons
 import compose.icons.feathericons.EyeOff
 import kotlinx.coroutines.delay
 import java.io.File
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.attribute.FileAttribute
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.SecureRandom
 import java.util.Base64
 
 /** View mode for Markdown files: plain editor, side-by-side, or rendered preview only. */
@@ -162,7 +167,41 @@ private fun PreviewUnavailableMessage(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * The schemes a previewed document may hand to the desktop.
+ *
+ * Every link in the preview is the opened repository's writing, and the shell
+ * routes all of them here by setting `target = '_blank'`. DOMPurify drops an
+ * *absolute* `file:` href, but a relative one is kept by design — and by the time
+ * the page reports a click, that relative path has resolved against `<base href>`
+ * into an absolute `file:` URL. So without this list
+ * `[Setup instructions](../../../../home/you/.ssh/id_rsa)` or `[docs](./setup.exe)`
+ * would be a one-click local-file open — on Windows through ShellExecute, which
+ * for some target types launches rather than views. The click is the operator's,
+ * which caps the severity, but "make the operator click a plausible-looking link"
+ * is squarely inside the threat model a hostile README presents.
+ *
+ * Only the schemes a document has a legitimate reason to point outward with are
+ * passed through. Anything else — `file:`, `jar:`, `smb:`, a custom handler
+ * registered by some other application — is dropped.
+ */
+private val BROWSABLE_LINK_SCHEMES = setOf("http", "https", "mailto")
+
+/** Whether [url] is something [openInSystemBrowser] will hand to the desktop. */
+internal fun isBrowsableLink(url: String): Boolean {
+    val scheme = try {
+        java.net.URI(url).scheme
+    } catch (_: Exception) {
+        null // not a URI at all
+    }
+    return scheme?.lowercase() in BROWSABLE_LINK_SCHEMES
+}
+
 private fun openInSystemBrowser(url: String) {
+    if (!isBrowsableLink(url)) {
+        System.err.println("[MarkdownPreview] Refusing to open a preview link that is not http, https or mailto")
+        return
+    }
     try {
         if (java.awt.Desktop.isDesktopSupported()) {
             java.awt.Desktop.getDesktop().browse(java.net.URI(url))
@@ -174,25 +213,56 @@ private fun openInSystemBrowser(url: String) {
 
 // ========== HTML shell generation ==========
 
-private val previewTmpDir: File by lazy {
-    File(System.getProperty("java.io.tmpdir"), "boss-md-preview").apply { mkdirs() }
+/**
+ * Creates the directory holding the extracted libraries and the generated shells.
+ *
+ * Deliberately not a fixed name under the system temp dir. That path is
+ * guessable, and `mkdirs()` succeeds silently on a directory a different local
+ * account created first — so on a shared host that account could pre-populate it
+ * with a `purify.min.js` whose `sanitize` is a passthrough. It would still report
+ * `isSupported`, the fail-closed guard would pass, and every property this page
+ * establishes would be gone with no visible symptom. That was survivable while
+ * the directory only held rendering libraries; it is not now that the sanitizer
+ * the preview's guarantees rest on lives there.
+ *
+ * [Files.createTempDirectory] picks an unguessable name, and where the filesystem
+ * carries POSIX permissions the directory is created `rwx------` so nothing but
+ * this user can write into it. On Windows the attribute is unsupported and
+ * omitted; the per-user temp directory is not a shared location there.
+ *
+ * The directory is registered for deletion *before* anything is written into it,
+ * so the JVM's reverse-order exit hook removes the files first and then the
+ * directory itself.
+ */
+internal fun createPreviewTmpDir(): File {
+    val posix = FileSystems.getDefault().supportedFileAttributeViews().contains("posix")
+    val attrs: Array<FileAttribute<*>> = if (posix) {
+        arrayOf(PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")))
+    } else {
+        emptyArray()
+    }
+    return Files.createTempDirectory("boss-md-preview", *attrs).toFile()
+        .also { it.deleteOnExit() }
 }
 
+private val previewTmpDir: File by lazy { createPreviewTmpDir() }
+
 /**
- * Extracts a vendored JS library from plugin resources to a shared temp file
- * (one copy for all tabs) and returns its file:// URI. The page references it by
- * absolute URI because `<base href>` points at the markdown file's directory.
+ * Extracts a vendored JS library from plugin resources to a temp file (one copy
+ * for all tabs) and returns its file:// URI. The page references it by absolute
+ * URI because `<base href>` points at the markdown file's directory.
+ *
+ * Always written, never reconciled against what is already on disk: the
+ * containing directory is created fresh per JVM, so there is nothing there to
+ * reuse, and a "same size means same file" shortcut is exactly the kind of check
+ * a substituted sanitizer passes.
  */
 private fun extractJsResource(name: String): String {
     val target = File(previewTmpDir, name)
     val resource = object {}.javaClass.classLoader.getResourceAsStream("markdown-preview/$name")
         ?: error("markdown-preview/$name missing from plugin resources")
-    resource.use { input ->
-        val bytes = input.readBytes()
-        if (!target.exists() || target.length() != bytes.size.toLong()) {
-            target.writeBytes(bytes)
-        }
-    }
+    target.deleteOnExit()
+    resource.use { input -> target.writeBytes(input.readBytes()) }
     return target.toURI().toString()
 }
 
@@ -212,6 +282,9 @@ private val mermaidJsUri: String by lazy { extractJsResource("mermaid.min.js") }
  */
 private val purifyJsUri: String by lazy { extractJsResource("purify.min.js") }
 
+/** Seeded once; [SecureRandom] is thread-safe and reseeds itself. */
+private val nonceRandom = SecureRandom()
+
 /**
  * Fresh nonce per preview page. The shell's Content-Security-Policy names this
  * value as the only way a script may run, and every `<script>` the shell writes
@@ -220,7 +293,7 @@ private val purifyJsUri: String by lazy { extractJsResource("purify.min.js") }
  */
 internal fun newScriptNonce(): String {
     val bytes = ByteArray(16)
-    java.security.SecureRandom().nextBytes(bytes)
+    nonceRandom.nextBytes(bytes)
     // Base64url: the CSP nonce grammar accepts '-' and '_', and dropping the
     // padding keeps the value free of '=' too.
     return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
@@ -282,6 +355,17 @@ private fun writePreviewShell(markdown: String, baseDir: String, dark: Boolean):
  *      inserting a `<style>` element into the SVG it builds, and the shell's own
  *      stylesheet is inline. Styles are not script, and with the fetch directives
  *      below a stylesheet has nowhere to send anything.
+ *
+ *      **Accepted residual**: DOMPurify's html profile keeps `style` *attributes*,
+ *      and this directive permits them, so a hostile document can style itself —
+ *      a `position: fixed` full-viewport overlay could spoof preview content
+ *      inside the preview pane. There is no exfiltration channel behind it
+ *      (`img-src` and `media-src` are `file: data:`, and `connect-src`/`font-src`
+ *      are `'none'`), so the reach ends at the pane. It is left as-is rather than
+ *      fixed with `FORBID_ATTR: ['style']`, because marked expresses table column
+ *      alignment as `style="text-align:right"` — dropping the attribute would
+ *      silently regress every aligned table until the stylesheet grew matching
+ *      `[align]` rules.
  *    - `img-src`/`media-src file: data:` — a document's relative image paths resolve
  *      against `<base href>` to `file:` URLs, and marked passes `data:` images
  *      through. Remote schemes are deliberately absent: a preview must not become a
@@ -433,17 +517,31 @@ internal fun buildPreviewHtml(
     });
   }
 
-  // Second line on mermaid's output path: whatever the SVG turned out to contain,
-  // no script element, inline handler or script-bearing URL survives in it. In
-  // normal operation this removes nothing (mermaid emits neither), and it leaves
-  // the drawing alone — geometry, foreignObject content, diagram-internal `#id`
-  // references (markers and <use> need them) and data: images.
+  // Second line on mermaid's output path — the policy above is the control that
+  // actually stops any of this from running, and it does so whether or not this
+  // function is correct. What this adds is that a rendered diagram does not sit in
+  // the document carrying a script element, an inline handler or a script-bearing
+  // URL in the first place. In normal operation it removes nothing (mermaid emits
+  // none of them), and it leaves the drawing alone — geometry, foreignObject
+  // content, diagram-internal `#id` references (markers and <use> need them) and
+  // data: images.
+  //
+  // Called with each `pre.mermaid` as its root rather than the whole article: that
+  // is the output path this is here for, and it keeps a document with one diagram
+  // from re-walking every element and attribute in it on every debounced
+  // re-render.
   function scrubRendered(root) {
     var all = root.querySelectorAll('*');
     for (var i = 0; i < all.length; i++) {
       var node = all[i];
       var name = (node.nodeName || '').toLowerCase();
-      if (name === 'script' || name === 'iframe' || name === 'object' || name === 'embed') {
+      // The animation elements are here because SMIL can re-point an attribute
+      // after this pass has been over it: <animate attributeName="href"
+      // to="javascript:…"> sets a scheme no scrub of the static tree can see.
+      // Mermaid never emits them, so dropping them costs a diagram nothing.
+      if (name === 'script' || name === 'iframe' || name === 'object' || name === 'embed' ||
+          name === 'animate' || name === 'animatemotion' || name === 'animatetransform' ||
+          name === 'set') {
         node.remove();
         continue;
       }
@@ -451,12 +549,17 @@ internal fun buildPreviewHtml(
       for (var j = attrs.length - 1; j >= 0; j--) {
         var attrName = attrs[j].name;
         var lower = attrName.toLowerCase();
-        var value = attrs[j].value || '';
+        // Deleting everything below U+0021 is what makes the scheme test mean
+        // something: a browser strips TAB, LF and CR out of a URL before it parses
+        // the scheme, so `java<TAB>script:` — already entity-decoded by the time it
+        // is an attribute value — is a working javascript: URL that a `^javascript:`
+        // test does not match.
+        var value = (attrs[j].value || '').replace(/[\u0000-\u0020]/g, '');
         if (lower.indexOf('on') === 0) {
           node.removeAttribute(attrName);
-        } else if (/^\s*(?:javascript|vbscript)\s*:/i.test(value)) {
+        } else if (/^(?:javascript|vbscript):/i.test(value)) {
           node.removeAttribute(attrName);
-        } else if ((lower === 'href' || lower === 'xlink:href') && /^\s*data\s*:/i.test(value)) {
+        } else if ((lower === 'href' || lower === 'xlink:href') && /^data:/i.test(value)) {
           node.removeAttribute(attrName);
         }
       }
@@ -501,11 +604,12 @@ internal fun buildPreviewHtml(
           diagram.textContent = code.textContent;
           code.parentElement.replaceWith(diagram);
         });
-        var scrub = function() { scrubRendered(el); };
+        var diagrams = el.querySelectorAll('pre.mermaid');
+        var scrub = function() { diagrams.forEach(function(d) { scrubRendered(d); }); };
         // On a bad diagram mermaid shows its error bomb in place; the rejection
         // handler both keeps that from surfacing as an unhandled promise error and
         // scrubs whatever did land.
-        mermaid.run({ nodes: el.querySelectorAll('pre.mermaid') }).then(scrub, scrub);
+        mermaid.run({ nodes: diagrams }).then(scrub, scrub);
       }
     } catch (e) {
       showRenderError('Markdown render error: ' + String(e));
