@@ -1257,6 +1257,7 @@ class EditorTabComponent(
                         baseDir = filePath.substringBeforeLast('/', projectPath),
                         darkTheme = settings.themeName != "Light" && settings.themeName != "Solarized Light",
                         modifier = Modifier.weight(1f).fillMaxHeight(),
+                        allowedRoot = projectPath,
                         // A link to a neighbouring file opens in BOSS rather than being
                         // handed to the OS, so nothing the link names can be launched.
                         // The host picks the surface by filename: a browser tab for
@@ -1266,7 +1267,11 @@ class EditorTabComponent(
                         onOpenLocalFile = { path ->
                             context.splitViewOperations?.openFileInActivePanel(
                                 path,
-                                path.substringAfterLast('/'),
+                                // File().name, not substringAfterLast('/'): these paths
+                                // are canonical, so on Windows they are backslash-
+                                // separated and splitting on '/' would make the whole
+                                // path the tab title.
+                                java.io.File(path).name,
                             )
                         }
                     )

@@ -20,6 +20,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,6 +71,9 @@ enum class MarkdownViewMode(val displayName: String) {
  * @param baseDir Directory of the .md file — becomes the page's `<base href>` so
  *   relative image/link paths resolve.
  * @param darkTheme Chooses the dark or light preview stylesheet.
+ * @param allowedRoot Directory a clicked local link may open within — the project
+ *   root. Null refuses every local link; see [previewLinkRoute].
+ * @param onOpenLocalFile Opens a link to a file inside [allowedRoot] in BOSS.
  */
 @Composable
 fun MarkdownPreviewPane(
@@ -78,6 +82,7 @@ fun MarkdownPreviewPane(
     baseDir: String,
     darkTheme: Boolean,
     modifier: Modifier = Modifier,
+    allowedRoot: String? = null,
     onOpenLocalFile: ((String) -> Unit)? = null
 ) {
     if (browserService == null || !browserService.isAvailable()) {
@@ -87,6 +92,8 @@ fun MarkdownPreviewPane(
 
     var browserHandle by remember { mutableStateOf<BrowserHandle?>(null) }
     var pageReady by remember { mutableStateOf(false) }
+    val currentAllowedRoot = rememberUpdatedState(allowedRoot)
+    val currentOnOpenLocalFile = rememberUpdatedState(onOpenLocalFile)
 
     // (Re)create the browser when the file's directory or theme changes.
     LaunchedEffect(baseDir, darkTheme) {
@@ -105,7 +112,15 @@ fun MarkdownPreviewPane(
         if (handle != null) {
             // Links the shell marked _blank land here. http/https/mailto go to the
             // system browser; a link to a neighbouring file opens inside BOSS.
-            handle.setOpenInNewTabCallback { url -> routePreviewLink(url, onOpenLocalFile) }
+            //
+            // Read through the latest-value holders rather than captured directly: this
+            // effect only re-runs on baseDir/darkTheme, so a callback capturing the
+            // parameters would keep whichever instances existed when the browser was
+            // built. Harmless while they are stable, a stale-closure bug the moment one
+            // of them closes over recomposing state.
+            handle.setOpenInNewTabCallback { url ->
+                routePreviewLink(url, currentAllowedRoot.value, currentOnOpenLocalFile.value)
+            }
             browserHandle = handle
             pageReady = true
         }
@@ -175,16 +190,22 @@ private fun PreviewUnavailableMessage(modifier: Modifier = Modifier) {
  * routes all of them here by setting `target = '_blank'`. DOMPurify drops an
  * *absolute* `file:` href, but a relative one is kept by design — and by the time
  * the page reports a click, that relative path has resolved against `<base href>`
- * into an absolute `file:` URL. So without this list
- * `[Setup instructions](../../../../home/you/.ssh/id_rsa)` or `[docs](./setup.exe)`
- * would be a one-click local-file open — on Windows through ShellExecute, which
- * for some target types launches rather than views. The click is the operator's,
- * which caps the severity, but "make the operator click a plausible-looking link"
- * is squarely inside the threat model a hostile README presents.
+ * into an absolute `file:` URL. So without this list `[docs](./setup.exe)` would be
+ * a one-click local-file open — on Windows through ShellExecute, which for some
+ * target types launches rather than views. The click is the operator's, which caps
+ * the severity, but "make the operator click a plausible-looking link" is squarely
+ * inside the threat model a hostile README presents.
  *
  * Only the schemes a document has a legitimate reason to point outward with are
  * passed through. Anything else — `file:`, `jar:`, `smb:`, a custom handler
- * registered by some other application — is dropped.
+ * registered by some other application — is dropped *here*.
+ *
+ * A `file:` URL is not simply dropped, though: [previewLinkRoute] gives it a second
+ * chance as an in-BOSS open, which is what keeps a link to a neighbouring `.md`
+ * working. That path is what stops `[docs](../../../.ssh/id_rsa)` — not this list —
+ * by confining the open to the project root. Both halves are needed: this one so
+ * nothing local is ever *executed*, that one so nothing outside the project is
+ * *read*.
  */
 private val BROWSABLE_LINK_SCHEMES = setOf("http", "https", "mailto")
 
@@ -204,15 +225,25 @@ internal fun isBrowsableLink(url: String): Boolean {
  * Three outcomes, and the split is the point:
  *
  * - `http`/`https`/`mailto` → the system browser, as before.
- * - a `file:` URL naming an existing regular file → opened **inside BOSS** via
- *   [onOpenLocalFile], never handed to the desktop. This is what makes a relative
- *   link to a neighbouring `.md` work again; the sanitisation pass had to refuse
- *   those wholesale because `<base href>` resolves them to `file:` URLs and
+ * - a `file:` URL naming an existing regular file **inside the project** → opened
+ *   inside BOSS, never handed to the desktop. This is what makes a relative link to
+ *   a neighbouring `.md` work again; the sanitisation pass had to refuse those
+ *   wholesale because `<base href>` resolves them to `file:` URLs and
  *   `Desktop.browse` would let the OS decide what to *execute* for
  *   `[docs](./setup.exe)`. Handing the path to the editor removes that: BOSS reads
  *   the bytes, the OS is never consulted.
- * - anything else — a `file:` URL pointing at a directory or nothing, `jar:`,
- *   `smb:`, a scheme some other application registered → dropped.
+ * - anything else — a `file:` URL pointing at a directory or nothing, one that
+ *   escapes the project, `jar:`, `smb:`, a scheme some other application
+ *   registered → dropped.
+ *
+ * Not executing a local file is only half of it. `[Setup instructions](../../../../.ssh/id_rsa)`
+ * resolves against `<base href>` to a perfectly real regular file, so an unbounded
+ * local-file route would surface the contents of anything readable from one click on
+ * a plausibly-labelled link in a repository the operator merely opened — and an open
+ * tab is reachable state, not just pixels. Hence [allowedRoot]: the resolved file has
+ * to sit inside the project. Every legitimate case (a sibling `README.md`,
+ * `../docs/x.md`) still works; a link into another checkout does not, which is what
+ * `main` did anyway.
  */
 internal sealed interface PreviewLinkRoute {
     /** Hand to the desktop — only ever an allowlisted outward scheme. */
@@ -225,14 +256,21 @@ internal sealed interface PreviewLinkRoute {
     data object Refuse : PreviewLinkRoute
 }
 
-/** Where a clicked preview link should go. Pure — [routePreviewLink] acts on it. */
-internal fun previewLinkRoute(url: String): PreviewLinkRoute = when {
+/**
+ * Where a clicked preview link should go. Pure — [routePreviewLink] acts on it.
+ *
+ * @param allowedRoot directory the local-file route is confined to. A null root
+ *   refuses every local file rather than allowing all of them: "we don't know where
+ *   the project is" must not widen what a document can reach.
+ */
+internal fun previewLinkRoute(url: String, allowedRoot: String?): PreviewLinkRoute = when {
     isBrowsableLink(url) -> PreviewLinkRoute.SystemBrowser(url)
-    else -> localFileFor(url)?.let { PreviewLinkRoute.LocalFile(it) } ?: PreviewLinkRoute.Refuse
+    else -> localFileFor(url, allowedRoot)?.let { PreviewLinkRoute.LocalFile(it) }
+        ?: PreviewLinkRoute.Refuse
 }
 
-private fun routePreviewLink(url: String, onOpenLocalFile: ((String) -> Unit)?) {
-    when (val route = previewLinkRoute(url)) {
+private fun routePreviewLink(url: String, allowedRoot: String?, onOpenLocalFile: ((String) -> Unit)?) {
+    when (val route = previewLinkRoute(url, allowedRoot)) {
         is PreviewLinkRoute.SystemBrowser -> openInSystemBrowser(route.url)
         is PreviewLinkRoute.LocalFile ->
             if (onOpenLocalFile != null) {
@@ -248,7 +286,7 @@ private fun routePreviewLink(url: String, onOpenLocalFile: ((String) -> Unit)?) 
 }
 
 /**
- * The path a `file:` URL names, if it is an existing regular file.
+ * The path a `file:` URL names, if it is an existing regular file within [allowedRoot].
  *
  * A directory is rejected (nothing sensible to open) and so is a path that does not
  * exist, which keeps a typo'd link from reaching the host at all.
@@ -257,8 +295,14 @@ private fun routePreviewLink(url: String, onOpenLocalFile: ((String) -> Unit)?) 
  * is an ordinary thing to write and `<base href>` resolves it to `file:///…/OTHER.md#setup`;
  * `java.io.File(URI)` rejects any URI carrying either component, so without this a
  * cross-file heading link would be refused rather than opened.
+ *
+ * Both sides of the containment check are canonical. URL resolution already collapses
+ * `..` before the click reaches Kotlin, so that part is insurance — but resolving
+ * symlinks is not: an in-repo symlink pointing at `~/.ssh/id_rsa` is inside the project
+ * by path and outside it by target, and only `canonicalPath` can tell the difference.
  */
-private fun localFileFor(url: String): String? {
+private fun localFileFor(url: String, allowedRoot: String?): String? {
+    if (allowedRoot.isNullOrBlank()) return null
     val uri = try {
         java.net.URI(url)
     } catch (_: Exception) {
@@ -274,12 +318,29 @@ private fun localFileFor(url: String): String? {
             return null
         }
     }
-    val file = try {
-        java.io.File(bare)
+    return try {
+        val file = java.io.File(bare).canonicalFile
+        val root = java.io.File(allowedRoot).canonicalFile
+        file.takeIf { it.isFile && it.isWithin(root) }?.path
     } catch (_: Exception) {
-        return null
+        null
     }
-    return file.absolutePath.takeIf { file.isFile }
+}
+
+/**
+ * Whether this file sits inside [root].
+ *
+ * Walks parents rather than comparing path strings: a `startsWith` on the path text
+ * accepts `/project-secrets/x` for a root of `/project`, since the prefix matches
+ * before the separator does.
+ */
+private fun java.io.File.isWithin(root: java.io.File): Boolean {
+    var cur: java.io.File? = parentFile
+    while (cur != null) {
+        if (cur == root) return true
+        cur = cur.parentFile
+    }
+    return false
 }
 
 private fun openInSystemBrowser(url: String) {
@@ -688,14 +749,24 @@ internal fun buildPreviewHtml(
         if (h.id) { usedIds[h.id] = true; return; }
         // GitHub's slug: lowercase, drop punctuation, spaces to hyphens. Collisions
         // get -1, -2 ... in document order, as GitHub numbers them.
+        //
+        // \p{L}\p{N} rather than \w: \w is ASCII-only, so a Japanese or Cyrillic
+        // heading would slug to the empty string and get no id at all -- leaving a
+        // non-English README's table of contents dead -- and an accented heading
+        // would lose the accent, so its id wouldn't match the anchor an author
+        // copied out of GitHub.
         var base = (h.textContent || '')
           .trim()
           .toLowerCase()
-          .replace(/[^\w\- ]+/g, '')
+          .replace(/[^\p{L}\p{N}\- _]+/gu, '')
           .replace(/\s+/g, '-');
         if (!base) return;
+        // Checked against the document, not just the headings seen so far: the shell
+        // renders into <article id="content">, so a '## Content' heading would be the
+        // second 'content' in the tree and lose the getElementById lookup to its own
+        // ancestor -- '#content' would scroll to the top of the pane instead.
         var id = base, n = 0;
-        while (usedIds[id]) { n++; id = base + '-' + n; }
+        while (usedIds[id] || document.getElementById(id)) { n++; id = base + '-' + n; }
         usedIds[id] = true;
         h.id = id;
       });

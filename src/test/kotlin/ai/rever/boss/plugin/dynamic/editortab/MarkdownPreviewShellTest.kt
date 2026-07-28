@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
+import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
@@ -308,7 +309,7 @@ class MarkdownPreviewShellTest {
         listOf("https://example.invalid/x", "http://example.invalid/x", "mailto:a@example.invalid")
             .forEach {
                 assertEquals(
-                    PreviewLinkRoute.SystemBrowser(it), previewLinkRoute(it),
+                    PreviewLinkRoute.SystemBrowser(it), previewLinkRoute(it, null),
                     "$it should go to the system browser"
                 )
             }
@@ -319,23 +320,23 @@ class MarkdownPreviewShellTest {
         // The whole point of the local-file route: a relative link, which <base href>
         // has already turned into a file: URL, reaches the editor as a path. The OS is
         // never asked what the file means, so `[docs](./setup.exe)` cannot launch.
-        val dir = Files.createTempDirectory("boss-preview-link-test")
-        val neighbour = dir.resolve("OTHER.md").toFile().apply { writeText("# other\n") }
-        val exe = dir.resolve("setup.exe").toFile().apply { writeText("MZ") }
+        val root = Files.createTempDirectory("boss-preview-link-test").toFile().canonicalFile
+        val neighbour = File(root, "OTHER.md").apply { writeText("# other\n") }
+        val exe = File(root, "setup.exe").apply { writeText("MZ") }
         try {
             assertEquals(
-                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
-                previewLinkRoute(neighbour.toURI().toString())
+                PreviewLinkRoute.LocalFile(neighbour.path),
+                previewLinkRoute(neighbour.toURI().toString(), root.path)
             )
             assertEquals(
-                PreviewLinkRoute.LocalFile(exe.absolutePath),
-                previewLinkRoute(exe.toURI().toString()),
+                PreviewLinkRoute.LocalFile(exe.path),
+                previewLinkRoute(exe.toURI().toString(), root.path),
                 "an executable must route into BOSS as a file, never to the desktop"
             )
         } finally {
             neighbour.delete()
             exe.delete()
-            dir.toFile().delete()
+            root.delete()
         }
     }
 
@@ -343,46 +344,126 @@ class MarkdownPreviewShellTest {
     fun `a heading link into another file keeps working`() {
         // `[see](./OTHER.md#setup)` is ordinary markdown, and File(URI) rejects any URI
         // carrying a fragment — so the fragment has to be stripped or the link is refused.
-        val dir = Files.createTempDirectory("boss-preview-frag-test")
-        val neighbour = dir.resolve("OTHER.md").toFile().apply { writeText("# setup\n") }
+        val root = Files.createTempDirectory("boss-preview-frag-test").toFile().canonicalFile
+        val neighbour = File(root, "OTHER.md").apply { writeText("# setup\n") }
         try {
             assertEquals(
-                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
-                previewLinkRoute("${neighbour.toURI()}#setup")
+                PreviewLinkRoute.LocalFile(neighbour.path),
+                previewLinkRoute("${neighbour.toURI()}#setup", root.path)
             )
             assertEquals(
-                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
-                previewLinkRoute("${neighbour.toURI()}?v=1")
+                PreviewLinkRoute.LocalFile(neighbour.path),
+                previewLinkRoute("${neighbour.toURI()}?v=1", root.path)
             )
         } finally {
             neighbour.delete()
-            dir.toFile().delete()
+            root.delete()
         }
     }
 
     @Test
     fun `a path with a space still resolves`() {
-        val dir = Files.createTempDirectory("boss preview space test")
-        val neighbour = dir.resolve("my notes.md").toFile().apply { writeText("# notes\n") }
+        val root = Files.createTempDirectory("boss preview space test").toFile().canonicalFile
+        val neighbour = File(root, "my notes.md").apply { writeText("# notes\n") }
         try {
             assertEquals(
-                PreviewLinkRoute.LocalFile(neighbour.absolutePath),
-                previewLinkRoute(neighbour.toURI().toString()),
+                PreviewLinkRoute.LocalFile(neighbour.path),
+                previewLinkRoute(neighbour.toURI().toString(), root.path),
                 "a percent-encoded path must be decoded back to the real file"
             )
         } finally {
             neighbour.delete()
-            dir.toFile().delete()
+            root.delete()
+        }
+    }
+
+    @Test
+    fun `a link may not escape the project`() {
+        // `[Setup instructions](../../../../home/you/.ssh/id_rsa)` resolves against
+        // <base href> into a perfectly real regular file. Not executing it is not
+        // enough — opening it in a panel still surfaces its contents from one click on
+        // a plausibly-labelled link in a repo the operator merely opened.
+        val parent = Files.createTempDirectory("boss-preview-escape").toFile().canonicalFile
+        val root = File(parent, "project").apply { mkdirs() }
+        val outside = File(parent, "id_rsa").apply { writeText("PRIVATE KEY") }
+        val inside = File(root, "README.md").apply { writeText("# hi\n") }
+        try {
+            assertEquals(
+                PreviewLinkRoute.Refuse,
+                previewLinkRoute(outside.toURI().toString(), root.path),
+                "a file outside the project must not open"
+            )
+            assertEquals(
+                PreviewLinkRoute.LocalFile(inside.path),
+                previewLinkRoute(inside.toURI().toString(), root.path),
+                "a file inside the project must still open"
+            )
+        } finally {
+            listOf(inside, outside, root, parent).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `a sibling directory sharing the root's name prefix is not inside it`() {
+        // A path-prefix check would accept `/tmp/x/project-secrets/k` for a root of
+        // `/tmp/x/project`, because the text matches before the separator does.
+        val parent = Files.createTempDirectory("boss-preview-prefix").toFile().canonicalFile
+        val root = File(parent, "project").apply { mkdirs() }
+        val sibling = File(parent, "project-secrets").apply { mkdirs() }
+        val secret = File(sibling, "key.txt").apply { writeText("k") }
+        try {
+            assertEquals(
+                PreviewLinkRoute.Refuse,
+                previewLinkRoute(secret.toURI().toString(), root.path)
+            )
+        } finally {
+            listOf(secret, sibling, root, parent).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `a symlink pointing out of the project is refused`() {
+        // The containment check is on canonical paths precisely for this: a link that is
+        // inside the project by path and outside it by target.
+        val parent = Files.createTempDirectory("boss-preview-symlink").toFile().canonicalFile
+        val root = File(parent, "project").apply { mkdirs() }
+        val outside = File(parent, "id_rsa").apply { writeText("PRIVATE KEY") }
+        val link = File(root, "innocent.md")
+        try {
+            Files.createSymbolicLink(link.toPath(), outside.toPath())
+            assertEquals(
+                PreviewLinkRoute.Refuse,
+                previewLinkRoute(link.toURI().toString(), root.path)
+            )
+        } catch (_: UnsupportedOperationException) {
+            return // no symlink support on this filesystem
+        } finally {
+            listOf(link, outside, root, parent).forEach { it.delete() }
+        }
+    }
+
+    @Test
+    fun `without a known project root no local link opens`() {
+        // Failing closed: "we don't know where the project is" must not widen what a
+        // document can reach.
+        val root = Files.createTempDirectory("boss-preview-noroot").toFile().canonicalFile
+        val file = File(root, "README.md").apply { writeText("# hi\n") }
+        try {
+            assertEquals(PreviewLinkRoute.Refuse, previewLinkRoute(file.toURI().toString(), null))
+            assertEquals(PreviewLinkRoute.Refuse, previewLinkRoute(file.toURI().toString(), ""))
+        } finally {
+            file.delete()
+            root.delete()
         }
     }
 
     @Test
     fun `everything else is refused`() {
-        val dir = Files.createTempDirectory("boss-preview-refuse-test")
+        val root = Files.createTempDirectory("boss-preview-refuse-test").toFile().canonicalFile
         try {
             listOf(
-                "file://${dir.toFile().absolutePath}", // a directory: nothing to open
-                "file:///nonexistent/boss/never/here.md", // a typo must not reach the host
+                "file://${root.path}", // a directory: nothing to open
+                "file://${root.path}/nope.md", // a typo must not reach the host
                 "jar:file:///tmp/x.jar!/y",
                 "smb://host/share/x",
                 "javascript:alert(1)",
@@ -392,10 +473,13 @@ class MarkdownPreviewShellTest {
                 "",
                 "not a uri at all"
             ).forEach {
-                assertEquals(PreviewLinkRoute.Refuse, previewLinkRoute(it), "$it must be refused")
+                assertEquals(
+                    PreviewLinkRoute.Refuse, previewLinkRoute(it, root.path),
+                    "$it must be refused"
+                )
             }
         } finally {
-            dir.toFile().delete()
+            root.delete()
         }
     }
 

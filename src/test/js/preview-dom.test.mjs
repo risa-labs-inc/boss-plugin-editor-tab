@@ -425,6 +425,57 @@ async function run() {
       slugs.ids[2] === 'notes' && slugs.ids[3] === 'notes-1' && slugs.ids[4] === 'notes-2' &&
       slugs.ids[5] === '', slugs);
 
+    // \w is ASCII-only, so these all slugged to '' and got no id at all -- a
+    // non-English README's table of contents stayed dead after the fragment fix.
+    const unicodeSlugs = await render(cdp,
+      '# \u65e5\u672c\u8a9e\u306e\u898b\u51fa\u3057\n\n## Caf\u00e9 r\u00e9sum\u00e9\n\n## \u0440\u0430\u0437\u0434\u0435\u043b\n',
+      `var hs = el.querySelectorAll('h1,h2');
+       return { ids: Array.prototype.map.call(hs, function (h) { return h.id; }) };`);
+    check('non-latin and accented headings get real slug ids',
+      unicodeSlugs.ids[0] === '\u65e5\u672c\u8a9e\u306e\u898b\u51fa\u3057' &&
+      unicodeSlugs.ids[1] === 'caf\u00e9-r\u00e9sum\u00e9' &&
+      unicodeSlugs.ids[2] === '\u0440\u0430\u0437\u0434\u0435\u043b', unicodeSlugs);
+
+    // The shell renders into <article id="content">, so a heading slugging to
+    // 'content' would be the second one in the tree and lose getElementById to its
+    // own ancestor -- '#content' would scroll to the top of the pane, not the heading.
+    const collision = await render(cdp,
+      '## Content\n\n' + 'filler\n\n'.repeat(60) + '[toc](#content-1)\n',
+      `var h = el.querySelector('h2');
+       var a = el.querySelector('a[href="#content-1"]');
+       var before = window.scrollY;
+       if (a) a.click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { id: h.id, movedDown: window.scrollY > before, href: location.href };`,
+      { budget: 300 });
+    check('a heading named Content does not collide with the shell container',
+      collision.id === 'content-1' && collision.movedDown, collision);
+
+    // Cheap now the harness exists, and both are ways the preview could still be
+    // thrown away: a link to an id that isn't there, and a bare '#'.
+    const noTarget = await render(cdp,
+      '[gone](#not-here)\n',
+      `var before = location.href;
+       el.querySelector('a').click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { navigated: location.href !== before,
+                stillRendered: !!el.querySelector('a[href="#not-here"]') };`,
+      { budget: 300 });
+    check('a fragment link with no target still keeps the preview alive',
+      !noTarget.navigated && noTarget.stillRendered, noTarget);
+
+    const bareHash = await render(cdp,
+      'filler\n\n'.repeat(60) + '[top](#)\n',
+      `window.scrollTo(0, 400);
+       await new Promise(function (r) { setTimeout(r, 100); });
+       var before = location.href;
+       el.querySelector('a[href="#"]').click();
+       await new Promise(function (r) { setTimeout(r, 250); });
+       return { navigated: location.href !== before, y: window.scrollY };`,
+      { budget: 300 });
+    check('a bare hash scrolls to the top without navigating',
+      !bareHash.navigated && bareHash.y === 0, bareHash);
+
     // Not marking it _blank is only half the job. The page carries a <base href>
     // pointing at the markdown file's directory so relative images resolve, and per
     // spec a bare '#heading' resolves against the BASE, not the document — so a
