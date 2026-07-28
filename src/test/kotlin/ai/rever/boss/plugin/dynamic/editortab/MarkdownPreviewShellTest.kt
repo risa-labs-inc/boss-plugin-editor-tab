@@ -12,7 +12,8 @@ import kotlin.test.assertTrue
  * allowed to do, and how markdown-derived HTML reaches its DOM.
  *
  * The page's behaviour is asserted separately, against a real DOM, by
- * `src/test/js/preview-dom.test.mjs` — see AGENTS.md.
+ * `src/test/js/preview-dom.test.mjs`, which loads the page in a headless browser
+ * — see that file's header for how to run it.
  */
 class MarkdownPreviewShellTest {
 

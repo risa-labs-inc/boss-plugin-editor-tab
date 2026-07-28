@@ -528,6 +528,35 @@ async function run() {
 
     // ---- fail closed ------------------------------------------------------
     console.log('\nfail closed');
+
+    // A DOMPurify that reports itself unsupported returns its input untouched
+    // instead of throwing, which is the case a render must refuse rather than
+    // sail through. Stand one in whose sanitize is a pure passthrough.
+    const unsupported = await cdp.eval(`
+      var real = window.DOMPurify;
+      window.DOMPurify = {
+        version: real.version, isSupported: false,
+        sanitize: function (html) {
+          var t = document.createElement('template');
+          t.innerHTML = html;
+          return t.content;
+        }
+      };
+      window.__ran = false;
+      try {
+        window.__setMarkdownB64(${JSON.stringify(
+          Buffer.from('<img src="pixel.png" onerror="window.__ran=true"> **hi**', 'utf8').toString('base64')
+        )});
+        await new Promise(function (r) { setTimeout(r, 300); });
+        var el = document.getElementById('content');
+        return { text: el.textContent, imgs: el.querySelectorAll('img').length,
+                 strong: el.querySelectorAll('strong').length, ran: window.__ran };
+      } finally { window.DOMPurify = real; }
+    `);
+    check('a sanitizer that reports itself unsupported is refused, not trusted',
+      unsupported.imgs === 0 && unsupported.strong === 0 && unsupported.ran === false &&
+      unsupported.text.startsWith('Markdown render error'), unsupported);
+
     const withoutSanitizer = join(fixtureDir, 'preview-no-sanitizer.html');
     const stripped = readFileSync(fixturePage, 'utf8')
       .replace(/[ \t]*<script[^>]*purify\.min\.js"><\/script>\n?/, '');

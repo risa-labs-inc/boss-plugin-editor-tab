@@ -393,13 +393,14 @@ internal fun buildPreviewHtml(
   // repository contains. marked reproduces any HTML the markdown carried, so its
   // output is data until DOMPurify has been over it.
   //
-  // The profile is HTML only — the element set GitHub renders markdown into.
-  // Tables, task-list checkboxes, footnote anchors, <details>, alignment and
-  // width/height attributes and relative image paths all survive it; <style>
-  // stays out so the page's own stylesheet remains the only one, and <form> stays
-  // out because a preview has nothing to submit. RETURN_DOM_FRAGMENT hands back
-  // nodes instead of a markup string, so the sanitized result is never re-parsed
-  // and no markup string is ever assigned to this document.
+  // The profile is HTML only — the element set GitHub renders markdown into, which
+  // also leaves out inline SVG and MathML. Tables, task-list checkboxes, footnote
+  // anchors, <details>, alignment and width/height attributes and relative image
+  // paths all survive it. FORBID_TAGS then names two the profile would otherwise
+  // decide: <style>, so the page's own stylesheet stays the only one, and <form>,
+  // because a preview has nothing to submit. RETURN_DOM_FRAGMENT hands back nodes
+  // instead of a markup string, so the sanitized result is never re-parsed and no
+  // markup string is ever assigned to this document.
   var PURIFY_CONFIG = {
     USE_PROFILES: { html: true },
     FORBID_TAGS: ['style', 'form'],
@@ -435,9 +436,8 @@ internal fun buildPreviewHtml(
   // Second line on mermaid's output path: whatever the SVG turned out to contain,
   // no script element, inline handler or script-bearing URL survives in it. In
   // normal operation this removes nothing (mermaid emits neither), and it leaves
-  // the geometry — including the foreignObject that carries HTML labels — alone.
-  // Diagram-internal `#id` references and data: images are kept, since markers,
-  // <use> and embedded icons need them.
+  // the drawing alone — geometry, foreignObject content, diagram-internal `#id`
+  // references (markers and <use> need them) and data: images.
   function scrubRendered(root) {
     var all = root.querySelectorAll('*');
     for (var i = 0; i < all.length; i++) {
@@ -475,7 +475,10 @@ internal fun buildPreviewHtml(
   window.__setMarkdownB64 = function(b64) {
     try {
       // No sanitizer, no render: an unsanitized document must never be the
-      // fallback for a library that failed to load.
+      // fallback for a library that failed to load. The isSupported half is the
+      // load-bearing one — DOMPurify that reports itself unsupported returns its
+      // input untouched rather than throwing, so without this check a render would
+      // proceed on unsanitized HTML and look like it had worked.
       if (!window.DOMPurify || !window.DOMPurify.isSupported) {
         throw new Error('HTML sanitizer unavailable');
       }
