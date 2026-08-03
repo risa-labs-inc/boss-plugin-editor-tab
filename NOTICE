@@ -1,0 +1,23 @@
+BOSS editor-tab plugin
+Copyright 2025-2026 Risa Labs Inc.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This plugin bundles the following third-party component inside its JAR:
+
+BossEditor (com.risaboss:bosseditor-compose-desktop) 1.0.4
+  Copyright Risa Labs Inc.
+  GNU Lesser General Public License, version 3.0. A copy of that license
+  accompanies this notice as LICENSE-LGPL-3.0.txt.
+  Source: https://github.com/risa-labs-inc/BossEditor
+
+  BossEditor is bundled privately rather than provided by the host
+  classloader, so it ships inside this plugin's JAR. LGPL-3.0 entitles you
+  to the library's source and to relink this plugin against a modified
+  build of it.
+
+  NOTE: BossEditor is being relicensed to Apache-2.0 upstream. That change
+  does not alter the terms of the already-published 1.0.4 artifact this
+  plugin currently pins, whose POM on Maven Central declares LGPL-3.0.
+  Once the pin moves to the first Apache-2.0 release of BossEditor, the
+  LGPL notice above and LICENSE-LGPL-3.0.txt can both be dropped.
