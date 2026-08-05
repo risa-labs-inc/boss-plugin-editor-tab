@@ -1,0 +1,94 @@
+name: BossEditor Auto-Bump
+
+# Polls Maven Central for a newer com.risaboss:bosseditor-compose-desktop release
+# and, when one is live, opens and merges a PR bumping the bundled version in
+# build.gradle.kts, then ships the plugin. See .github/scripts/bump-bosseditor.sh
+# for the bump logic.
+#
+# The counterpart to terminal-tab's BossTerm Auto-Bump. Without it, a BossEditor
+# release reaches nobody: BossEditor's own release workflow dispatches nothing
+# downstream, and this repo's release only fires on `push: main` — which never
+# happens on its own, because nothing bumps the pin. That gap is why the plugin
+# sat on 1.0.4 after 1.0.5 shipped.
+#
+# No PAT needed — uses the built-in GITHUB_TOKEN. A merge pushed by GITHUB_TOKEN
+# does NOT trigger build.yml's `push: main` (GitHub's recursion guard), BUT
+# workflow_dispatch is exempt from that guard, so after merging we explicitly
+# dispatch the release with `gh workflow run build.yml`. Requires `actions: write`.
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly, off the hour to avoid the cron rush
+  # Run on demand from the Actions tab ("Run workflow"), or: gh workflow run "BossEditor Auto-Bump"
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: 'Force a specific bosseditor version (testing/manual)'
+        required: false
+      dry_run:
+        description: 'Open the PR but do not merge it'
+        type: boolean
+        default: false
+
+concurrency:
+  group: bosseditor-autobump
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # push the bump branch + merge to main
+  pull-requests: write   # open and merge the PR
+  actions: write         # dispatch build.yml (the release) via gh workflow run
+
+jobs:
+  autobump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve & prepare bump
+        id: bump
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+        run: bash .github/scripts/bump-bosseditor.sh
+
+      - name: Open, merge & release
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_BE: ${{ steps.bump.outputs.new_be }}
+          NEW_PLUGIN: ${{ steps.bump.outputs.new_plugin }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          BR="bump/bosseditor-${NEW_BE}"
+
+          # Idempotency: skip if a PR for this exact bump already exists.
+          if [ -n "$(gh pr list --head "$BR" --state all --json number -q '.[0].number')" ]; then
+            echo "PR for $BR already exists — skipping."
+            exit 0
+          fi
+
+          # Plain project identity, not a bot account: this repo is public and
+          # commits here must not be attributed to github-actions[bot].
+          git config user.name  "BOSS Release"
+          git config user.email "releases@risalabs.ai"
+          git switch -c "$BR"
+          git commit -am "⬆️ Bundle BossEditor ${NEW_BE} (${NEW_PLUGIN})"
+          git push -u origin "$BR"
+
+          gh pr create --base main --head "$BR" \
+            --title "⬆️ Bundle BossEditor ${NEW_BE} (${NEW_PLUGIN})" \
+            --body-file pr-body.md
+
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "dry_run=true — PR opened, leaving it unmerged."
+            exit 0
+          fi
+
+          gh pr merge "$BR" --squash --delete-branch
+
+          # The merge above was pushed by GITHUB_TOKEN, which does NOT trigger
+          # build.yml's `push: main`. workflow_dispatch is exempt from the guard,
+          # so dispatch the release explicitly (build.yml has workflow_dispatch).
+          gh workflow run build.yml --ref main
