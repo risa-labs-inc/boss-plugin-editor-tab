@@ -2,6 +2,7 @@
 
 package ai.rever.boss.plugin.dynamic.editortab.settings
 
+import ai.rever.boss.plugin.ui.BossDialog
 import ai.rever.boss.plugin.ui.BossDarkAccent
 import ai.rever.boss.plugin.ui.BossDarkBorder
 import ai.rever.boss.plugin.ui.BossDarkError
@@ -32,7 +33,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -648,7 +648,7 @@ private fun AddEditServerDialog(
     // Template selection
     var showTemplates by remember { mutableStateOf(!isEdit) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    BossDialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
                 .width(500.dp)
@@ -877,7 +877,7 @@ private fun LoggingSettingsDialog(
     var fileLoggingEnabled by remember { mutableStateOf(config.fileLoggingEnabled) }
     var logFilePath by remember { mutableStateOf(config.logFilePath ?: "") }
 
-    Dialog(onDismissRequest = onDismiss) {
+    BossDialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier.width(450.dp),
             backgroundColor = BossDarkSurface,
@@ -1009,7 +1009,7 @@ private fun AdvancedSettingsDialog(
 ) {
     var maxPendingRequests by remember { mutableStateOf(config.maxPendingRequests) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    BossDialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier.width(450.dp),
             backgroundColor = BossDarkSurface,

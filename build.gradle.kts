@@ -43,7 +43,7 @@ repositories {
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.53.jar")
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.73.jar")
     } else {
         // CI: use downloaded JAR
         files("build/downloaded-deps/boss-plugin-api.jar")
