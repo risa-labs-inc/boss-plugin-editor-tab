@@ -171,6 +171,26 @@ internal fun scrollMetrics(viewport: VisibleViewport, fallbackLineHeight: Float)
         viewportHeight = viewport.viewportHeight.takeIf { it > 0f } ?: UNMEASURED_VIEWPORT_HEIGHT_PX
     )
 
+/**
+ * Y offset at which a gutter icon for [visualLine] should be drawn, or null when that line is
+ * not on screen - either hidden inside a collapsed fold (a negative visual line) or scrolled
+ * out of the viewport.
+ *
+ * Takes a visual line, never a document line: with a fold collapsed above it the two diverge,
+ * and the icon has to follow what is painted.
+ */
+internal fun gutterIconOffsetPx(
+    visualLine: Int,
+    metrics: ScrollMetrics,
+    scrollOffsetY: Int
+): Float? {
+    if (visualLine < 0) return null
+    val offset = visualLine * metrics.lineHeight - scrollOffsetY
+    // One line of slack at the top so a partially scrolled row still draws.
+    if (offset <= -metrics.lineHeight || offset >= metrics.viewportHeight) return null
+    return offset
+}
+
 class EditorTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
@@ -2347,11 +2367,13 @@ private fun EditorRunGutter(
     val scrollOffset by editorState.scrollOffset.collectAsState()
     // Collect visual line mapper for folding support
     val visualLineMapper by editorState.visualLineMapper.collectAsState()
+    // The canvas measures itself and publishes the result here; prefer it over the estimate below
+    val viewport by editorState.visibleViewport.collectAsState()
     val density = androidx.compose.ui.platform.LocalDensity.current
 
-    // Measure line height to match EditorCanvas exactly
+    // Fallback line height, for the frames before the canvas has measured itself
     val textMeasurer = rememberTextMeasurer()
-    val lineHeightPx = remember(fontSize, fontFamily, lineSpacing) {
+    val estimatedLineHeightPx = remember(fontSize, fontFamily, lineSpacing) {
         val style = TextStyle(
             fontFamily = fontFamily,
             fontSize = fontSize.sp
@@ -2359,58 +2381,40 @@ private fun EditorRunGutter(
         textMeasurer.measure("M", style).size.height.toFloat() * lineSpacing
     }
 
+    val metrics = scrollMetrics(viewport, estimatedLineHeightPx)
+
     // Convert pixel height to dp for sizing
-    val lineHeightDp = with(density) { lineHeightPx.toDp() }
-
-    // Create a map for fast lookup
-    val runnableLines = remember(detectedMainFunctions) {
-        detectedMainFunctions.associateBy { it.lineNumber }
-    }
-
-    // Calculate visible range with buffer
-    val firstVisibleLine = (scrollOffset.y / lineHeightPx).toInt().coerceAtLeast(0)
-    val visibleLineCount = 50 // Generous buffer for smooth scrolling
-    val visibleRange = remember(firstVisibleLine, visibleLineCount, editorState.document.lineCount) {
-        val start = (firstVisibleLine - 2).coerceAtLeast(0)
-        val end = (firstVisibleLine + visibleLineCount + 2).coerceAtMost(editorState.document.lineCount)
-        start until end
-    }
+    val lineHeightDp = with(density) { metrics.lineHeight.toDp() }
 
     Box(modifier = modifier) {
-        // Render run icons for detected main functions in visible range
-        detectedMainFunctions
-            .filter { it.lineNumber in visibleRange }
-            .forEach { detected ->
-                // lineNumber from detector is 0-based document line
-                val documentLine = detected.lineNumber
+        // Render run icons for detected main functions that are actually on screen.
+        //
+        // There is no document-line pre-filter here on purpose. The old one windowed on a
+        // hardcoded 50 lines - fewer than a tall pane shows, so icons near the bottom were
+        // dropped - and it compared a *visual* first-visible-line against *document* line
+        // numbers, which diverge as soon as a fold above them is collapsed. The offset
+        // calculation below is the honest test, and this list holds a handful of entries.
+        detectedMainFunctions.forEach { detected ->
+            // lineNumber from detector is 0-based document line; the mapper converts it to
+            // the visual line actually painted (or -1 when a collapsed fold hides it)
+            val visualLine = visualLineMapper.documentToVisual(detected.lineNumber)
+            val yOffsetPx = gutterIconOffsetPx(visualLine, metrics, scrollOffset.y) ?: return@forEach
 
-                // Convert document line to visual line (accounts for folding)
-                val visualLine = visualLineMapper.documentToVisual(documentLine)
-
-                // Skip if line is hidden (inside a collapsed fold)
-                if (visualLine < 0) return@forEach
-
-                // Calculate Y position using visual line
-                val yOffsetPx = (visualLine * lineHeightPx) - scrollOffset.y
-
-                // Only render if within viewport
-                if (yOffsetPx >= -lineHeightPx && yOffsetPx < 2000f) {
-                    Box(
-                        modifier = Modifier
-                            // Use pixel-based offset to match EditorCanvas rendering
-                            .offset { IntOffset(0, yOffsetPx.toInt()) }
-                            .height(lineHeightDp)
-                            .fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        GutterRunIcon(
-                            detected = detected,
-                            onRun = onRun,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
+            Box(
+                modifier = Modifier
+                    // Use pixel-based offset to match EditorCanvas rendering
+                    .offset { IntOffset(0, yOffsetPx.toInt()) }
+                    .height(lineHeightDp)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                GutterRunIcon(
+                    detected = detected,
+                    onRun = onRun,
+                    modifier = Modifier.size(18.dp)
+                )
             }
+        }
     }
 }
 
