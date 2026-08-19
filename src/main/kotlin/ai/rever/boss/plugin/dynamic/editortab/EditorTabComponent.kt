@@ -403,6 +403,24 @@ class EditorTabComponent(
             textMeasurer.measure("M", style).size.height.toFloat() * settings.lineSpacing
         }
 
+        // Centre a line in the viewport, for navigation that jumps somewhere the caret was
+        // not. BossEditor measures the canvas and publishes the result on visibleViewport,
+        // so use those numbers rather than this composable's own font-metric guess and a
+        // hardcoded height - in any window taller than the old 600px estimate, the "centred"
+        // line landed well above centre.
+        //
+        // Still routed through scrollToLine rather than left to the library's caret-follow:
+        // that follow deliberately does the minimum, parking the target against whichever
+        // edge it entered from, and it does not expandToReveal a fold the target sits inside.
+        fun scrollLineIntoView(line: Int) {
+            val viewport = editorState.visibleViewport.value
+            editorState.scrollToLine(
+                line,
+                viewport.lineHeight.takeIf { it > 0f } ?: lineHeightPx,
+                viewport.viewportHeight.takeIf { it > 0f } ?: UNMEASURED_VIEWPORT_HEIGHT_PX
+            )
+        }
+
         // Listen for navigation targets (cursor positioning after navigation)
         // Matches bundled BossEditorIntegration exactly
         LaunchedEffect(filePath, editorState, lineHeightPx, windowId) {
@@ -421,8 +439,8 @@ class EditorTabComponent(
                         editorState.moveCaret(position)
                         editorState.clearSelection()
 
-                        // Scroll to make the line visible (estimate viewport as 600px)
-                        editorState.scrollToLine(line, lineHeightPx, 600f)
+                        // Scroll to make the line visible
+                        scrollLineIntoView(line)
 
                         // Clear replay cache after consumption to avoid re-triggering
                         navProvider.clearCache()
@@ -627,7 +645,7 @@ class EditorTabComponent(
             val match = searchManager.currentMatch ?: return
             val pos = editorState.document.offsetToPosition(match.startOffset)
             editorState.moveCaret(EditorPosition(pos.line, pos.column))
-            editorState.scrollToLine(pos.line, lineHeightPx, 600f)
+            scrollLineIntoView(pos.line)
             currentSearchMatchIndex = searchManager.currentIndex
         }
 
@@ -1222,7 +1240,7 @@ class EditorTabComponent(
                             val targetLine = (line - 1).coerceAtLeast(0)
                             val targetColumn = (column - 1).coerceAtLeast(0)
                             editorState.moveCaret(EditorPosition(targetLine, targetColumn))
-                            editorState.scrollToLine(targetLine, lineHeightPx, 600f)
+                            scrollLineIntoView(targetLine)
                             showGoToLineDialog = false
                         },
                         onDismiss = {
@@ -1565,6 +1583,13 @@ private fun parseHexColor(hex: String): Color? {
  * SemanticCache — the same singleton the editor's tokenProvider reads — so no
  * host bridge is needed (the host no longer has a PSI stack to bridge from).
  */
+/**
+ * Viewport height assumed only until the editor canvas has been laid out and reported its
+ * real size. Navigation that arrives before first layout (a deep link, a restored tab) has
+ * nothing better to centre against.
+ */
+private const val UNMEASURED_VIEWPORT_HEIGHT_PX = 600f
+
 private val semanticTokens = PluginSemanticTokenProvider()
 
 // ========== Semantic Highlighting Helpers ==========
