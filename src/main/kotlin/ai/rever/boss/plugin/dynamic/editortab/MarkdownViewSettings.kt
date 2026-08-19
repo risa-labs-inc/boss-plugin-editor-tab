@@ -50,7 +50,21 @@ data class MarkdownViewSettings(
     val defaultView: MarkdownDefaultView = MarkdownDefaultView.PREVIEW,
     val lastSelectedView: MarkdownViewMode = MarkdownViewMode.PREVIEW
 ) {
-    fun initialViewMode(): MarkdownViewMode = defaultView.resolve(lastSelectedView)
+    /**
+     * Mode a newly opened Markdown tab starts in.
+     *
+     * An empty file overrides the configured default with [MarkdownViewMode.EDIT]: there is
+     * nothing to render, and with the shipped default of Preview a file created from the
+     * codebase tree would open on a blank pane with no way to start writing in it. Blank
+     * counts as empty - a lone newline renders to nothing just the same.
+     *
+     * This is a per-tab override, not a preference change: nothing is recorded, so the next
+     * Markdown file with content in it still opens the way the user configured.
+     */
+    fun initialViewMode(isDocumentEmpty: Boolean = false): MarkdownViewMode = when {
+        isDocumentEmpty -> MarkdownViewMode.EDIT
+        else -> defaultView.resolve(lastSelectedView)
+    }
 }
 
 /**

@@ -546,7 +546,9 @@ class EditorTabComponent(
         // loaded before reaching this point, so the configured mode is the first
         // mode composed and remains local to this tab afterward.
         var viewMode by remember {
-            mutableStateOf(markdownViewSettings.initialViewMode())
+            mutableStateOf(
+                markdownViewSettings.initialViewMode(isDocumentEmpty = initialContent.isBlank())
+            )
         }
         var markdownText by remember { mutableStateOf(initialContent) }
 
