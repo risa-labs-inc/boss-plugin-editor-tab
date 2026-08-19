@@ -119,6 +119,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
@@ -195,7 +196,8 @@ class EditorTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
     private val context: PluginContext,
-    private val markdownSettingsManager: MarkdownViewSettingsManager
+    private val markdownSettingsManager: MarkdownViewSettingsManager,
+    private val autoSaveSettingsManager: AutoSaveSettingsManager
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = EditorTabType
@@ -526,6 +528,12 @@ class EditorTabComponent(
         var isSaving by remember { mutableStateOf(false) }
         var saveError by remember { mutableStateOf<String?>(null) }
 
+        // Bumped on every edit, purely to restart the auto save debounce below. isModified
+        // cannot do that job: it latches true on the first edit and stays there, so it would
+        // fire the timer once and never again.
+        var editVersion by remember { mutableStateOf(0) }
+        val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
+
         // Search state
         var showSearchBar by remember { mutableStateOf(false) }
         var showReplaceInSearchBar by remember { mutableStateOf(false) }
@@ -688,6 +696,33 @@ class EditorTabComponent(
             settings.minimapForegroundColor?.let { parseHexColor(it) }
         }
 
+        // One save path for both Cmd+S and auto save, so they cannot drift on what counts as
+        // saved or how failure is surfaced.
+        suspend fun persistDocument() {
+            if (isLargeFile || filePath.isEmpty()) return
+            if (!editorState.isModified.value) return
+
+            isSaving = true
+            saveError = null
+            val content = editorState.document.getText()
+            val success = withContext(Dispatchers.IO) { saveFile(content) }
+            if (success) {
+                editorState.markAsSaved()
+            } else {
+                saveError = "Failed to save file"
+            }
+            isSaving = false
+        }
+
+        // Auto save. Keyed on editVersion, so each keystroke cancels the pending timer and
+        // starts a new one - a burst of typing produces one write, not one per character.
+        // Also keyed on the toggle, so switching it on with unsaved changes flushes them.
+        LaunchedEffect(editVersion, autoSaveEnabled, isLargeFile, filePath) {
+            if (!autoSaveEnabled) return@LaunchedEffect
+            delay(AUTO_SAVE_DEBOUNCE_MILLIS)
+            persistDocument()
+        }
+
         // Helper function to perform search and update state
         fun performSearch(query: String, options: SearchOptions) {
             if (query.isEmpty()) {
@@ -746,22 +781,7 @@ class EditorTabComponent(
                             }
                             // Cmd+S or Ctrl+S: Save file
                             isMeta && event.key == Key.S && !isLargeFile -> {
-                                if (editorState.isModified.value) {
-                                    scope.launch {
-                                        isSaving = true
-                                        saveError = null
-                                        val content = editorState.document.getText()
-                                        val success = withContext(Dispatchers.IO) {
-                                            saveFile(content)
-                                        }
-                                        if (success) {
-                                            editorState.markAsSaved()
-                                        } else {
-                                            saveError = "Failed to save file"
-                                        }
-                                        isSaving = false
-                                    }
-                                }
+                                scope.launch { persistDocument() }
                                 true
                             }
                             // F3: Find next
@@ -907,6 +927,8 @@ class EditorTabComponent(
                     // which has ShowUsages support for clicking on definitions
                     navigationResolver = null,
                     onTextChanged = {
+                        // Restarts the auto save debounce
+                        editVersion++
                         // Feed the live markdown preview (debounced inside the pane)
                         if (isMarkdown) {
                             markdownText = editorState.document.getText()
