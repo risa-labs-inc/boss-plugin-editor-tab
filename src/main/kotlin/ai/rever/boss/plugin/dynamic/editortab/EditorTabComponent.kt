@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.IntOffset
 import ai.rever.bosseditor.core.EditorPosition
 import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
+import ai.rever.bosseditor.core.VisibleViewport
 import ai.rever.bosseditor.highlight.Token
 import ai.rever.bosseditor.highlight.TokenCache
 import ai.rever.bosseditor.highlight.TokenType
@@ -119,6 +120,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.first
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -139,6 +142,35 @@ import kotlin.reflect.full.memberProperties
  * - Minimap (optional)
  * - Advanced toggles (mark occurrences, highlight current line, navigation)
  */
+/**
+ * Viewport height assumed only when the editor canvas has not been laid out yet and so has
+ * reported no real size. Navigation that still lands here has nothing better to centre against.
+ */
+internal const val UNMEASURED_VIEWPORT_HEIGHT_PX = 600f
+
+/**
+ * How long navigation will wait for the canvas's first measurement before centring on the
+ * assumed height above. One frame is the normal case; this only bounds a pathological one.
+ */
+private const val FIRST_LAYOUT_TIMEOUT_MS = 1_000L
+
+/** Line height and viewport height to centre a line against. */
+internal data class ScrollMetrics(val lineHeight: Float, val viewportHeight: Float)
+
+/**
+ * Picks the metrics for centring a line: the canvas's own measurements when it has published
+ * them, the caller's font-metric estimate otherwise.
+ *
+ * Each metric is guarded independently rather than treating one as an is-it-measured flag for
+ * both - `scrollToLine` divides by `lineHeight`, so a zero slipping through on the strength of
+ * a non-zero `viewportHeight` would be a divide-by-zero rather than a bad scroll.
+ */
+internal fun scrollMetrics(viewport: VisibleViewport, fallbackLineHeight: Float): ScrollMetrics =
+    ScrollMetrics(
+        lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight,
+        viewportHeight = viewport.viewportHeight.takeIf { it > 0f } ?: UNMEASURED_VIEWPORT_HEIGHT_PX
+    )
+
 class EditorTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
@@ -413,17 +445,28 @@ class EditorTabComponent(
         // that follow deliberately does the minimum, parking the target against whichever
         // edge it entered from, and it does not expandToReveal a fold the target sits inside.
         fun scrollLineIntoView(line: Int) {
-            val viewport = editorState.visibleViewport.value
-            editorState.scrollToLine(
-                line,
-                viewport.lineHeight.takeIf { it > 0f } ?: lineHeightPx,
-                viewport.viewportHeight.takeIf { it > 0f } ?: UNMEASURED_VIEWPORT_HEIGHT_PX
-            )
+            val metrics = scrollMetrics(editorState.visibleViewport.value, lineHeightPx)
+            editorState.scrollToLine(line, metrics.lineHeight, metrics.viewportHeight)
+        }
+
+        // Same, for navigation that can arrive before the canvas has been laid out.
+        // navigationTargetProvider replays its targets, so a deep link or a cross-file
+        // go-to-definition is consumed in roughly the frame the tab first composes - at which
+        // point visibleViewport is still zeroed and the plain helper above would centre
+        // against the assumed height, which is exactly the case this is all meant to fix.
+        // Waiting one measurement costs nothing on the paths that are already laid out,
+        // because the filter passes immediately.
+        suspend fun scrollLineIntoViewOnceMeasured(line: Int) {
+            val viewport = withTimeoutOrNull(FIRST_LAYOUT_TIMEOUT_MS) {
+                editorState.visibleViewport.first { it.viewportHeight > 0f && it.lineHeight > 0f }
+            } ?: editorState.visibleViewport.value
+            val metrics = scrollMetrics(viewport, lineHeightPx)
+            editorState.scrollToLine(line, metrics.lineHeight, metrics.viewportHeight)
         }
 
         // Listen for navigation targets (cursor positioning after navigation)
         // Matches bundled BossEditorIntegration exactly
-        LaunchedEffect(filePath, editorState, lineHeightPx, windowId) {
+        LaunchedEffect(filePath, editorState, windowId) {
             val navProvider = context.navigationTargetProvider ?: return@LaunchedEffect
             navProvider.targets.collect { target ->
                 // Only process if this editor is showing the target file and event is for this window
@@ -440,7 +483,7 @@ class EditorTabComponent(
                         editorState.clearSelection()
 
                         // Scroll to make the line visible
-                        scrollLineIntoView(line)
+                        scrollLineIntoViewOnceMeasured(line)
 
                         // Clear replay cache after consumption to avoid re-triggering
                         navProvider.clearCache()
@@ -1583,13 +1626,6 @@ private fun parseHexColor(hex: String): Color? {
  * SemanticCache — the same singleton the editor's tokenProvider reads — so no
  * host bridge is needed (the host no longer has a PSI stack to bridge from).
  */
-/**
- * Viewport height assumed only until the editor canvas has been laid out and reported its
- * real size. Navigation that arrives before first layout (a deep link, a restored tab) has
- * nothing better to centre against.
- */
-private const val UNMEASURED_VIEWPORT_HEIGHT_PX = 600f
-
 private val semanticTokens = PluginSemanticTokenProvider()
 
 // ========== Semantic Highlighting Helpers ==========
