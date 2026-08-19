@@ -45,6 +45,13 @@ class EditorTabPluginAPIImpl(
         // BossEditor's singleton settings manager gives reactive updates;
         // settings persist to editor-settings.json under the BOSS data root and
         // apply to all BossEditor instances immediately.
+        // The panel is BossEditor's own UI, so it needs the host chrome pushed in, and
+        // it previews the follow-host theme through the registry - which is populated
+        // by the bridge, not by the panel. Both have to happen here as well as in a
+        // tab: Settings can be opened in a fresh session with no editor tab composed.
+        ApplyHostChromeToEditor()
+        rememberHostEditorTheme()
+
         val settingsManager = remember { EditorSettingsManager.instance }
         val currentSettings by settingsManager.settings.collectAsState()
         val markdownSettings by markdownSettingsManager.settings.collectAsState()

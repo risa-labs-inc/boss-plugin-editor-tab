@@ -54,7 +54,7 @@ dependencies {
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.11")
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.12")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

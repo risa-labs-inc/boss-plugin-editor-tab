@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.ui.BossThemeColors
+import ai.rever.bosseditor.theme.ChromeColors
+import ai.rever.bosseditor.theme.EditorChrome
 import ai.rever.bosseditor.theme.EditorTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -33,15 +35,14 @@ import kotlin.math.abs
  */
 
 /**
- * Name the derived theme is registered under, so BossEditor itself can resolve it -
- * its settings panel previews `EditorTheme.forName(FOLLOW_HOST_THEME_NAME)` when the
- * "Follow BOSS Theme" toggle is on.
+ * Name the derived theme is registered under, so BossEditor itself can resolve it:
+ * its settings panel previews `EditorTheme.forSettings(...)` through the same
+ * registry entry the tabs render with.
  *
- * Kept as a literal because the bundled bosseditor predates
- * `EditorTheme.FOLLOW_HOST_THEME`; the two strings must stay equal, and the pin bump
- * that introduces the constant should replace this with it.
+ * Aliases the library's constant rather than repeating the string - the two halves
+ * have to agree or the preview silently shows Dark.
  */
-const val FOLLOW_HOST_THEME_NAME: String = "Follow BOSS Theme"
+const val FOLLOW_HOST_THEME_NAME: String = EditorTheme.FOLLOW_HOST_THEME
 
 /**
  * The live host-derived editor theme, registered with BossEditor's custom-theme
@@ -71,6 +72,32 @@ fun rememberHostEditorTheme(): EditorTheme {
     // and it would publish a theme from a tab that never appeared.
     LaunchedEffect(theme) { EditorTheme.registerTheme(theme) }
     return theme
+}
+
+/**
+ * Pushes the host's chrome tokens into the bundled BossEditor, so its settings
+ * panel, dropdowns and color picker follow the host instead of painting the fixed
+ * dark surface with a blue accent they carried as constants.
+ *
+ * Call this from anywhere the plugin composes BossEditor UI: the chrome holder is
+ * process-global (per plugin classloader, so per window), and the settings panel can
+ * be open with no editor tab in sight.
+ */
+@Composable
+fun ApplyHostChromeToEditor() {
+    val chrome = ChromeColors(
+        surface = BossThemeColors.SurfaceColor,
+        background = BossThemeColors.BackgroundColor,
+        accent = BossThemeColors.AccentColor,
+        border = BossThemeColors.BorderColor,
+        textPrimary = BossThemeColors.TextPrimary,
+        textSecondary = BossThemeColors.TextSecondary,
+        textMuted = BossThemeColors.TextMuted,
+        // Content on an accent fill: the host has no token for it, and neither white
+        // nor the panel's own text color is right for every theme's accent.
+        onAccent = ChromeColors.contentFor(BossThemeColors.AccentColor),
+    )
+    LaunchedEffect(chrome) { EditorChrome.apply(chrome) }
 }
 
 /**

@@ -389,6 +389,7 @@ class EditorTabComponent(
     override fun Content() {
         BossTheme {
             val settings by PluginEditorSettings.settings.collectAsState()
+            ApplyHostChromeToEditor()
             val hostTheme = rememberHostEditorTheme()
             val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
                 resolveEditorTheme(settings.followHostTheme, settings.themeName, hostTheme)
