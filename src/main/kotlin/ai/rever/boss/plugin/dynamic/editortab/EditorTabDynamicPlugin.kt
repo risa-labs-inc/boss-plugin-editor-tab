@@ -33,21 +33,24 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
     private var pluginContext: PluginContext? = null
     private var markdownSettingsManager: MarkdownViewSettingsManager? = null
+    private var autoSaveSettingsManager: AutoSaveSettingsManager? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
 
         markdownSettingsManager?.dispose()
-        val markdownSettings = MarkdownViewSettingsManager(
-            storage = runCatching {
-                context.pluginStorageFactory?.createStorage(pluginId)
-            }.getOrNull()
-        )
+        autoSaveSettingsManager?.dispose()
+        val storage = runCatching {
+            context.pluginStorageFactory?.createStorage(pluginId)
+        }.getOrNull()
+        val markdownSettings = MarkdownViewSettingsManager(storage = storage)
         markdownSettingsManager = markdownSettings
+        val autoSaveSettings = AutoSaveSettingsManager(storage = storage)
+        autoSaveSettingsManager = autoSaveSettings
 
         // Register as a main panel TAB TYPE (not a sidebar panel!)
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
-            EditorTabComponent(ctx, tabInfo, context, markdownSettings)
+            EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings)
         }
 
         // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
@@ -61,7 +64,7 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // still render their own editor settings from their own BossEditor
         // dependency, so skipping registration degrades nothing there.
         try {
-            context.registerPluginAPI(EditorTabPluginAPIImpl(markdownSettings))
+            context.registerPluginAPI(EditorTabPluginAPIImpl(markdownSettings, autoSaveSettings))
         } catch (e: LinkageError) {
             // Host predates EditorTabPluginAPI — skip; everything else works.
         }
@@ -80,6 +83,8 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
         markdownSettingsManager?.dispose()
         markdownSettingsManager = null
+        autoSaveSettingsManager?.dispose()
+        autoSaveSettingsManager = null
 
         // Tear down the bundled PSI stack (previously the host main.kt shutdown
         // hook's job, when BossEditor lived on the host classpath).

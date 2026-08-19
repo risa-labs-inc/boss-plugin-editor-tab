@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.EditorTabPluginAPI
 import ai.rever.boss.plugin.dynamic.editortab.settings.LspSettingsContent
+import ai.rever.boss.plugin.dynamic.editortab.settings.AutoSaveSettingsContent
 import ai.rever.boss.plugin.dynamic.editortab.settings.MarkdownViewSettingsContent
 import ai.rever.boss.plugin.ui.BossDarkBorder
 import ai.rever.bosseditor.settings.EditorSettingsManager
@@ -20,6 +21,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Editor-tab's implementation of EditorTabPluginAPI, registered with the host
@@ -28,8 +30,15 @@ import androidx.compose.ui.unit.dp
  * classpath (same inversion as terminal-tab's TerminalTabPluginAPIImpl).
  */
 class EditorTabPluginAPIImpl(
-    private val markdownSettingsManager: MarkdownViewSettingsManager
+    private val markdownSettingsManager: MarkdownViewSettingsManager,
+    private val autoSaveSettingsManager: AutoSaveSettingsManager
 ) : EditorTabPluginAPI {
+
+    override fun autoSaveEnabled(): StateFlow<Boolean> = autoSaveSettingsManager.enabled
+
+    override fun setAutoSaveEnabled(enabled: Boolean) {
+        autoSaveSettingsManager.setEnabled(enabled)
+    }
 
     @Composable
     override fun EditorSettingsPanel(modifier: Modifier) {
@@ -39,6 +48,7 @@ class EditorTabPluginAPIImpl(
         val settingsManager = remember { EditorSettingsManager.instance }
         val currentSettings by settingsManager.settings.collectAsState()
         val markdownSettings by markdownSettingsManager.settings.collectAsState()
+        val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
         val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
         Column(modifier = modifier.fillMaxSize()) {
@@ -56,6 +66,19 @@ class EditorTabPluginAPIImpl(
                     modifier = Modifier.fillMaxSize()
                 )
             }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(BossDarkBorder)
+            )
+
+            AutoSaveSettingsContent(
+                enabled = autoSaveEnabled,
+                onEnabledChange = autoSaveSettingsManager::setEnabled,
+                modifier = Modifier.fillMaxWidth()
+            )
 
             Box(
                 modifier = Modifier
