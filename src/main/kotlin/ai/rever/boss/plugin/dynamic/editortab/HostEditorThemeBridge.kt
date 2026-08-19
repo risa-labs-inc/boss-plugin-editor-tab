@@ -3,9 +3,11 @@ package ai.rever.boss.plugin.dynamic.editortab
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.bosseditor.theme.EditorTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
+import kotlin.math.abs
 
 /**
  * Bridges the BOSS host theme into the bundled BossEditor so the editor re-skins
@@ -63,9 +65,12 @@ fun rememberHostEditorTheme(): EditorTheme {
         alert = BossThemeColors.ErrorColor,
         warn = BossThemeColors.WarningColor,
     )
-    return remember(tokens) {
-        buildHostEditorTheme(tokens).also { EditorTheme.registerTheme(it) }
-    }
+    val theme = remember(tokens) { buildHostEditorTheme(tokens) }
+    // Registering writes a process-global registry, so it belongs in an effect: a
+    // `remember {}` calculation also runs for a composition that is then abandoned,
+    // and it would publish a theme from a tab that never appeared.
+    LaunchedEffect(theme) { EditorTheme.registerTheme(theme) }
+    return theme
 }
 
 /**
@@ -107,19 +112,35 @@ internal data class HostChromeTokens(
 /**
  * Derives an [EditorTheme] from the host chrome tokens.
  *
- * Light vs dark comes from the host floor's luminance, which also picks the base
- * whose syntax colors are inherited. Everything the host has an opinion about is
- * overridden; everything else stays curated.
+ * Every token is first composited onto the floor, so a translucent chrome token
+ * ("white at 8% over the background" is a normal way to define a step) cannot
+ * reach [mix] as a non-premultiplied triple and land as an opaque near-white fill.
+ * Light vs dark is then taken from the floor against the host's own text color
+ * rather than an absolute luminance bar: a mid-tone floor sits at ~0.2 relative
+ * luminance, so a fixed `> 0.5f` test would put dark-theme pastels on a mid grey,
+ * while the pair the host already balanced always answers correctly.
+ *
+ * Everything the host has an opinion about is overridden; everything else stays
+ * curated.
  */
-internal fun buildHostEditorTheme(t: HostChromeTokens): EditorTheme {
-    val isLight = t.ink.luminance() > 0.5f
+internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
+    val t = raw.flattenedOntoFloor()
+    val isLight = t.ink.luminance() > t.textPrimary.luminance()
     val base = if (isLight) EditorTheme.Light else EditorTheme.Dark
 
-    // A surface one step off the floor, for the current line, fold placeholders
-    // and inlay chips. `panel` is normally the host's chrome step above `ink`, but
-    // a theme is free to make them equal, so fall back to a tint of the text color
-    // rather than rendering an invisible highlight.
-    val subtle = if (t.panel == t.ink) mix(t.ink, t.textPrimary, 0.06f) else t.panel
+    // A surface one step off the floor, for the current line, fold placeholders and
+    // inlay chips. `panel` is normally the host's chrome step above `ink`, but a
+    // theme is free to make them equal (or near enough that the difference is not
+    // visible), so fall back to a tint of the text color rather than painting a
+    // highlight nobody can see.
+    val subtle = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, t.textPrimary, 0.06f))
+    // A brand token that collapses into the floor cannot carry a caret, a selection
+    // or a match. The text color is the one color the host guarantees is readable
+    // on its own floor, so it is the fallback for each of them.
+    val signal = t.signal.orIfIndistinctFrom(t.ink, t.textPrimary)
+    val warn = t.warn.orIfIndistinctFrom(t.ink, t.textPrimary)
+    val data = t.data.orIfIndistinctFrom(t.ink, t.textPrimary)
+    val alert = t.alert.orIfIndistinctFrom(t.ink, t.textPrimary)
 
     return EditorTheme(
         name = FOLLOW_HOST_THEME_NAME,
@@ -128,14 +149,14 @@ internal fun buildHostEditorTheme(t: HostChromeTokens): EditorTheme {
             // Floor and caret
             background = t.ink,
             text = t.textPrimary,
-            caret = t.signal,
+            caret = signal,
             // Opaque blends, not alpha: selection and match highlights are painted
             // under the text, and a translucent fill over a light floor washes the
             // glyphs out at exactly the moment the user is reading them.
-            selectionBackground = mix(t.ink, t.signal, 0.30f),
+            selectionBackground = mix(t.ink, signal, 0.30f),
             currentLineHighlight = subtle,
             marginLine = t.line,
-            matchedBracketBackground = mix(t.ink, t.signal, 0.22f),
+            matchedBracketBackground = mix(t.ink, signal, 0.22f),
             matchedBracketForeground = t.textPrimary,
 
             // Gutter shares the floor, as the curated themes do; the hairline and
@@ -156,40 +177,40 @@ internal fun buildHostEditorTheme(t: HostChromeTokens): EditorTheme {
             activeIndentGuide = t.textMuted,
 
             // Status colors the host owns. Syntax colors deliberately stay curated.
-            error = t.alert,
-            searchMatchBackground = mix(t.ink, t.warn, 0.35f),
-            currentSearchMatchBackground = mix(t.ink, t.signal, 0.55f),
-            hyperlink = t.data,
-            markOccurrences = mix(t.ink, t.signal, 0.18f),
+            error = alert,
+            searchMatchBackground = mix(t.ink, warn, 0.35f),
+            currentSearchMatchBackground = mix(t.ink, signal, 0.55f),
+            hyperlink = data,
+            markOccurrences = mix(t.ink, signal, 0.18f),
 
             minimapBackground = t.ink,
             minimapForeground = t.textPrimary,
             minimapViewport = t.textMuted.copy(alpha = 0.25f),
             minimapViewportBorder = t.textMuted.copy(alpha = 0.5f),
-            minimapSelection = t.signal.copy(alpha = 0.35f),
-            minimapSearchHighlight = t.warn,
-            minimapOccurrence = mix(t.ink, t.signal, 0.25f),
-            minimapError = t.alert,
-            minimapWarning = t.warn,
-            minimapInfo = t.data,
+            minimapSelection = signal.copy(alpha = 0.35f),
+            minimapSearchHighlight = warn,
+            minimapOccurrence = mix(t.ink, signal, 0.25f),
+            minimapError = alert,
+            minimapWarning = warn,
+            minimapInfo = data,
             minimapHint = t.textMuted,
             minimapCurrentLine = subtle,
             minimapSliderHover = t.textMuted.copy(alpha = 0.35f),
             minimapBorder = t.line,
 
-            errorSquiggle = t.alert,
-            warningSquiggle = t.warn,
-            infoSquiggle = t.data,
+            errorSquiggle = alert,
+            warningSquiggle = warn,
+            infoSquiggle = data,
             hintSquiggle = t.textMuted,
-            gutterError = t.alert,
-            gutterWarning = t.warn,
-            gutterInfo = t.data,
+            gutterError = alert,
+            gutterWarning = warn,
+            gutterInfo = data,
             gutterHint = t.textMuted,
 
             inlayHintParameterBackground = subtle,
             inlayHintParameterForeground = t.textSecondary,
-            inlayHintTypeBackground = mix(t.ink, t.data, 0.18f),
-            inlayHintTypeForeground = t.data,
+            inlayHintTypeBackground = mix(t.ink, data, 0.18f),
+            inlayHintTypeForeground = data,
         ),
     )
 }
@@ -208,3 +229,46 @@ internal fun mix(a: Color, b: Color, t: Float): Color = Color(
     blue = a.blue + (b.blue - a.blue) * t,
     alpha = 1f,
 )
+
+/**
+ * Smallest component difference two colors can have and still read as two colors.
+ *
+ * Roughly 5/255 per channel. Exact inequality is not a usable test here: a panel
+ * one step off the floor passes `!=` and paints an invisible highlight.
+ */
+private const val VISIBLE_DELTA = 0.02f
+
+/** [this] unless it is indistinguishable from [floor], in which case [fallback]. */
+private fun Color.orIfIndistinctFrom(floor: Color, fallback: Color): Color =
+    if (visiblyDiffers(this, floor)) this else fallback
+
+/** Whether [a] and [b] differ by at least [VISIBLE_DELTA] in any channel. */
+internal fun visiblyDiffers(a: Color, b: Color): Boolean =
+    abs(a.red - b.red) >= VISIBLE_DELTA ||
+        abs(a.green - b.green) >= VISIBLE_DELTA ||
+        abs(a.blue - b.blue) >= VISIBLE_DELTA
+
+/**
+ * Every token composited onto the floor, so the rest of the derivation only ever
+ * blends opaque colors. The floor itself is composited onto black - it is the
+ * bottom of the stack, and there is nothing behind it to show through.
+ */
+private fun HostChromeTokens.flattenedOntoFloor(): HostChromeTokens {
+    val floor = ink.over(Color.Black)
+    return HostChromeTokens(
+        ink = floor,
+        panel = panel.over(floor),
+        line = line.over(floor),
+        textPrimary = textPrimary.over(floor),
+        textSecondary = textSecondary.over(floor),
+        textMuted = textMuted.over(floor),
+        signal = signal.over(floor),
+        data = data.over(floor),
+        alert = alert.over(floor),
+        warn = warn.over(floor),
+    )
+}
+
+/** Source-over compositing of [this] onto an opaque [backdrop]. */
+private fun Color.over(backdrop: Color): Color =
+    if (alpha >= 1f) this else mix(backdrop, copy(alpha = 1f), alpha)

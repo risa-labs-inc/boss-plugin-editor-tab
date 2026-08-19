@@ -138,8 +138,9 @@ import kotlin.reflect.full.memberProperties
  * for multiple languages, code folding, and modification tracking.
  *
  * **Features match the bundled BOSS editor:**
- * - Settings loaded from ~/.boss/code-editor-settings.json
- * - Theme support (Dark, Light, Dracula, Monokai, Solarized)
+ * - Settings loaded from editor-settings.json under the BOSS data root
+ * - Theme support: the host theme by default, or one of the bundled themes
+ *   (Dark, Light, Dracula, Monokai, Solarized) once one is chosen
  * - Font customization (family, size, ligatures, line spacing)
  * - Status bar with cursor position, language, save status
  * - Minimap (optional)
@@ -1391,6 +1392,7 @@ class EditorTabComponent(
 
             // Status bar (matches bundled editor)
             EditorStatusBar(
+                followsHostTheme = settings.followHostTheme,
                 filePath = filePath,
                 language = language,
                 line = cursorLine,
@@ -1443,12 +1445,53 @@ class EditorTabComponent(
     }
 }
 
+/** Colors for [EditorStatusBar], taken from the host or from the editor theme. */
+private data class StatusBarColors(
+    val fill: Color,
+    val border: Color,
+    val primary: Color,
+    val secondary: Color,
+    val muted: Color,
+    val accent: Color,
+    val error: Color,
+)
+
+/**
+ * Host chrome while the editor follows the host, the editor's own theme otherwise,
+ * so the bar always belongs to whatever is directly above it.
+ */
+@Composable
+private fun statusBarColors(followsHostTheme: Boolean): StatusBarColors {
+    val editor = LocalEditorTheme.current.colors
+    return if (followsHostTheme) {
+        StatusBarColors(
+            fill = BossThemeColors.SurfaceColor,
+            border = BossThemeColors.BorderColor,
+            primary = BossThemeColors.TextPrimary,
+            secondary = BossThemeColors.TextSecondary,
+            muted = BossThemeColors.TextMuted,
+            accent = BossThemeColors.AccentColor,
+            error = BossThemeColors.ErrorColor,
+        )
+    } else {
+        StatusBarColors(
+            fill = editor.gutterBackground,
+            border = editor.gutterBorder,
+            primary = editor.text,
+            secondary = editor.lineNumber,
+            muted = editor.foldIndicator,
+            accent = editor.caret,
+            error = editor.error,
+        )
+    }
+}
+
 /**
  * Status bar for the editor showing file info, cursor position, and save status.
- * Matches the bundled BOSS editor status bar exactly.
  */
 @Composable
 private fun EditorStatusBar(
+    followsHostTheme: Boolean,
     filePath: String,
     language: String,
     line: Int,
@@ -1459,22 +1502,24 @@ private fun EditorStatusBar(
     viewMode: MarkdownViewMode? = null,
     onViewModeChange: (MarkdownViewMode) -> Unit = {}
 ) {
-    // Host chrome, not a fixed strip: this bar frames the editor inside a BOSS tab,
-    // so it follows the host theme even when a fixed editor theme is selected. It
-    // used to be VS Code's #007ACC blue with white text, which was the loudest
-    // thing in an amber or light window.
+    // Not a fixed strip any more: this used to be VS Code's #007ACC blue with white
+    // text, the loudest thing in an amber or a light window. It follows the host
+    // while the editor does, and the editor theme once a fixed theme is chosen -
+    // otherwise a Dracula canvas in a light window would get a light bar welded to
+    // it, which is the same seam this bridge exists to remove, just inverted.
+    val bar = statusBarColors(followsHostTheme)
     Column(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(1.dp)
-                .background(BossThemeColors.BorderColor)
+                .background(bar.border)
         )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(24.dp)
-                .background(BossThemeColors.SurfaceColor)
+                .background(bar.fill)
                 .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
@@ -1488,14 +1533,14 @@ private fun EditorStatusBar(
                 val fileName = filePath.substringAfterLast('/').ifEmpty { "Untitled" }
                 Text(
                     text = if (isModified) "$fileName *" else fileName,
-                    color = BossThemeColors.TextPrimary,
+                    color = bar.primary,
                     fontSize = 12.sp
                 )
 
                 // Language
                 Text(
                     text = language.uppercase(),
-                    color = BossThemeColors.TextSecondary,
+                    color = bar.secondary,
                     fontSize = 11.sp
                 )
             }
@@ -1515,8 +1560,7 @@ private fun EditorStatusBar(
                             val active = mode == viewMode
                             Text(
                                 text = mode.displayName,
-                                color = if (active) BossThemeColors.AccentColor
-                                        else BossThemeColors.TextMuted,
+                                color = if (active) bar.accent else bar.muted,
                                 fontSize = 11.sp,
                                 fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
                                              else androidx.compose.ui.text.font.FontWeight.Normal,
@@ -1530,7 +1574,7 @@ private fun EditorStatusBar(
                 if (error != null) {
                     Text(
                         text = error,
-                        color = BossThemeColors.ErrorColor,
+                        color = bar.error,
                         fontSize = 11.sp
                     )
                 }
@@ -1539,7 +1583,7 @@ private fun EditorStatusBar(
                 if (isSaving) {
                     Text(
                         text = "Saving...",
-                        color = BossThemeColors.TextSecondary,
+                        color = bar.secondary,
                         fontSize = 11.sp
                     )
                 }
@@ -1547,7 +1591,7 @@ private fun EditorStatusBar(
                 // Cursor position
                 Text(
                     text = "Ln $line, Col $column",
-                    color = BossThemeColors.TextSecondary,
+                    color = bar.secondary,
                     fontSize = 12.sp
                 )
             }
@@ -1558,8 +1602,8 @@ private fun EditorStatusBar(
 // ========== Settings ==========
 
 /**
- * Settings data class matching the bosseditor EditorSettings format exactly.
- * This ensures compatibility with ~/.boss/editor-settings.json
+ * Settings data class matching the bosseditor EditorSettings format exactly, so
+ * both halves read and write one editor-settings.json under the BOSS data root.
  */
 @Serializable
 data class PluginEditorSettingsData(
@@ -1599,8 +1643,8 @@ data class PluginEditorSettingsData(
 )
 
 /**
- * Reactive settings manager that reads from ~/.boss/editor-settings.json
- * (the same file used by the bosseditor library).
+ * Reactive settings manager that reads editor-settings.json from the BOSS data
+ * root (the same file the bundled bosseditor library writes).
  *
  * Provides a StateFlow that updates when settings change, matching the
  * bundled editor's EditorSettingsManager behavior.
@@ -1609,8 +1653,11 @@ object PluginEditorSettings {
     // Resolved the way the bundled bosseditor resolves it, not hardcoded to ~/.boss:
     // a dev host stores its data under ~/.boss_debug, so the settings panel wrote
     // there while this reader watched the production file and nothing an editor
-    // rendered ever changed.
-    private val settingsFile = BossDirectories.resolve("editor-settings.json")
+    // rendered ever changed. Guarded because this runs during class init, where an
+    // exception becomes an ExceptionInInitializerError that poisons the object for
+    // the rest of the process - every later settings read, not just this one.
+    private val settingsFile = runCatching { BossDirectories.resolve("editor-settings.json") }
+        .getOrElse { File(System.getProperty("user.home"), ".boss/editor-settings.json") }
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true

@@ -107,30 +107,95 @@ class HostEditorThemeTest {
             val c = buildHostEditorTheme(tokens).colors
             val what = "floor ${tokens.ink}"
 
-            // Each of these is a fill painted on the floor. Equal to the floor means
-            // the user sees nothing happen when they select, search or click a line.
-            assertNotEquals(c.background, c.currentLineHighlight, "current line vs $what")
-            assertNotEquals(c.background, c.selectionBackground, "selection vs $what")
-            assertNotEquals(c.background, c.searchMatchBackground, "search match vs $what")
-            assertNotEquals(c.background, c.markOccurrences, "occurrences vs $what")
-            assertNotEquals(c.background, c.matchedBracketBackground, "bracket vs $what")
+            // Each of these is a fill painted on the floor, and the assertion is a
+            // visible delta rather than inequality: a 1/255 difference passes `!=`
+            // and still shows the user nothing when they select, search or click.
+            assertVisiblyDiffers(c.background, c.currentLineHighlight, "current line vs $what")
+            assertVisiblyDiffers(c.background, c.selectionBackground, "selection vs $what")
+            assertVisiblyDiffers(c.background, c.searchMatchBackground, "search match vs $what")
+            assertVisiblyDiffers(c.background, c.markOccurrences, "occurrences vs $what")
+            assertVisiblyDiffers(c.background, c.matchedBracketBackground, "bracket vs $what")
 
             // The current match has to be findable among the other matches, and
             // neither may read as the selection.
-            assertNotEquals(c.searchMatchBackground, c.currentSearchMatchBackground, "match pair on $what")
-            assertNotEquals(c.selectionBackground, c.currentSearchMatchBackground, "selection vs match on $what")
+            assertVisiblyDiffers(c.searchMatchBackground, c.currentSearchMatchBackground, "match pair on $what")
+            assertVisiblyDiffers(c.selectionBackground, c.currentSearchMatchBackground, "selection vs match on $what")
         }
     }
 
     @Test
     fun `a floor with no chrome step above it still gets a visible highlight`() {
-        // A host theme is free to make panel equal ink; the current-line highlight
-        // must not vanish when it does.
+        // A host theme is free to make panel equal ink, or one step off it, which is
+        // worse: it passes an equality guard and paints an invisible highlight.
         val flat = blueprint.copy(panel = blueprint.ink)
-        val colors = buildHostEditorTheme(flat).colors
+        val almostFlat = blueprint.copy(panel = Color(0xFF05070C)) // ink + 1/255 on blue
 
-        assertNotEquals(colors.background, colors.currentLineHighlight)
-        assertNotEquals(colors.background, colors.foldPlaceholderBackground)
+        for (tokens in listOf(flat, almostFlat)) {
+            val colors = buildHostEditorTheme(tokens).colors
+            assertVisiblyDiffers(colors.background, colors.currentLineHighlight, "current line")
+            assertVisiblyDiffers(colors.background, colors.foldPlaceholderBackground, "fold placeholder")
+        }
+    }
+
+    @Test
+    fun `a brand token that collapses into the floor falls back to the text color`() {
+        // Nothing stops a host theme from having a signal or a warn the same color as
+        // its floor; a caret or a selection derived from it would be invisible.
+        val collapsed = blueprint.copy(
+            signal = blueprint.ink,
+            warn = blueprint.ink,
+            data = blueprint.ink,
+            alert = blueprint.ink,
+        )
+        val c = buildHostEditorTheme(collapsed).colors
+
+        assertVisiblyDiffers(c.background, c.caret, "caret")
+        assertVisiblyDiffers(c.background, c.selectionBackground, "selection")
+        assertVisiblyDiffers(c.background, c.searchMatchBackground, "search match")
+        assertVisiblyDiffers(c.background, c.hyperlink, "hyperlink")
+        assertVisiblyDiffers(c.background, c.errorSquiggle, "error squiggle")
+    }
+
+    @Test
+    fun `a translucent token is composited onto the floor, never mixed raw`() {
+        // "Surface = white at 8% over the background" is a normal way to define a
+        // chrome step. Read as a non-premultiplied triple it is near-white, so the
+        // fold-placeholder hover would come out an opaque near-white slab on ink.
+        val translucent = blueprint.copy(panel = Color.White.copy(alpha = 0.08f))
+        val c = buildHostEditorTheme(translucent).colors
+
+        assertEquals(1f, c.currentLineHighlight.alpha, "opaque after compositing")
+        assertTrue(
+            c.currentLineHighlight.luminance() < 0.2f,
+            "8% white over ink should stay dark, was ${c.currentLineHighlight}",
+        )
+        assertVisiblyDiffers(c.background, c.currentLineHighlight, "current line")
+    }
+
+    @Test
+    fun `polarity comes from the floor against the host's own text color`() {
+        // A mid grey sits at ~0.216 relative luminance, so an absolute `> 0.5f` test
+        // calls it dark and puts dark-theme pastels on it. The ink/text pair the host
+        // already balanced answers correctly at any tone.
+        val midToneDarkText = blueprint.copy(
+            ink = Color(0xFF808080),
+            panel = Color(0xFF8C8C8C),
+            textPrimary = Color(0xFF10151C),
+            textSecondary = Color(0xFF2A3038),
+            textMuted = Color(0xFF454C55),
+        )
+        val midToneLightText = blueprint.copy(ink = Color(0xFF808080), panel = Color(0xFF6E6E6E))
+
+        assertEquals(false, buildHostEditorTheme(midToneDarkText).isDark, "dark text on mid grey")
+        assertEquals(
+            EditorTheme.Light.colors.keyword,
+            buildHostEditorTheme(midToneDarkText).colors.keyword,
+        )
+        assertEquals(true, buildHostEditorTheme(midToneLightText).isDark, "light text on mid grey")
+    }
+
+    private fun assertVisiblyDiffers(a: Color, b: Color, what: String) {
+        assertTrue(visiblyDiffers(a, b), "$what: $a and $b are indistinguishable")
     }
 
     @Test
