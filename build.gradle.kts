@@ -96,6 +96,12 @@ dependencies {
     // The Compose compiler plugin also runs for compileTestKotlin and requires
     // the runtime on that classpath, even when an individual test is pure logic.
     testImplementation(compose.runtime)
+    // androidx.compose.ui.graphics.Color, for the theme-derivation tests. Compose
+    // is compileOnly for main (the host provides it) and bosseditor does not
+    // re-export it, so without this the test classpath has no Color at all.
+    // Test-only scope: it stays out of runtimeClasspath, which is what
+    // buildPluginJar bundles from.
+    testImplementation(compose.ui)
 }
 
 // The default :jar task would otherwise write build/libs/boss-plugin-editor-tab-<version>.jar —

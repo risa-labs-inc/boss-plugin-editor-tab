@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.bosseditor.compose.BossEditor
+import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
 import ai.rever.bosseditor.features.UsagesPopupState
 import ai.rever.bosseditor.features.NavigationFeedbackPopup
@@ -70,7 +71,7 @@ import ai.rever.bosseditor.highlight.lexers.PHPLexer
 import ai.rever.bosseditor.highlight.lexers.PerlLexer
 import ai.rever.bosseditor.highlight.lexers.LuaLexer
 import ai.rever.bosseditor.rendering.EditorToken
-import ai.rever.bosseditor.theme.EditorTheme
+import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
@@ -93,6 +94,7 @@ import androidx.compose.material.Text
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Play
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -385,7 +387,18 @@ class EditorTabComponent(
     @Composable
     override fun Content() {
         BossTheme {
-            EditorTabContent()
+            val settings by PluginEditorSettings.settings.collectAsState()
+            val hostTheme = rememberHostEditorTheme()
+            val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
+                resolveEditorTheme(settings.followHostTheme, settings.themeName, hostTheme)
+            }
+            // Provided here rather than only handed to BossEditor: the search bar,
+            // the rename/extract dialogs and the usages popup are siblings of the
+            // editor canvas, so with only the canvas themed they kept rendering
+            // against LocalEditorTheme's static Dark default.
+            CompositionLocalProvider(LocalEditorTheme provides editorTheme) {
+                EditorTabContent()
+            }
         }
     }
 
@@ -676,17 +689,10 @@ class EditorTabComponent(
             }
         }
 
-        // Get theme from settings (matches bundled editor exactly)
-        val editorTheme = remember(settings.themeName) {
-            when (settings.themeName) {
-                "Light" -> EditorTheme.Light
-                "Dracula" -> EditorTheme.Dracula
-                "Monokai" -> EditorTheme.Monokai
-                "Solarized Dark" -> EditorTheme.SolarizedDark
-                "Solarized Light" -> EditorTheme.SolarizedLight
-                else -> EditorTheme.Dark
-            }
-        }
+        // Resolved in Content() (host theme unless a fixed theme was chosen) and
+        // provided to this subtree, so the canvas and the popups around it cannot
+        // disagree about which theme is active.
+        val editorTheme = LocalEditorTheme.current
 
         // Parse minimap custom colors from settings (matches bundled editor exactly)
         val minimapBgColor = remember(settings.minimapBackgroundColor) {
@@ -1360,7 +1366,7 @@ class EditorTabComponent(
                         browserService = context.browserService,
                         markdown = markdownText,
                         baseDir = filePath.substringBeforeLast('/', projectPath),
-                        darkTheme = settings.themeName != "Light" && settings.themeName != "Solarized Light",
+                        darkTheme = editorTheme.isDark,
                         modifier = Modifier.weight(1f).fillMaxHeight(),
                         allowedRoot = projectPath,
                         // A link to a neighbouring file opens in BOSS rather than being
@@ -1453,85 +1459,98 @@ private fun EditorStatusBar(
     viewMode: MarkdownViewMode? = null,
     onViewModeChange: (MarkdownViewMode) -> Unit = {}
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(24.dp)
-            .background(Color(0xFF_007ACC).copy(alpha = 0.8f))
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        // Left: File info
+    // Host chrome, not a fixed strip: this bar frames the editor inside a BOSS tab,
+    // so it follows the host theme even when a fixed editor theme is selected. It
+    // used to be VS Code's #007ACC blue with white text, which was the loudest
+    // thing in an amber or light window.
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(BossThemeColors.BorderColor)
+        )
         Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(24.dp)
+                .background(BossThemeColors.SurfaceColor)
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // File name with modification indicator
-            val fileName = filePath.substringAfterLast('/').ifEmpty { "Untitled" }
-            Text(
-                text = if (isModified) "$fileName *" else fileName,
-                color = Color.White,
-                fontSize = 12.sp
-            )
+            // Left: File info
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // File name with modification indicator
+                val fileName = filePath.substringAfterLast('/').ifEmpty { "Untitled" }
+                Text(
+                    text = if (isModified) "$fileName *" else fileName,
+                    color = BossThemeColors.TextPrimary,
+                    fontSize = 12.sp
+                )
 
-            // Language
-            Text(
-                text = language.uppercase(),
-                color = Color.White.copy(alpha = 0.8f),
-                fontSize = 11.sp
-            )
-        }
+                // Language
+                Text(
+                    text = language.uppercase(),
+                    color = BossThemeColors.TextSecondary,
+                    fontSize = 11.sp
+                )
+            }
 
-        // Right: Cursor position and status
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Markdown view-mode toggle (only shown for markdown files)
-            if (viewMode != null) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    MarkdownViewMode.entries.forEach { mode ->
-                        val active = mode == viewMode
-                        Text(
-                            text = mode.displayName,
-                            color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
-                            fontSize = 11.sp,
-                            fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
-                                         else androidx.compose.ui.text.font.FontWeight.Normal,
-                            modifier = Modifier.clickable { onViewModeChange(mode) }
-                        )
+            // Right: Cursor position and status
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Markdown view-mode toggle (only shown for markdown files)
+                if (viewMode != null) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MarkdownViewMode.entries.forEach { mode ->
+                            val active = mode == viewMode
+                            Text(
+                                text = mode.displayName,
+                                color = if (active) BossThemeColors.AccentColor
+                                        else BossThemeColors.TextMuted,
+                                fontSize = 11.sp,
+                                fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
+                                             else androidx.compose.ui.text.font.FontWeight.Normal,
+                                modifier = Modifier.clickable { onViewModeChange(mode) }
+                            )
+                        }
                     }
                 }
-            }
 
-            // Error message
-            if (error != null) {
+                // Error message
+                if (error != null) {
+                    Text(
+                        text = error,
+                        color = BossThemeColors.ErrorColor,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Saving indicator
+                if (isSaving) {
+                    Text(
+                        text = "Saving...",
+                        color = BossThemeColors.TextSecondary,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Cursor position
                 Text(
-                    text = error,
-                    color = BossThemeColors.ErrorColor,
-                    fontSize = 11.sp
+                    text = "Ln $line, Col $column",
+                    color = BossThemeColors.TextSecondary,
+                    fontSize = 12.sp
                 )
             }
-
-            // Saving indicator
-            if (isSaving) {
-                Text(
-                    text = "Saving...",
-                    color = Color.White.copy(alpha = 0.8f),
-                    fontSize = 11.sp
-                )
-            }
-
-            // Cursor position
-            Text(
-                text = "Ln $line, Col $column",
-                color = Color.White,
-                fontSize = 12.sp
-            )
         }
     }
 }
@@ -1549,6 +1568,12 @@ data class PluginEditorSettingsData(
     val fontSize: Float = 14f,
     val lineSpacing: Float = 1.2f,
     val themeName: String = "Dark",
+    // Whether to take colors from the host theme instead of [themeName]. On by
+    // default, and absent from any settings file written before it existed, so an
+    // existing install starts following the host rather than staying on the "Dark"
+    // its file records. Mirrors bosseditor's EditorSettings.followHostTheme - both
+    // read the same editor-settings.json, so the defaults must agree.
+    val followHostTheme: Boolean = true,
     val showLineNumbers: Boolean = true,
     val highlightCurrentLine: Boolean = true,
     // Behavior Settings
@@ -1581,7 +1606,11 @@ data class PluginEditorSettingsData(
  * bundled editor's EditorSettingsManager behavior.
  */
 object PluginEditorSettings {
-    private val settingsFile = File(System.getProperty("user.home"), ".boss/editor-settings.json")
+    // Resolved the way the bundled bosseditor resolves it, not hardcoded to ~/.boss:
+    // a dev host stores its data under ~/.boss_debug, so the settings panel wrote
+    // there while this reader watched the production file and nothing an editor
+    // rendered ever changed.
+    private val settingsFile = BossDirectories.resolve("editor-settings.json")
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -2454,10 +2483,12 @@ private fun GutterRunIcon(
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
+    // The host's ok token rather than IntelliJ's green, so the run affordance
+    // belongs to the active theme; hover lifts it toward the text color.
     val iconColor = if (isHovered) {
-        Color(0xFF6BBF78) // Brighter green when hovered
+        mix(BossThemeColors.SuccessColor, BossThemeColors.TextPrimary, 0.25f)
     } else {
-        Color(0xFF59A869) // IntelliJ's run icon green
+        BossThemeColors.SuccessColor
     }
 
     Icon(
