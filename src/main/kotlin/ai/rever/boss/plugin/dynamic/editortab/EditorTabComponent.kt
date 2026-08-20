@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.bosseditor.compose.BossEditor
+import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
 import ai.rever.bosseditor.features.UsagesPopupState
 import ai.rever.bosseditor.features.NavigationFeedbackPopup
@@ -70,9 +71,10 @@ import ai.rever.bosseditor.highlight.lexers.PHPLexer
 import ai.rever.bosseditor.highlight.lexers.PerlLexer
 import ai.rever.bosseditor.highlight.lexers.LuaLexer
 import ai.rever.bosseditor.rendering.EditorToken
-import ai.rever.bosseditor.theme.EditorTheme
+import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -93,6 +95,7 @@ import androidx.compose.material.Text
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.Play
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -136,8 +139,9 @@ import kotlin.reflect.full.memberProperties
  * for multiple languages, code folding, and modification tracking.
  *
  * **Features match the bundled BOSS editor:**
- * - Settings loaded from ~/.boss/code-editor-settings.json
- * - Theme support (Dark, Light, Dracula, Monokai, Solarized)
+ * - Settings loaded from editor-settings.json under the BOSS data root
+ * - Theme support: the host theme by default, or one of the bundled themes
+ *   (Dark, Light, Dracula, Monokai, Solarized) once one is chosen
  * - Font customization (family, size, ligatures, line spacing)
  * - Status bar with cursor position, language, save status
  * - Minimap (optional)
@@ -385,16 +389,28 @@ class EditorTabComponent(
     @Composable
     override fun Content() {
         BossTheme {
-            EditorTabContent()
+            val settings by PluginEditorSettings.settings.collectAsState()
+            ApplyHostChromeToEditor()
+            val hostTheme = rememberHostEditorTheme()
+            val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
+                resolveEditorTheme(settings.followHostTheme, settings.themeName, hostTheme)
+            }
+            // Provided here rather than only handed to BossEditor: the search bar,
+            // the rename/extract dialogs and the usages popup are siblings of the
+            // editor canvas, so with only the canvas themed they kept rendering
+            // against LocalEditorTheme's static Dark default.
+            CompositionLocalProvider(LocalEditorTheme provides editorTheme) {
+                EditorTabContent(settings)
+            }
         }
     }
 
     @Composable
-    private fun EditorTabContent() {
+    private fun EditorTabContent(settings: PluginEditorSettingsData) {
         val scope = rememberCoroutineScope()
 
-        // Reactive settings - updates automatically when settings file changes (like bundled editor)
-        val settings by PluginEditorSettings.settings.collectAsState()
+        // Settings arrive from Content(), which already collects them to resolve the
+        // theme - collecting again here would recompose this subtree twice per change.
         val markdownViewSettings by markdownSettingsManager.settings.collectAsState()
         val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
@@ -676,17 +692,10 @@ class EditorTabComponent(
             }
         }
 
-        // Get theme from settings (matches bundled editor exactly)
-        val editorTheme = remember(settings.themeName) {
-            when (settings.themeName) {
-                "Light" -> EditorTheme.Light
-                "Dracula" -> EditorTheme.Dracula
-                "Monokai" -> EditorTheme.Monokai
-                "Solarized Dark" -> EditorTheme.SolarizedDark
-                "Solarized Light" -> EditorTheme.SolarizedLight
-                else -> EditorTheme.Dark
-            }
-        }
+        // Resolved in Content() (host theme unless a fixed theme was chosen) and
+        // provided to this subtree, so the canvas and the popups around it cannot
+        // disagree about which theme is active.
+        val editorTheme = LocalEditorTheme.current
 
         // Parse minimap custom colors from settings (matches bundled editor exactly)
         val minimapBgColor = remember(settings.minimapBackgroundColor) {
@@ -1360,7 +1369,7 @@ class EditorTabComponent(
                         browserService = context.browserService,
                         markdown = markdownText,
                         baseDir = filePath.substringBeforeLast('/', projectPath),
-                        darkTheme = settings.themeName != "Light" && settings.themeName != "Solarized Light",
+                        darkTheme = editorTheme.isDark,
                         modifier = Modifier.weight(1f).fillMaxHeight(),
                         allowedRoot = projectPath,
                         // A link to a neighbouring file opens in BOSS rather than being
@@ -1439,7 +1448,6 @@ class EditorTabComponent(
 
 /**
  * Status bar for the editor showing file info, cursor position, and save status.
- * Matches the bundled BOSS editor status bar exactly.
  */
 @Composable
 private fun EditorStatusBar(
@@ -1453,85 +1461,101 @@ private fun EditorStatusBar(
     viewMode: MarkdownViewMode? = null,
     onViewModeChange: (MarkdownViewMode) -> Unit = {}
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(24.dp)
-            .background(Color(0xFF_007ACC).copy(alpha = 0.8f))
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        // Left: File info
+    // Not a fixed strip any more: this used to be VS Code's #007ACC blue with white
+    // text, the loudest thing in an amber or a light window. It follows the host
+    // while the editor does, and the editor theme once a fixed theme is chosen -
+    // otherwise a Dracula canvas in a light window would get a light bar welded to
+    // it, which is the same seam this bridge exists to remove, just inverted.
+    val bar = statusBarColors(hostChromeTokens(), LocalEditorTheme.current)
+    // The hairline is drawn inside the 24.dp rather than stacked above it, so the bar
+    // occupies exactly the height it always did.
+    Box(modifier = Modifier.fillMaxWidth()) {
         Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(24.dp)
+                .background(bar.fill)
+                .drawBehind {
+                    drawRect(
+                        color = bar.border,
+                        size = androidx.compose.ui.geometry.Size(size.width, 1.dp.toPx()),
+                    )
+                }
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // File name with modification indicator
-            val fileName = filePath.substringAfterLast('/').ifEmpty { "Untitled" }
-            Text(
-                text = if (isModified) "$fileName *" else fileName,
-                color = Color.White,
-                fontSize = 12.sp
-            )
+            // Left: File info
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // File name with modification indicator
+                val fileName = filePath.substringAfterLast('/').ifEmpty { "Untitled" }
+                Text(
+                    text = if (isModified) "$fileName *" else fileName,
+                    color = bar.primary,
+                    fontSize = 12.sp
+                )
 
-            // Language
-            Text(
-                text = language.uppercase(),
-                color = Color.White.copy(alpha = 0.8f),
-                fontSize = 11.sp
-            )
-        }
+                // Language
+                Text(
+                    text = language.uppercase(),
+                    color = bar.secondary,
+                    fontSize = 11.sp
+                )
+            }
 
-        // Right: Cursor position and status
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Markdown view-mode toggle (only shown for markdown files)
-            if (viewMode != null) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    MarkdownViewMode.entries.forEach { mode ->
-                        val active = mode == viewMode
-                        Text(
-                            text = mode.displayName,
-                            color = if (active) Color.White else Color.White.copy(alpha = 0.55f),
-                            fontSize = 11.sp,
-                            fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
-                                         else androidx.compose.ui.text.font.FontWeight.Normal,
-                            modifier = Modifier.clickable { onViewModeChange(mode) }
-                        )
+            // Right: Cursor position and status
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Markdown view-mode toggle (only shown for markdown files)
+                if (viewMode != null) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MarkdownViewMode.entries.forEach { mode ->
+                            val active = mode == viewMode
+                            Text(
+                                text = mode.displayName,
+                                color = if (active) bar.accent else bar.muted,
+                                fontSize = 11.sp,
+                                fontWeight = if (active) androidx.compose.ui.text.font.FontWeight.Bold
+                                             else androidx.compose.ui.text.font.FontWeight.Normal,
+                                modifier = Modifier.clickable { onViewModeChange(mode) }
+                            )
+                        }
                     }
                 }
-            }
 
-            // Error message
-            if (error != null) {
+                // Error message
+                if (error != null) {
+                    Text(
+                        text = error,
+                        color = bar.error,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Saving indicator
+                if (isSaving) {
+                    Text(
+                        text = "Saving...",
+                        color = bar.secondary,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Cursor position
                 Text(
-                    text = error,
-                    color = BossThemeColors.ErrorColor,
-                    fontSize = 11.sp
+                    text = "Ln $line, Col $column",
+                    color = bar.secondary,
+                    fontSize = 12.sp
                 )
             }
-
-            // Saving indicator
-            if (isSaving) {
-                Text(
-                    text = "Saving...",
-                    color = Color.White.copy(alpha = 0.8f),
-                    fontSize = 11.sp
-                )
-            }
-
-            // Cursor position
-            Text(
-                text = "Ln $line, Col $column",
-                color = Color.White,
-                fontSize = 12.sp
-            )
         }
     }
 }
@@ -1539,8 +1563,8 @@ private fun EditorStatusBar(
 // ========== Settings ==========
 
 /**
- * Settings data class matching the bosseditor EditorSettings format exactly.
- * This ensures compatibility with ~/.boss/editor-settings.json
+ * Settings data class matching the bosseditor EditorSettings format exactly, so
+ * both halves read and write one editor-settings.json under the BOSS data root.
  */
 @Serializable
 data class PluginEditorSettingsData(
@@ -1549,6 +1573,12 @@ data class PluginEditorSettingsData(
     val fontSize: Float = 14f,
     val lineSpacing: Float = 1.2f,
     val themeName: String = "Dark",
+    // Whether to take colors from the host theme instead of [themeName]. On by
+    // default, and absent from any settings file written before it existed, so an
+    // existing install starts following the host rather than staying on the "Dark"
+    // its file records. Mirrors bosseditor's EditorSettings.followHostTheme - both
+    // read the same editor-settings.json, so the defaults must agree.
+    val followHostTheme: Boolean = true,
     val showLineNumbers: Boolean = true,
     val highlightCurrentLine: Boolean = true,
     // Behavior Settings
@@ -1566,7 +1596,10 @@ data class PluginEditorSettingsData(
     val caretBlinkRate: Int = 530,
     val caretStyle: String = "line",
     // Minimap Settings
-    val showMinimap: Boolean = true,
+    // false, matching bosseditor's own default: with true here the settings panel
+    // showed the toggle off while a tab rendered a minimap anyway. Found by the test
+    // that compares this mirror against EditorSettings property by property.
+    val showMinimap: Boolean = false,
     val minimapWidth: Int = 80,
     val minimapUseEditorColors: Boolean = true,
     val minimapBackgroundColor: String? = null,
@@ -1574,14 +1607,32 @@ data class PluginEditorSettingsData(
 )
 
 /**
- * Reactive settings manager that reads from ~/.boss/editor-settings.json
- * (the same file used by the bosseditor library).
+ * Reactive settings manager that reads editor-settings.json from the BOSS data
+ * root (the same file the bundled bosseditor library writes).
  *
  * Provides a StateFlow that updates when settings change, matching the
  * bundled editor's EditorSettingsManager behavior.
  */
+/**
+ * Where the settings live: the same file the bundled bosseditor writes, resolved the
+ * same way rather than hardcoded to `~/.boss`. A dev host keeps its data under
+ * `~/.boss_debug`, so the settings panel was writing to a file no editor tab watched.
+ *
+ * [resolve] is a parameter so both branches are testable. The guard matters because
+ * this runs during `object` init, where a throw becomes an
+ * `ExceptionInInitializerError` that poisons every later read, not just the first -
+ * and the fallback is loud because it reinstates exactly the split above.
+ */
+internal fun resolveSettingsFile(
+    resolve: (String) -> File = { BossDirectories.resolve(it) },
+): File = runCatching { resolve("editor-settings.json") }
+    .getOrElse { error ->
+        System.err.println("editor-tab: BOSS data root unavailable ($error), using ~/.boss")
+        File(System.getProperty("user.home"), ".boss/editor-settings.json")
+    }
+
 object PluginEditorSettings {
-    private val settingsFile = File(System.getProperty("user.home"), ".boss/editor-settings.json")
+    private val settingsFile = resolveSettingsFile()
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -2442,6 +2493,9 @@ private fun EditorRunGutter(
     }
 }
 
+/** IntelliJ's run green, which every curated editor theme is drawn around. */
+private val CURATED_RUN_GREEN = Color(0xFF59A869)
+
 /**
  * Run icon with hover effect matching IntelliJ style.
  */
@@ -2454,11 +2508,19 @@ private fun GutterRunIcon(
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
-    val iconColor = if (isHovered) {
-        Color(0xFF6BBF78) // Brighter green when hovered
-    } else {
-        Color(0xFF59A869) // IntelliJ's run icon green
+    // Same rule as the status bar, read off the resolved theme: the host's ok token
+    // while the editor follows the host, the curated green once a fixed theme is
+    // chosen. Taking the host token unconditionally painted a green tuned for a light
+    // window onto a Dracula gutter.
+    val theme = LocalEditorTheme.current
+    val floor = theme.colors.gutterBackground
+    val base = if (followsHostTheme(theme)) BossThemeColors.SuccessColor else CURATED_RUN_GREEN
+    // Remembered: gutter icons recompose on every scroll frame, and only the hover
+    // lift below has to follow the pointer.
+    val tint = remember(base, floor, theme.colors.text) {
+        runIconTint(base, floor, theme.colors.text)
     }
+    val iconColor = if (isHovered) mix(tint, theme.colors.text, 0.25f) else tint
 
     Icon(
         imageVector = FeatherIcons.Play,

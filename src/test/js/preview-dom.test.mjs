@@ -20,6 +20,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { mkdtempSync, existsSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -710,8 +711,14 @@ async function run() {
       failClosed.ran === false && failClosed.text.startsWith('Markdown render error'), failClosed);
     rmSync(withoutSanitizer, { force: true });
   } finally {
+    // Wait for the process to actually be gone before deleting its profile. SIGKILL
+    // does not wait, so a bare rmSync raced Chromium's last writes and failed
+    // ENOTEMPTY on a directory it had just emptied - failing the suite after every
+    // assertion had already passed. Waiting removes the race rather than retrying
+    // through it, so a genuinely stuck directory still surfaces.
     child.kill('SIGKILL');
-    rmSync(userDataDir, { recursive: true, force: true });
+    await once(child, 'exit').catch(function () {});
+    rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 
   console.log(`\n${checks - failures.length}/${checks} checks passed`);

@@ -48,6 +48,11 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         val autoSaveSettings = AutoSaveSettingsManager(storage = storage)
         autoSaveSettingsManager = autoSaveSettings
 
+        // Seed BossEditor with the host theme before anything composes: the settings
+        // panel can be the first thing to render, and it resolves the follow-host
+        // theme through a registry that is a plain map, not snapshot state.
+        publishHostThemeToEditor()
+
         // Register as a main panel TAB TYPE (not a sidebar panel!)
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
             EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings)
@@ -85,6 +90,11 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         markdownSettingsManager = null
         autoSaveSettingsManager?.dispose()
         autoSaveSettingsManager = null
+
+        // Undo what register() published. The registry and the chrome holder live in
+        // this plugin's classloader, so a reload replaces them anyway - symmetry is
+        // cheaper than depending on that reasoning staying true.
+        runCatching { unpublishHostThemeFromEditor() }
 
         // Tear down the bundled PSI stack (previously the host main.kt shutdown
         // hook's job, when BossEditor lived on the host classpath).

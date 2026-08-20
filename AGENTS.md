@@ -8,7 +8,7 @@ Code editor tab with syntax highlighting, code folding, and run gutter icons
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.editortab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin`
-- **API Version**: 1.0.20
+- **API Version**: pinned in `build.gradle.kts` (currently `boss-plugin-api-1.0.80.jar`); the floor moves whenever the plugin uses a newer surface
 
 ## Essential Commands
 
