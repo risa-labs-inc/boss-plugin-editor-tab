@@ -11,6 +11,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertSame
 import kotlinx.serialization.descriptors.elementNames
+import java.io.File
 import kotlin.reflect.full.memberProperties
 import kotlin.test.assertTrue
 
@@ -118,7 +119,19 @@ class HostEditorThemeTest {
         // 0.04 apart in blend factor land within 1/100 of each other. Every fixture
         // above has a high-contrast signal, which hides that.
         val dimSignal = blueprint.copy(signal = Color(0xFF454545), warn = Color(0xFF454545))
-        val fixtures = listOf(blueprint, blueprintLight, pureBlack, monochrome, weakSignal, dimSignal)
+        // Both halves of the hardest case at once: a signal that has to fall back to
+        // the text color, and a panel sitting almost exactly where a 12% tint of that
+        // text color lands (`mix(#05070B, #E6EDF6, 0.12) == #202326`). The fallback
+        // alone cannot separate those - the surface has to move.
+        val dimSignalOrdinaryPanel = blueprint.copy(
+            signal = Color(0xFF060810),
+            warn = Color(0xFF060810),
+            panel = Color(0xFF202326),
+        )
+        val fixtures = listOf(
+            blueprint, blueprintLight, pureBlack, monochrome, weakSignal, dimSignal,
+            dimSignalOrdinaryPanel,
+        )
 
         for (tokens in fixtures) {
             val c = buildHostEditorTheme(tokens).colors
@@ -315,6 +328,37 @@ class HostEditorThemeTest {
         assertEquals(Color.White, chrome.onAccent, "content on a nearly-transparent accent")
         assertEquals(blueprint.panel, chrome.surface)
         assertEquals(blueprint.ink, chrome.background)
+    }
+
+    @Test
+    fun `the settings path falls back loudly when the data root cannot be resolved`() {
+        val resolved = resolveSettingsFile { name -> File("/tmp/boss-test-root", name) }
+        assertEquals(File("/tmp/boss-test-root", "editor-settings.json"), resolved)
+
+        // The branch that used to be unreachable from a test: a resolver that throws
+        // must not take the object's class initializer with it.
+        val fallback = resolveSettingsFile { error("no data root") }
+        assertEquals(
+            File(System.getProperty("user.home"), ".boss/editor-settings.json"),
+            fallback,
+        )
+    }
+
+    @Test
+    fun `unpopulated host tokens are not published`() {
+        // What register() sees if it ever runs before the host applies its theme:
+        // every token is Unspecified, which is alpha 0, and compositing ten of those
+        // would seed a pure black theme.
+        val unset = HostChromeTokens(
+            ink = Color.Unspecified, panel = Color.Unspecified, line = Color.Unspecified,
+            textPrimary = Color.Unspecified, textSecondary = Color.Unspecified,
+            textMuted = Color.Unspecified, signal = Color.Unspecified,
+            data = Color.Unspecified, alert = Color.Unspecified, warn = Color.Unspecified,
+        )
+
+        assertEquals(false, unset.allSpecified())
+        assertTrue(blueprint.allSpecified())
+        assertEquals(false, blueprint.copy(warn = Color.Unspecified).allSpecified())
     }
 
     @Test

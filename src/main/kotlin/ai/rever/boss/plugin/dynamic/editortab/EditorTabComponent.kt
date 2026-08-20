@@ -1613,21 +1613,26 @@ data class PluginEditorSettingsData(
  * Provides a StateFlow that updates when settings change, matching the
  * bundled editor's EditorSettingsManager behavior.
  */
+/**
+ * Where the settings live: the same file the bundled bosseditor writes, resolved the
+ * same way rather than hardcoded to `~/.boss`. A dev host keeps its data under
+ * `~/.boss_debug`, so the settings panel was writing to a file no editor tab watched.
+ *
+ * [resolve] is a parameter so both branches are testable. The guard matters because
+ * this runs during `object` init, where a throw becomes an
+ * `ExceptionInInitializerError` that poisons every later read, not just the first -
+ * and the fallback is loud because it reinstates exactly the split above.
+ */
+internal fun resolveSettingsFile(
+    resolve: (String) -> File = { BossDirectories.resolve(it) },
+): File = runCatching { resolve("editor-settings.json") }
+    .getOrElse { error ->
+        System.err.println("editor-tab: BOSS data root unavailable ($error), using ~/.boss")
+        File(System.getProperty("user.home"), ".boss/editor-settings.json")
+    }
+
 object PluginEditorSettings {
-    // Resolved the way the bundled bosseditor resolves it, not hardcoded to ~/.boss:
-    // a dev host stores its data under ~/.boss_debug, so the settings panel wrote
-    // there while this reader watched the production file and nothing an editor
-    // rendered ever changed. Guarded because this runs during class init, where an
-    // exception becomes an ExceptionInInitializerError that poisons the object for
-    // the rest of the process - every later settings read, not just this one.
-    private val settingsFile = runCatching { BossDirectories.resolve("editor-settings.json") }
-        .getOrElse { error ->
-            // Say so: the fallback silently reinstates the split this change fixed (a
-            // dev host writes ~/.boss_debug while this reads ~/.boss), and a settings
-            // panel that appears to do nothing is otherwise an afternoon to diagnose.
-            System.err.println("editor-tab: BOSS data root unavailable ($error), using ~/.boss")
-            File(System.getProperty("user.home"), ".boss/editor-settings.json")
-        }
+    private val settingsFile = resolveSettingsFile()
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true

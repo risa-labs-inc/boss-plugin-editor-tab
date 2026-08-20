@@ -91,11 +91,12 @@ fun EditorHostThemeEffects() {
  */
 fun publishHostThemeToEditor() {
     // Only once the host actually has colors. An unspecified token has alpha 0, so
-    // compositing would flatten all ten onto the floor and seed a pure black theme -
-    // a worse first frame than the Dark this seeding exists to avoid. If the host is
-    // not ready, the effects publish the real thing on the first composition.
-    if (!BossThemeColors.BackgroundColor.isSpecified) return
+    // compositing would flatten it onto the floor, and ten of them would seed a pure
+    // black theme - a worse first frame than the Dark this seeding exists to avoid. If
+    // the host is not ready, the effects publish the real thing on the first
+    // composition.
     val tokens = hostChromeTokensNow()
+    if (!tokens.allSpecified()) return
     EditorTheme.registerTheme(hostEditorTheme(tokens))
     EditorChrome.apply(hostChromeColors(tokens))
 }
@@ -115,6 +116,12 @@ internal fun hostEditorTheme(tokens: HostChromeTokens): EditorTheme =
 
 private val derivedLock = Any()
 private var derived: Pair<HostChromeTokens, EditorTheme>? = null
+
+/** Whether every token has a real color, rather than [Color.Unspecified]. */
+internal fun HostChromeTokens.allSpecified(): Boolean =
+    ink.isSpecified && panel.isSpecified && line.isSpecified &&
+        textPrimary.isSpecified && textSecondary.isSpecified && textMuted.isSpecified &&
+        signal.isSpecified && data.isSpecified && alert.isSpecified && warn.isSpecified
 
 /** Drops the memoised theme and the chrome, for plugin teardown. */
 fun unpublishHostThemeFromEditor() {
@@ -326,7 +333,7 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
     // theme is free to make them equal (or near enough that the difference is not
     // visible), so fall back to a tint of the text color rather than painting a
     // highlight nobody can see.
-    val subtle = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, text, 0.06f))
+    val subtleBase = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, text, 0.06f))
     // A brand token has to survive being blended into the floor at 12%, which is a
     // stronger requirement than being distinguishable from it: a token 0.03 off the
     // floor clears the surface gate and then vanishes in every wash derived from it.
@@ -336,11 +343,20 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
     // step and so moves independently. A dim monochrome signal at 18% over ink lands
     // right on the panel color, making an occurrence highlight and a current line the
     // same thing.
-    val signal = t.signal.washableOver(t.ink, alsoClearing = subtle, fallback = text)
-    val warn = t.warn.washableOver(t.ink, alsoClearing = subtle, fallback = text)
+    val signal = t.signal.washableOver(t.ink, alsoClearing = subtleBase, fallback = text)
+    val warn = t.warn.washableOver(t.ink, alsoClearing = subtleBase, fallback = text)
     // Same gate: `data` also backs a fill (the inlay type chip), which sits next to a
     // parameter chip painted in the current-line surface.
-    val data = t.data.washableOver(t.ink, alsoClearing = subtle, fallback = text)
+    val data = t.data.washableOver(t.ink, alsoClearing = subtleBase, fallback = text)
+    // Last resort, for the case the fallback above cannot rescue: the substitute wash
+    // (a 12% tint of the text color) can itself land on the surface, because an
+    // ordinary `panel` sits about that far from `ink`. Then move the *surface* - it has
+    // somewhere to go, further from the floor, and the wash does not.
+    val subtle = if (visiblyDiffers(mix(t.ink, signal, OCCURRENCE_WASH), subtleBase)) {
+        subtleBase
+    } else {
+        mix(subtleBase, text, 0.35f)
+    }
     val alert = t.alert.orIfTooWeakToWash(t.ink, text)
 
     return EditorTheme(
