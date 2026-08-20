@@ -711,7 +711,10 @@ async function run() {
     rmSync(withoutSanitizer, { force: true });
   } finally {
     child.kill('SIGKILL');
-    rmSync(userDataDir, { recursive: true, force: true });
+    // SIGKILL does not wait, so Chromium can still be writing its profile while this
+    // runs: a bare rmSync then fails ENOTEMPTY on a directory it just emptied and
+    // fails the whole suite after every assertion has already passed. Retry instead.
+    rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 
   console.log(`\n${checks - failures.length}/${checks} checks passed`);
