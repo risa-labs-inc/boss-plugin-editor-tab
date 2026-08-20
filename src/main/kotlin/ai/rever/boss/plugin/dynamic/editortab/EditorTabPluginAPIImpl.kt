@@ -49,8 +49,7 @@ class EditorTabPluginAPIImpl(
         // it previews the follow-host theme through the registry - which is populated
         // by the bridge, not by the panel. Both have to happen here as well as in a
         // tab: Settings can be opened in a fresh session with no editor tab composed.
-        ApplyHostChromeToEditor()
-        rememberHostEditorTheme()
+        EditorHostThemeEffects()
 
         val settingsManager = remember { EditorSettingsManager.instance }
         val currentSettings by settingsManager.settings.collectAsState()

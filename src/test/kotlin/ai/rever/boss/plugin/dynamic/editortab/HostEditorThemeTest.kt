@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
+import ai.rever.bosseditor.settings.EditorSettings
 import ai.rever.bosseditor.theme.EditorTheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -7,6 +8,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertSame
+import kotlin.reflect.full.memberProperties
 import kotlin.test.assertTrue
 
 /**
@@ -99,27 +101,73 @@ class HostEditorThemeTest {
     }
 
     @Test
-    fun `highlights stay distinct from the floor and from each other`() {
-        // Three floors, including pure black, because the blend behaves worst at the
-        // extremes: what stays visible on near-black ink can still vanish on black.
+    fun `every fill stays distinct from the floor and from every other fill`() {
+        // The whole matrix, not a hand-picked subset, over floors and token shapes the
+        // derivation can collapse: pure black (worst case for a blend), a monochrome
+        // host where signal and warn are one color (all five fills land on one axis),
+        // and a signal that clears the surface gate but is far too close to the floor
+        // to survive being diluted to 12%.
         val pureBlack = blueprint.copy(ink = Color(0xFF000000), panel = Color(0xFF000000))
-        for (tokens in listOf(blueprint, blueprintLight, pureBlack)) {
+        val monochrome = blueprint.copy(warn = blueprint.signal, data = blueprint.signal)
+        val weakSignal = blueprint.copy(signal = Color(0xFF0A0F18))
+        // The fixture that pins the blend ladder: a signal that only just clears the
+        // wash gate (about 2.1:1 on ink) has a small channel range, so fills spaced
+        // 0.04 apart in blend factor land within 1/100 of each other. Every fixture
+        // above has a high-contrast signal, which hides that.
+        val dimSignal = blueprint.copy(signal = Color(0xFF454545), warn = Color(0xFF454545))
+        val fixtures = listOf(blueprint, blueprintLight, pureBlack, monochrome, weakSignal, dimSignal)
+
+        for (tokens in fixtures) {
             val c = buildHostEditorTheme(tokens).colors
-            val what = "floor ${tokens.ink}"
+            val what = "floor ${tokens.ink} signal ${tokens.signal} warn ${tokens.warn}"
+            val fills = mapOf(
+                "current line" to c.currentLineHighlight,
+                "occurrences" to c.markOccurrences,
+                "bracket" to c.matchedBracketBackground,
+                "selection" to c.selectionBackground,
+                "search match" to c.searchMatchBackground,
+                "current search match" to c.currentSearchMatchBackground,
+            )
 
-            // Each of these is a fill painted on the floor, and the assertion is a
-            // visible delta rather than inequality: a 1/255 difference passes `!=`
-            // and still shows the user nothing when they select, search or click.
-            assertVisiblyDiffers(c.background, c.currentLineHighlight, "current line vs $what")
-            assertVisiblyDiffers(c.background, c.selectionBackground, "selection vs $what")
-            assertVisiblyDiffers(c.background, c.searchMatchBackground, "search match vs $what")
-            assertVisiblyDiffers(c.background, c.markOccurrences, "occurrences vs $what")
-            assertVisiblyDiffers(c.background, c.matchedBracketBackground, "bracket vs $what")
+            for ((name, fill) in fills) {
+                assertVisiblyDiffers(c.background, fill, "$name vs the floor: $what")
+            }
+            // The two inlay chips sit side by side in a line of code, and the parameter
+            // one is deliberately the current-line surface, so they are asserted here
+            // rather than in the matrix (where "same as the current line" is correct).
+            assertVisiblyDiffers(
+                c.inlayHintTypeBackground,
+                c.inlayHintParameterBackground,
+                "inlay chips: $what",
+            )
+            // Pairwise: a fill the user cannot tell from another fill is as useless as
+            // one they cannot tell from the floor.
+            val entries = fills.entries.toList()
+            for (i in entries.indices) {
+                for (j in i + 1 until entries.size) {
+                    assertVisiblyDiffers(
+                        entries[i].value,
+                        entries[j].value,
+                        "${entries[i].key} vs ${entries[j].key}: $what",
+                    )
+                }
+            }
+        }
+    }
 
-            // The current match has to be findable among the other matches, and
-            // neither may read as the selection.
-            assertVisiblyDiffers(c.searchMatchBackground, c.currentSearchMatchBackground, "match pair on $what")
-            assertVisiblyDiffers(c.selectionBackground, c.currentSearchMatchBackground, "selection vs match on $what")
+    @Test
+    fun `code stays readable when the host's text color sits on its own floor`() {
+        // The highest-consequence degenerate case, and the pair polarity is taken from:
+        // near-equal ink and text means a coin-flip base and code the color of the floor.
+        for (floor in listOf(blueprint.ink, blueprintLight.ink)) {
+            val tokens = blueprint.copy(ink = floor, textPrimary = floor)
+            val c = buildHostEditorTheme(tokens).colors
+
+            assertVisiblyDiffers(c.background, c.text, "text vs floor $floor")
+            assertTrue(
+                contrastRatio(c.text, c.background) > 4.5f,
+                "text on floor $floor was ${contrastRatio(c.text, c.background)}:1",
+            )
         }
     }
 
@@ -228,10 +276,38 @@ class HostEditorThemeTest {
     }
 
     @Test
-    fun `the plugin default follows the host`() {
-        // The two halves of this default live in different repos (this mirror and
-        // bosseditor's EditorSettings), and they read the same file.
+    fun `the plugin default follows the host, and agrees with the library`() {
+        // Both halves read one editor-settings.json, so the invariant is not "this is
+        // true" but "these two agree". Asserted against the library so the pin bump is
+        // what fails, rather than a user seeing the wrong theme.
         assertEquals(true, PluginEditorSettingsData().followHostTheme)
+        assertEquals(EditorSettings().followHostTheme, PluginEditorSettingsData().followHostTheme)
+    }
+
+    @Test
+    fun `the settings mirror does not drift from the library's`() {
+        // ignoreUnknownKeys means a rename on the library side degrades silently and
+        // permanently to this mirror's defaults - followHostTheme would read true
+        // forever, whatever the toggle did. Compare the whole struct, not one field.
+        val mirror = PluginEditorSettingsData()
+        val library = EditorSettings()
+        val libraryProps = EditorSettings::class.memberProperties.associateBy { it.name }
+
+        val missing = mutableListOf<String>()
+        val differing = mutableListOf<String>()
+        for (property in PluginEditorSettingsData::class.memberProperties) {
+            val theirs = libraryProps[property.name]
+            if (theirs == null) {
+                missing += property.name
+                continue
+            }
+            val ours = property.getter.call(mirror)
+            val library1 = theirs.getter.call(library)
+            if (ours != library1) differing += "${property.name} (mirror=$ours, library=$library1)"
+        }
+
+        assertTrue(missing.isEmpty(), "fields the library no longer has: $missing")
+        assertTrue(differing.isEmpty(), "defaults that disagree: $differing")
     }
 
     @Test

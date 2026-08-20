@@ -15,6 +15,10 @@ group = "ai.rever.boss.plugin.dynamic"
 // and owns the PSI stack (kotlin-compiler-embeddable is bundled).
 // 1.3.0: contributes MCP tools (editor_read_file/write_file/detect_language)
 // via boss-plugin-api 1.0.51's McpToolProvider, surfaced on the `boss` MCP server.
+// 1.4.19: editor tabs follow the BOSS host theme by default (followHostTheme), and
+// the bundled BossEditor's own chrome follows it too - which hard-requires
+// bosseditor 1.0.12 for EditorTheme.FOLLOW_HOST_THEME, ChromeColors and
+// EditorChrome.
 version = "1.4.19"
 
 java {
@@ -102,6 +106,10 @@ dependencies {
     // Test-only scope: it stays out of runtimeClasspath, which is what
     // buildPluginJar bundles from.
     testImplementation(compose.ui)
+    // Reflection, for the test that compares PluginEditorSettingsData against
+    // bosseditor's EditorSettings property by property. kotlin-reflect is compileOnly
+    // for main (the host ships it), so the test classpath needs its own copy.
+    testImplementation(kotlin("reflect"))
 }
 
 // The default :jar task would otherwise write build/libs/boss-plugin-editor-tab-<version>.jar —

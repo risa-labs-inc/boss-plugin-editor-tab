@@ -5,7 +5,7 @@ import ai.rever.bosseditor.theme.ChromeColors
 import ai.rever.bosseditor.theme.EditorChrome
 import ai.rever.bosseditor.theme.EditorTheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -54,7 +54,35 @@ const val FOLLOW_HOST_THEME_NAME: String = EditorTheme.FOLLOW_HOST_THEME
  */
 @Composable
 fun rememberHostEditorTheme(): EditorTheme {
-    val tokens = HostChromeTokens(
+    val tokens = hostChromeTokens()
+    val theme = remember(tokens) { buildHostEditorTheme(tokens) }
+    // SideEffect, not LaunchedEffect: both writes publish composition state into a
+    // non-Compose global, and LaunchedEffect runs a frame later - long enough for
+    // the settings panel, which resolves the follow-host theme through this same
+    // registry in the same pass, to render one frame of Dark first. SideEffect runs
+    // after the composition is applied, so it still skips an abandoned composition,
+    // and both calls are idempotent (EditorChrome.apply no-ops on equal colors).
+    SideEffect { EditorTheme.registerTheme(theme) }
+    return theme
+}
+
+/**
+ * Publishes the host theme to BossEditor without rendering anything: registers the
+ * derived theme and pushes the chrome tokens.
+ *
+ * For UI that is BossEditor's own rather than an editor tab - the settings panel -
+ * which needs both but has no use for the theme value.
+ */
+@Composable
+fun EditorHostThemeEffects() {
+    rememberHostEditorTheme()
+    ApplyHostChromeToEditor()
+}
+
+/** The host's live chrome tokens, read reactively. */
+@Composable
+private fun hostChromeTokens(): HostChromeTokens {
+    return HostChromeTokens(
         ink = BossThemeColors.BackgroundColor,
         panel = BossThemeColors.SurfaceColor,
         line = BossThemeColors.BorderColor,
@@ -66,12 +94,6 @@ fun rememberHostEditorTheme(): EditorTheme {
         alert = BossThemeColors.ErrorColor,
         warn = BossThemeColors.WarningColor,
     )
-    val theme = remember(tokens) { buildHostEditorTheme(tokens) }
-    // Registering writes a process-global registry, so it belongs in an effect: a
-    // `remember {}` calculation also runs for a composition that is then abandoned,
-    // and it would publish a theme from a tab that never appeared.
-    LaunchedEffect(theme) { EditorTheme.registerTheme(theme) }
-    return theme
 }
 
 /**
@@ -97,7 +119,9 @@ fun ApplyHostChromeToEditor() {
         // nor the panel's own text color is right for every theme's accent.
         onAccent = ChromeColors.contentFor(BossThemeColors.AccentColor),
     )
-    LaunchedEffect(chrome) { EditorChrome.apply(chrome) }
+    // Same reasoning as the theme registration above: applied within the frame, and
+    // idempotent, so a recomposition that changes nothing writes nothing.
+    SideEffect { EditorChrome.apply(chrome) }
 }
 
 /**
@@ -152,7 +176,16 @@ internal data class HostChromeTokens(
  */
 internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
     val t = raw.flattenedOntoFloor()
-    val isLight = t.ink.luminance() > t.textPrimary.luminance()
+    // Polarity comes from the pair the host balanced - unless that pair is unusable.
+    // A text color that does not read on its own floor cannot decide which way up the
+    // theme is (equal luminances answer "dark" for a white floor), so fall back to the
+    // floor's own luminance and substitute a text color at the opposite extreme.
+    val hostTextReads = contrastRatio(t.textPrimary, t.ink) >= TEXT_CONTRAST
+    val isLight = if (hostTextReads) {
+        t.ink.luminance() > t.textPrimary.luminance()
+    } else {
+        t.ink.luminance() > 0.5f
+    }
     val base = if (isLight) EditorTheme.Light else EditorTheme.Dark
 
     // A surface one step off the floor, for the current line, fold placeholders and
@@ -161,13 +194,24 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
     // visible), so fall back to a tint of the text color rather than painting a
     // highlight nobody can see.
     val subtle = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, t.textPrimary, 0.06f))
-    // A brand token that collapses into the floor cannot carry a caret, a selection
-    // or a match. The text color is the one color the host guarantees is readable
-    // on its own floor, so it is the fallback for each of them.
-    val signal = t.signal.orIfIndistinctFrom(t.ink, t.textPrimary)
-    val warn = t.warn.orIfIndistinctFrom(t.ink, t.textPrimary)
-    val data = t.data.orIfIndistinctFrom(t.ink, t.textPrimary)
-    val alert = t.alert.orIfIndistinctFrom(t.ink, t.textPrimary)
+    // Code has to stay readable even if a host hands over a text color that sits on
+    // its own floor.
+    val text = if (hostTextReads) t.textPrimary else if (isLight) Color.Black else Color.White
+    // A brand token has to survive being blended into the floor at 12%, which is a
+    // stronger requirement than being distinguishable from it: a token 0.03 off the
+    // floor clears the surface gate and then vanishes in every wash derived from it.
+    // The text color is the one color the host guarantees reads on its own floor.
+    // Second gate, against the surface rather than the floor: the lightest wash also
+    // has to be distinguishable from the current-line highlight, which is a *surface*
+    // step and so moves independently. A dim monochrome signal at 18% over ink lands
+    // right on the panel color, making an occurrence highlight and a current line the
+    // same thing.
+    val signal = t.signal.washableOver(t.ink, alsoClearing = subtle, fallback = text)
+    val warn = t.warn.washableOver(t.ink, alsoClearing = subtle, fallback = text)
+    // Same gate: `data` also backs a fill (the inlay type chip), which sits next to a
+    // parameter chip painted in the current-line surface.
+    val data = t.data.washableOver(t.ink, alsoClearing = subtle, fallback = text)
+    val alert = t.alert.orIfTooWeakToWash(t.ink, text)
 
     return EditorTheme(
         name = FOLLOW_HOST_THEME_NAME,
@@ -175,28 +219,28 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
         colors = base.colors.copy(
             // Floor and caret
             background = t.ink,
-            text = t.textPrimary,
+            text = text,
             caret = signal,
             // Opaque blends, not alpha: selection and match highlights are painted
             // under the text, and a translucent fill over a light floor washes the
             // glyphs out at exactly the moment the user is reading them.
-            selectionBackground = mix(t.ink, signal, 0.30f),
+            selectionBackground = mix(t.ink, signal, SELECTION_WASH),
             currentLineHighlight = subtle,
             marginLine = t.line,
-            matchedBracketBackground = mix(t.ink, signal, 0.22f),
-            matchedBracketForeground = t.textPrimary,
+            matchedBracketBackground = mix(t.ink, signal, BRACKET_WASH),
+            matchedBracketForeground = text,
 
             // Gutter shares the floor, as the curated themes do; the hairline and
             // the numbers come from the host.
             gutterBackground = t.ink,
             gutterBorder = t.line,
             lineNumber = t.textMuted,
-            lineNumberActive = t.textPrimary,
+            lineNumberActive = text,
             foldIndicator = t.textMuted,
             foldBackground = t.ink,
 
             foldPlaceholderBackground = subtle,
-            foldPlaceholderHover = mix(subtle, t.textPrimary, 0.10f),
+            foldPlaceholderHover = mix(subtle, text, 0.10f),
             foldPlaceholderBorder = t.line,
             foldPlaceholderText = t.textSecondary,
             foldGuide = t.line,
@@ -205,18 +249,18 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
 
             // Status colors the host owns. Syntax colors deliberately stay curated.
             error = alert,
-            searchMatchBackground = mix(t.ink, warn, 0.35f),
-            currentSearchMatchBackground = mix(t.ink, signal, 0.55f),
+            searchMatchBackground = mix(t.ink, warn, SEARCH_WASH),
+            currentSearchMatchBackground = mix(t.ink, signal, CURRENT_SEARCH_WASH),
             hyperlink = data,
-            markOccurrences = mix(t.ink, signal, 0.18f),
+            markOccurrences = mix(t.ink, signal, OCCURRENCE_WASH),
 
             minimapBackground = t.ink,
-            minimapForeground = t.textPrimary,
+            minimapForeground = text,
             minimapViewport = t.textMuted.copy(alpha = 0.25f),
             minimapViewportBorder = t.textMuted.copy(alpha = 0.5f),
             minimapSelection = signal.copy(alpha = 0.35f),
             minimapSearchHighlight = warn,
-            minimapOccurrence = mix(t.ink, signal, 0.25f),
+            minimapOccurrence = mix(t.ink, signal, OCCURRENCE_WASH),
             minimapError = alert,
             minimapWarning = warn,
             minimapInfo = data,
@@ -258,6 +302,27 @@ internal fun mix(a: Color, b: Color, t: Float): Color = Color(
 )
 
 /**
+ * How far each fill painted on the editor floor is blended toward its brand token.
+ *
+ * Evenly spaced by 0.12 rather than the 0.04-to-0.05 steps this started with, because
+ * a host is free to make `signal` and `warn` one color - a monochrome or amber theme
+ * does - which puts every fill on a single axis. A token that only just clears
+ * [WASH_CONTRAST] has a narrow channel range there, and 0.04 of it is invisible: with
+ * the old spacing an occurrence highlight and a matched bracket were the same color.
+ * The ceiling stays low enough that code drawn on the text-bearing four is readable,
+ * with only the current match - the one the user is looking at - going near the top.
+ *
+ * Spacing alone is not enough (a token can collapse into the floor or into the
+ * current-line surface, which is what the two gates below are for) and neither are
+ * the gates alone. Both are pinned by the fixtures in `HostEditorThemeTest`.
+ */
+private const val OCCURRENCE_WASH = 0.12f
+private const val BRACKET_WASH = 0.24f
+private const val SELECTION_WASH = 0.36f
+private const val SEARCH_WASH = 0.48f
+private const val CURRENT_SEARCH_WASH = 0.60f
+
+/**
  * Smallest component difference two colors can have and still read as two colors.
  *
  * Roughly 5/255 per channel. Exact inequality is not a usable test here: a panel
@@ -265,9 +330,46 @@ internal fun mix(a: Color, b: Color, t: Float): Color = Color(
  */
 private const val VISIBLE_DELTA = 0.02f
 
+/**
+ * Contrast a token needs against the floor to survive being blended into it.
+ *
+ * [VISIBLE_DELTA] answers "are these two colors different", which is the right
+ * question for a surface step and the wrong one for a token that gets diluted to
+ * 12%: a channel gate is also least honest on a light floor, where a 0.03 delta is
+ * technically distinct and practically invisible. A WCAG-style ratio is what the
+ * eye actually tracks, and 2:1 is roughly where a 12% wash of a color stops reading
+ * as the floor.
+ */
+private const val WASH_CONTRAST = 2f
+
+/** Contrast the host's own text color needs against its floor to be usable as code. */
+private const val TEXT_CONTRAST = 3f
+
 /** [this] unless it is indistinguishable from [floor], in which case [fallback]. */
 private fun Color.orIfIndistinctFrom(floor: Color, fallback: Color): Color =
     if (visiblyDiffers(this, floor)) this else fallback
+
+/** [this] unless it is too close to [floor] to survive a wash, in which case [fallback]. */
+private fun Color.orIfTooWeakToWash(floor: Color, fallback: Color): Color =
+    if (contrastRatio(this, floor) >= WASH_CONTRAST) this else fallback
+
+/**
+ * [this] if it can carry a wash over [floor] that is also distinguishable from
+ * [alsoClearing], otherwise [fallback]. Checked at [OCCURRENCE_WASH], the lightest
+ * wash and therefore the one that collides first.
+ */
+private fun Color.washableOver(floor: Color, alsoClearing: Color, fallback: Color): Color {
+    val candidate = orIfTooWeakToWash(floor, fallback)
+    val lightestWash = mix(floor, candidate, OCCURRENCE_WASH)
+    return if (visiblyDiffers(lightestWash, alsoClearing)) candidate else fallback
+}
+
+/** WCAG relative-luminance contrast ratio between [a] and [b]. */
+internal fun contrastRatio(a: Color, b: Color): Float {
+    val la = a.luminance()
+    val lb = b.luminance()
+    return (maxOf(la, lb) + 0.05f) / (minOf(la, lb) + 0.05f)
+}
 
 /** Whether [a] and [b] differ by at least [VISIBLE_DELTA] in any channel. */
 internal fun visiblyDiffers(a: Color, b: Color): Boolean =
@@ -296,6 +398,11 @@ private fun HostChromeTokens.flattenedOntoFloor(): HostChromeTokens {
     )
 }
 
-/** Source-over compositing of [this] onto an opaque [backdrop]. */
-private fun Color.over(backdrop: Color): Color =
+/**
+ * Source-over compositing of [this] onto an opaque [backdrop].
+ *
+ * Internal rather than private: the run-gutter icon blends a host token outside the
+ * derivation, and the premultiplication guarantee has to hold there too.
+ */
+internal fun Color.over(backdrop: Color): Color =
     if (alpha >= 1f) this else mix(backdrop, copy(alpha = 1f), alpha)

@@ -1636,7 +1636,10 @@ data class PluginEditorSettingsData(
     val caretBlinkRate: Int = 530,
     val caretStyle: String = "line",
     // Minimap Settings
-    val showMinimap: Boolean = true,
+    // false, matching bosseditor's own default: with true here the settings panel
+    // showed the toggle off while a tab rendered a minimap anyway. Found by the test
+    // that compares this mirror against EditorSettings property by property.
+    val showMinimap: Boolean = false,
     val minimapWidth: Int = 80,
     val minimapUseEditorColors: Boolean = true,
     val minimapBackgroundColor: String? = null,
@@ -1658,7 +1661,13 @@ object PluginEditorSettings {
     // exception becomes an ExceptionInInitializerError that poisons the object for
     // the rest of the process - every later settings read, not just this one.
     private val settingsFile = runCatching { BossDirectories.resolve("editor-settings.json") }
-        .getOrElse { File(System.getProperty("user.home"), ".boss/editor-settings.json") }
+        .getOrElse { error ->
+            // Say so: the fallback silently reinstates the split this change fixed (a
+            // dev host writes ~/.boss_debug while this reads ~/.boss), and a settings
+            // panel that appears to do nothing is otherwise an afternoon to diagnose.
+            System.err.println("editor-tab: BOSS data root unavailable ($error), using ~/.boss")
+            File(System.getProperty("user.home"), ".boss/editor-settings.json")
+        }
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -2519,6 +2528,12 @@ private fun EditorRunGutter(
     }
 }
 
+/** IntelliJ's run green, which every curated editor theme is drawn around. */
+private val CURATED_RUN_GREEN = Color(0xFF59A869)
+
+/** A run icon has to be seen to be clicked, so it needs this much against its floor. */
+private const val RUN_ICON_CONTRAST = 2f
+
 /**
  * Run icon with hover effect matching IntelliJ style.
  */
@@ -2531,13 +2546,22 @@ private fun GutterRunIcon(
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
-    // The host's ok token rather than IntelliJ's green, so the run affordance
-    // belongs to the active theme; hover lifts it toward the text color.
-    val iconColor = if (isHovered) {
-        mix(BossThemeColors.SuccessColor, BossThemeColors.TextPrimary, 0.25f)
+    // Same rule as the status bar, read off the resolved theme rather than a second
+    // parameter: the host's ok token while the editor follows the host, the curated
+    // green once a fixed theme is chosen. Taking the host token unconditionally
+    // painted a green tuned for a light window onto a Dracula gutter.
+    val theme = LocalEditorTheme.current
+    val floor = theme.colors.gutterBackground
+    val base = if (theme.name == FOLLOW_HOST_THEME_NAME) {
+        // Composited, so a translucent host token cannot arrive as a raw triple.
+        BossThemeColors.SuccessColor.over(floor)
     } else {
-        BossThemeColors.SuccessColor
+        CURATED_RUN_GREEN
     }
+    // This is a click target, not decoration: if the tint collapses into the gutter
+    // it stops being findable, so fall back to the color the theme reads text in.
+    val tint = if (contrastRatio(base, floor) >= RUN_ICON_CONTRAST) base else theme.colors.text
+    val iconColor = if (isHovered) mix(tint, theme.colors.text, 0.25f) else tint
 
     Icon(
         imageVector = FeatherIcons.Play,
