@@ -19,7 +19,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // the bundled BossEditor's own chrome follows it too - which hard-requires
 // bosseditor 1.0.12 for EditorTheme.FOLLOW_HOST_THEME, ChromeColors and
 // EditorChrome.
-version = "1.4.19"
+version = "1.4.20"
 
 java {
     toolchain {
