@@ -125,9 +125,14 @@ private fun hostChromeTokensNow(): HostChromeTokens {
  * panel, dropdowns and color picker follow the host instead of painting the fixed
  * dark surface with a blue accent they carried as constants.
  *
- * Call this from anywhere the plugin composes BossEditor UI: the chrome holder is
- * process-global (per plugin classloader, so per window), and the settings panel can
+ * Call this from anywhere the plugin composes BossEditor UI: the settings panel can
  * be open with no editor tab in sight.
+ *
+ * The chrome holder is global to this plugin's classloader, which the host gives out
+ * per window - `PluginClassLoaderManager` is owned by each window's
+ * `DynamicPluginManager`, which is exactly why its API layer is the one thing it
+ * keeps process-wide. So two windows on different host themes hold separate copies
+ * rather than racing over one.
  */
 @Composable
 fun ApplyHostChromeToEditor() {
