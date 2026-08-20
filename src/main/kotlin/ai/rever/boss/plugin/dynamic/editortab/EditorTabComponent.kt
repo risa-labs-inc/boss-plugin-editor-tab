@@ -399,17 +399,17 @@ class EditorTabComponent(
             // editor canvas, so with only the canvas themed they kept rendering
             // against LocalEditorTheme's static Dark default.
             CompositionLocalProvider(LocalEditorTheme provides editorTheme) {
-                EditorTabContent()
+                EditorTabContent(settings)
             }
         }
     }
 
     @Composable
-    private fun EditorTabContent() {
+    private fun EditorTabContent(settings: PluginEditorSettingsData) {
         val scope = rememberCoroutineScope()
 
-        // Reactive settings - updates automatically when settings file changes (like bundled editor)
-        val settings by PluginEditorSettings.settings.collectAsState()
+        // Settings arrive from Content(), which already collects them to resolve the
+        // theme - collecting again here would recompose this subtree twice per change.
         val markdownViewSettings by markdownSettingsManager.settings.collectAsState()
         val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
@@ -1393,7 +1393,6 @@ class EditorTabComponent(
 
             // Status bar (matches bundled editor)
             EditorStatusBar(
-                followsHostTheme = settings.followHostTheme,
                 filePath = filePath,
                 language = language,
                 line = cursorLine,
@@ -1460,11 +1459,16 @@ private data class StatusBarColors(
 /**
  * Host chrome while the editor follows the host, the editor's own theme otherwise,
  * so the bar always belongs to whatever is directly above it.
+ *
+ * Keyed on the resolved theme rather than on the setting: `followHostTheme = false`
+ * with a blank or retired theme name still resolves to the host theme, and keying on
+ * the setting made the bar disagree with the canvas in exactly that case.
  */
 @Composable
-private fun statusBarColors(followsHostTheme: Boolean): StatusBarColors {
-    val editor = LocalEditorTheme.current.colors
-    return if (followsHostTheme) {
+private fun statusBarColors(): StatusBarColors {
+    val theme = LocalEditorTheme.current
+    val editor = theme.colors
+    return if (followsHostTheme(theme)) {
         StatusBarColors(
             fill = BossThemeColors.SurfaceColor,
             border = BossThemeColors.BorderColor,
@@ -1492,7 +1496,6 @@ private fun statusBarColors(followsHostTheme: Boolean): StatusBarColors {
  */
 @Composable
 private fun EditorStatusBar(
-    followsHostTheme: Boolean,
     filePath: String,
     language: String,
     line: Int,
@@ -1508,7 +1511,7 @@ private fun EditorStatusBar(
     // while the editor does, and the editor theme once a fixed theme is chosen -
     // otherwise a Dracula canvas in a light window would get a light bar welded to
     // it, which is the same seam this bridge exists to remove, just inverted.
-    val bar = statusBarColors(followsHostTheme)
+    val bar = statusBarColors()
     Column(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
@@ -2531,9 +2534,6 @@ private fun EditorRunGutter(
 /** IntelliJ's run green, which every curated editor theme is drawn around. */
 private val CURATED_RUN_GREEN = Color(0xFF59A869)
 
-/** A run icon has to be seen to be clicked, so it needs this much against its floor. */
-private const val RUN_ICON_CONTRAST = 2f
-
 /**
  * Run icon with hover effect matching IntelliJ style.
  */
@@ -2546,21 +2546,18 @@ private fun GutterRunIcon(
     val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
 
-    // Same rule as the status bar, read off the resolved theme rather than a second
-    // parameter: the host's ok token while the editor follows the host, the curated
-    // green once a fixed theme is chosen. Taking the host token unconditionally
-    // painted a green tuned for a light window onto a Dracula gutter.
+    // Same rule as the status bar, read off the resolved theme: the host's ok token
+    // while the editor follows the host, the curated green once a fixed theme is
+    // chosen. Taking the host token unconditionally painted a green tuned for a light
+    // window onto a Dracula gutter.
     val theme = LocalEditorTheme.current
     val floor = theme.colors.gutterBackground
-    val base = if (theme.name == FOLLOW_HOST_THEME_NAME) {
-        // Composited, so a translucent host token cannot arrive as a raw triple.
-        BossThemeColors.SuccessColor.over(floor)
-    } else {
-        CURATED_RUN_GREEN
+    val base = if (followsHostTheme(theme)) BossThemeColors.SuccessColor else CURATED_RUN_GREEN
+    // Remembered: gutter icons recompose on every scroll frame, and only the hover
+    // lift below has to follow the pointer.
+    val tint = remember(base, floor, theme.colors.text) {
+        runIconTint(base, floor, theme.colors.text)
     }
-    // This is a click target, not decoration: if the tint collapses into the gutter
-    // it stops being findable, so fall back to the color the theme reads text in.
-    val tint = if (contrastRatio(base, floor) >= RUN_ICON_CONTRAST) base else theme.colors.text
     val iconColor = if (isHovered) mix(tint, theme.colors.text, 0.25f) else tint
 
     Icon(

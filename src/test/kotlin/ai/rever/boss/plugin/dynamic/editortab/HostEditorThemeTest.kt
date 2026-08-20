@@ -247,6 +247,63 @@ class HostEditorThemeTest {
     }
 
     @Test
+    fun `a flat panel and a collapsed text color together still leave a visible line`() {
+        // Each degeneracy has its own test above; this is both at once, which is what
+        // the fallback ordering has to survive - a current-line tint derived from a
+        // text color that was itself rejected is just the floor again.
+        for (floor in listOf(blueprint.ink, blueprintLight.ink)) {
+            val tokens = blueprint.copy(ink = floor, panel = floor, textPrimary = floor)
+            val c = buildHostEditorTheme(tokens).colors
+
+            assertVisiblyDiffers(c.background, c.currentLineHighlight, "current line on $floor")
+            assertVisiblyDiffers(c.background, c.foldPlaceholderBackground, "fold placeholder on $floor")
+            assertVisiblyDiffers(c.background, c.minimapCurrentLine, "minimap current line on $floor")
+            assertVisiblyDiffers(c.background, c.text, "text on $floor")
+        }
+    }
+
+    @Test
+    fun `a muted token that vanishes into the floor still numbers the lines`() {
+        // "Muted" is a design choice; muted into its own floor is unreadable. Line
+        // numbers, fold arrows and hints all come from these two tokens.
+        val collapsed = blueprint.copy(textSecondary = blueprint.ink, textMuted = blueprint.ink)
+        val c = buildHostEditorTheme(collapsed).colors
+
+        for ((name, color) in mapOf(
+            "line number" to c.lineNumber,
+            "fold indicator" to c.foldIndicator,
+            "hint squiggle" to c.hintSquiggle,
+            "fold placeholder text" to c.foldPlaceholderText,
+        )) {
+            assertTrue(
+                contrastRatio(color, c.background) >= 2f,
+                "$name was ${contrastRatio(color, c.background)}:1 on the floor",
+            )
+        }
+    }
+
+    @Test
+    fun `the run icon tint falls back when it collapses into the gutter`() {
+        val gutter = Color(0xFF282A36) // Dracula's gutter
+        val text = Color(0xFFF8F8F2)
+
+        // A usable green survives.
+        assertEquals(Color(0xFF59A869), runIconTint(Color(0xFF59A869), gutter, text))
+        // A green the same color as the gutter would be an invisible click target.
+        assertEquals(text, runIconTint(gutter, gutter, text))
+        // Translucency is composited, not read as a raw triple: 8% white over the
+        // gutter is still dark, so it falls back rather than painting near-white.
+        assertEquals(text, runIconTint(Color.White.copy(alpha = 0.08f), gutter, text))
+    }
+
+    @Test
+    fun `only the derived theme counts as following the host`() {
+        assertTrue(followsHostTheme(buildHostEditorTheme(blueprint)))
+        assertEquals(false, followsHostTheme(EditorTheme.Dracula))
+        assertEquals(false, followsHostTheme(EditorTheme.Dark))
+    }
+
+    @Test
     fun `the derived theme carries the follow-host name`() {
         assertEquals(FOLLOW_HOST_THEME_NAME, buildHostEditorTheme(blueprint).name)
     }

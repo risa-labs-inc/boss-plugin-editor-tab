@@ -188,15 +188,23 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
     }
     val base = if (isLight) EditorTheme.Light else EditorTheme.Dark
 
+    // Code has to stay readable even if a host hands over a text color that sits on
+    // its own floor. Resolved before anything derived from it: every fallback below
+    // tints toward this, and tinting toward the raw token would carry the same
+    // degeneracy forward - a host with `panel == ink` *and* `textPrimary == ink` got
+    // a current-line highlight equal to the floor.
+    val text = if (hostTextReads) t.textPrimary else if (isLight) Color.Black else Color.White
+    // Supporting copy: line numbers, fold arrows, hints. Muted by design, but a token
+    // that is muted into its own floor is just unreadable, so it falls back to a tint
+    // of the vetted text color at roughly the weight a muted token should have.
+    val textSecondary = t.textSecondary.orIfTooWeakToWash(t.ink, mix(t.ink, text, 0.70f))
+    val textMuted = t.textMuted.orIfTooWeakToWash(t.ink, mix(t.ink, text, 0.45f))
     // A surface one step off the floor, for the current line, fold placeholders and
     // inlay chips. `panel` is normally the host's chrome step above `ink`, but a
     // theme is free to make them equal (or near enough that the difference is not
     // visible), so fall back to a tint of the text color rather than painting a
     // highlight nobody can see.
-    val subtle = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, t.textPrimary, 0.06f))
-    // Code has to stay readable even if a host hands over a text color that sits on
-    // its own floor.
-    val text = if (hostTextReads) t.textPrimary else if (isLight) Color.Black else Color.White
+    val subtle = t.panel.orIfIndistinctFrom(t.ink, mix(t.ink, text, 0.06f))
     // A brand token has to survive being blended into the floor at 12%, which is a
     // stronger requirement than being distinguishable from it: a token 0.03 off the
     // floor clears the surface gate and then vanishes in every wash derived from it.
@@ -234,18 +242,18 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
             // the numbers come from the host.
             gutterBackground = t.ink,
             gutterBorder = t.line,
-            lineNumber = t.textMuted,
+            lineNumber = textMuted,
             lineNumberActive = text,
-            foldIndicator = t.textMuted,
+            foldIndicator = textMuted,
             foldBackground = t.ink,
 
             foldPlaceholderBackground = subtle,
             foldPlaceholderHover = mix(subtle, text, 0.10f),
             foldPlaceholderBorder = t.line,
-            foldPlaceholderText = t.textSecondary,
+            foldPlaceholderText = textSecondary,
             foldGuide = t.line,
             indentGuide = t.line,
-            activeIndentGuide = t.textMuted,
+            activeIndentGuide = textMuted,
 
             // Status colors the host owns. Syntax colors deliberately stay curated.
             error = alert,
@@ -256,30 +264,30 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
 
             minimapBackground = t.ink,
             minimapForeground = text,
-            minimapViewport = t.textMuted.copy(alpha = 0.25f),
-            minimapViewportBorder = t.textMuted.copy(alpha = 0.5f),
+            minimapViewport = textMuted.copy(alpha = 0.25f),
+            minimapViewportBorder = textMuted.copy(alpha = 0.5f),
             minimapSelection = signal.copy(alpha = 0.35f),
             minimapSearchHighlight = warn,
             minimapOccurrence = mix(t.ink, signal, OCCURRENCE_WASH),
             minimapError = alert,
             minimapWarning = warn,
             minimapInfo = data,
-            minimapHint = t.textMuted,
+            minimapHint = textMuted,
             minimapCurrentLine = subtle,
-            minimapSliderHover = t.textMuted.copy(alpha = 0.35f),
+            minimapSliderHover = textMuted.copy(alpha = 0.35f),
             minimapBorder = t.line,
 
             errorSquiggle = alert,
             warningSquiggle = warn,
             infoSquiggle = data,
-            hintSquiggle = t.textMuted,
+            hintSquiggle = textMuted,
             gutterError = alert,
             gutterWarning = warn,
             gutterInfo = data,
-            gutterHint = t.textMuted,
+            gutterHint = textMuted,
 
             inlayHintParameterBackground = subtle,
-            inlayHintParameterForeground = t.textSecondary,
+            inlayHintParameterForeground = textSecondary,
             inlayHintTypeBackground = mix(t.ink, data, 0.18f),
             inlayHintTypeForeground = data,
         ),
@@ -363,6 +371,20 @@ private fun Color.washableOver(floor: Color, alsoClearing: Color, fallback: Colo
     val lightestWash = mix(floor, candidate, OCCURRENCE_WASH)
     return if (visiblyDiffers(lightestWash, alsoClearing)) candidate else fallback
 }
+
+/**
+ * Tint for the run gutter icon: [base] unless it collapses into [floor], in which
+ * case [text].
+ *
+ * A run icon is a click target, so "can the user find it" is the requirement, not
+ * "does it look themed". Pure and internal so it can be pinned like the rest of the
+ * derivation - the composable only supplies the three colors.
+ */
+internal fun runIconTint(base: Color, floor: Color, text: Color): Color =
+    if (contrastRatio(base.over(floor), floor) >= WASH_CONTRAST) base.over(floor) else text
+
+/** Whether [theme] is the one derived from the host, rather than a fixed choice. */
+internal fun followsHostTheme(theme: EditorTheme): Boolean = theme.name == FOLLOW_HOST_THEME_NAME
 
 /** WCAG relative-luminance contrast ratio between [a] and [b]. */
 internal fun contrastRatio(a: Color, b: Color): Float {
