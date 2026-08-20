@@ -10,6 +10,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertSame
+import kotlinx.serialization.descriptors.elementNames
 import kotlin.reflect.full.memberProperties
 import kotlin.test.assertTrue
 
@@ -331,6 +332,47 @@ class HostEditorThemeTest {
     }
 
     @Test
+    fun `the status bar stays legible on a degenerate host`() {
+        val hostTheme = buildHostEditorTheme(blueprint)
+        // A translucent accent used to paint the active markdown mode at 10% alpha,
+        // making the selected one the least visible of the three; a muted token equal
+        // to the bar's own fill made the caret position unreadable.
+        val degenerate = blueprint.copy(
+            signal = Color.White.copy(alpha = 0.10f),
+            textSecondary = blueprint.panel,
+            textMuted = blueprint.panel,
+            textPrimary = blueprint.panel,
+        )
+
+        for ((label, tokens) in mapOf("blueprint" to blueprint, "degenerate" to degenerate)) {
+            val bar = statusBarColors(tokens, hostTheme)
+            assertEquals(1f, bar.accent.alpha, "$label: accent composited")
+            for ((name, color) in mapOf(
+                "primary" to bar.primary,
+                "secondary" to bar.secondary,
+                "muted" to bar.muted,
+                "accent" to bar.accent,
+                "error" to bar.error,
+            )) {
+                assertTrue(
+                    contrastRatio(color, bar.fill) >= 2f,
+                    "$label $name was ${contrastRatio(color, bar.fill)}:1 on the bar",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `the status bar follows the editor theme once a fixed one is chosen`() {
+        val bar = statusBarColors(blueprint, EditorTheme.Dracula)
+
+        // Welded to the canvas above it, not to the host chrome.
+        assertEquals(EditorTheme.Dracula.colors.gutterBackground, bar.fill)
+        assertEquals(EditorTheme.Dracula.colors.text, bar.primary)
+        assertEquals(EditorTheme.Dracula.colors.caret, bar.accent)
+    }
+
+    @Test
     fun `only the derived theme counts as following the host`() {
         assertTrue(followsHostTheme(buildHostEditorTheme(blueprint)))
         assertEquals(false, followsHostTheme(EditorTheme.Dracula))
@@ -398,6 +440,13 @@ class HostEditorThemeTest {
             if (ours != libraryValue) differing += "${property.name} (mirror=$ours, library=$libraryValue)"
         }
 
+        // The wire format, not just the property names: a @SerialName on either side
+        // renames the key while leaving both Kotlin names identical, which is exactly
+        // the divergence ignoreUnknownKeys hides. Defaults still need the reflection
+        // above, since a descriptor does not carry them.
+        val mirrorKeys = PluginEditorSettingsData.serializer().descriptor.elementNames.toSet()
+        val libraryKeys = EditorSettings.serializer().descriptor.elementNames.toSet()
+
         // Both directions. A field the library gained and the mirror lacks is the
         // failure ignoreUnknownKeys actually hides: the tab silently keeps this
         // mirror's default forever, whatever the panel writes. Anything deliberately
@@ -408,6 +457,11 @@ class HostEditorThemeTest {
         assertTrue(missing.isEmpty(), "fields the library no longer has: $missing")
         assertTrue(differing.isEmpty(), "defaults that disagree: $differing")
         assertTrue(unmirrored.isEmpty(), "settings the library has and this mirror does not: $unmirrored")
+        assertEquals(
+            libraryKeys - deliberatelyUnmirrored,
+            mirrorKeys,
+            "serialized keys differ, so one side is reading a name the other never writes",
+        )
     }
 
     @Test

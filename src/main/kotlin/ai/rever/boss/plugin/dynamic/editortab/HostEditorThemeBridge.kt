@@ -8,6 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.luminance
 import kotlin.math.abs
 
@@ -55,7 +56,7 @@ val FOLLOW_HOST_THEME_NAME: String = EditorTheme.FOLLOW_HOST_THEME
 @Composable
 fun rememberHostEditorTheme(): EditorTheme {
     val tokens = hostChromeTokens()
-    val theme = remember(tokens) { buildHostEditorTheme(tokens) }
+    val theme = remember(tokens) { hostEditorTheme(tokens) }
     // SideEffect, not LaunchedEffect: both writes publish composition state into a
     // non-Compose global, and LaunchedEffect runs a frame later - long enough for
     // the settings panel, which resolves the follow-host theme through this same
@@ -89,14 +90,42 @@ fun EditorHostThemeEffects() {
  * chrome are never empty, and the effects keep them current from there.
  */
 fun publishHostThemeToEditor() {
+    // Only once the host actually has colors. An unspecified token has alpha 0, so
+    // compositing would flatten all ten onto the floor and seed a pure black theme -
+    // a worse first frame than the Dark this seeding exists to avoid. If the host is
+    // not ready, the effects publish the real thing on the first composition.
+    if (!BossThemeColors.BackgroundColor.isSpecified) return
     val tokens = hostChromeTokensNow()
-    EditorTheme.registerTheme(buildHostEditorTheme(tokens))
+    EditorTheme.registerTheme(hostEditorTheme(tokens))
     EditorChrome.apply(hostChromeColors(tokens))
+}
+
+/**
+ * The derived theme for [tokens], memoised across tabs.
+ *
+ * Every open tab derives the same theme from the same tokens, and they are also the
+ * `LocalEditorTheme` identity each tab provides - so one instance per token set means
+ * one derivation and one registry write per theme switch, not one per tab.
+ */
+internal fun hostEditorTheme(tokens: HostChromeTokens): EditorTheme =
+    synchronized(derivedLock) {
+        derived?.takeIf { it.first == tokens }?.second
+            ?: buildHostEditorTheme(tokens).also { derived = tokens to it }
+    }
+
+private val derivedLock = Any()
+private var derived: Pair<HostChromeTokens, EditorTheme>? = null
+
+/** Drops the memoised theme and the chrome, for plugin teardown. */
+fun unpublishHostThemeFromEditor() {
+    synchronized(derivedLock) { derived = null }
+    EditorTheme.unregisterTheme(FOLLOW_HOST_THEME_NAME)
+    EditorChrome.reset()
 }
 
 /** The host's live chrome tokens, read reactively when called from a composition. */
 @Composable
-private fun hostChromeTokens(): HostChromeTokens = hostChromeTokensNow()
+internal fun hostChromeTokens(): HostChromeTokens = hostChromeTokensNow()
 
 /**
  * The host's chrome tokens as of now.
@@ -141,6 +170,58 @@ fun ApplyHostChromeToEditor() {
     // idempotent, so a recomposition that changes nothing writes nothing.
     SideEffect { EditorChrome.apply(chrome) }
 }
+
+/**
+ * Colors for the status bar under the editor.
+ *
+ * Host chrome while the editor follows the host, the editor's own theme otherwise, so
+ * the bar always belongs to whatever is directly above it. Pure, and gated like the
+ * derivation: the host branch composites its tokens onto the bar's own fill and falls
+ * back when one collapses into it, because a translucent accent would otherwise paint
+ * the active markdown mode at 10% alpha - the least visible of the three.
+ */
+internal fun statusBarColors(tokens: HostChromeTokens, theme: EditorTheme): StatusBarColors {
+    if (!followsHostTheme(theme)) {
+        val editor = theme.colors
+        return StatusBarColors(
+            fill = editor.gutterBackground,
+            border = editor.gutterBorder,
+            primary = editor.text,
+            secondary = editor.lineNumber,
+            muted = editor.foldIndicator,
+            accent = editor.caret,
+            error = editor.error,
+        )
+    }
+    // The bar is painted in `panel`, so that - not `ink` - is the floor its own
+    // content sits on.
+    val t = tokens.flattenedOnto(tokens.panel)
+    val primary = if (contrastRatio(t.textPrimary, t.panel) >= TEXT_CONTRAST) {
+        t.textPrimary
+    } else {
+        if (t.panel.luminance() > 0.5f) Color.Black else Color.White
+    }
+    return StatusBarColors(
+        fill = t.panel,
+        border = t.line,
+        primary = primary,
+        secondary = t.textSecondary.orIfTooWeakToWash(t.panel, mix(t.panel, primary, 0.70f)),
+        muted = t.textMuted.orIfTooWeakToWash(t.panel, mix(t.panel, primary, 0.45f)),
+        accent = t.signal.orIfTooWeakToWash(t.panel, primary),
+        error = t.alert.orIfTooWeakToWash(t.panel, primary),
+    )
+}
+
+/** What [statusBarColors] resolves to. */
+internal data class StatusBarColors(
+    val fill: Color,
+    val border: Color,
+    val primary: Color,
+    val secondary: Color,
+    val muted: Color,
+    val accent: Color,
+    val error: Color,
+)
 
 /**
  * Resolves the theme an editor tab should render with.
@@ -342,6 +423,10 @@ internal fun buildHostEditorTheme(raw: HostChromeTokens): EditorTheme {
  * black rounds back to pure black - which collapses exactly the subtle surface
  * ladder this derivation is built from on an ink-floored theme. BossTerm's
  * `UiTheme` carries the same helper for the same reason.
+ *
+ * Reads and writes sRGB components: every color here comes from the host's tokens or
+ * from BossEditor's palettes, all of which are sRGB. A color from another space would
+ * be reinterpreted rather than converted.
  */
 internal fun mix(a: Color, b: Color, t: Float): Color = Color(
     red = a.red + (b.red - a.red) * t,
@@ -391,7 +476,15 @@ private const val VISIBLE_DELTA = 0.02f
  */
 private const val WASH_CONTRAST = 2f
 
-/** Contrast the host's own text color needs against its floor to be usable as code. */
+/**
+ * Contrast below which the host's own text token is treated as unusable.
+ *
+ * Not a readability target - code wants 4.5:1 and the substitute this triggers
+ * (black or white on the floor) clears that by a mile. It is the bar for *deferring*
+ * to the host: a token that clears 3:1 is the host's considered choice about its own
+ * theme and gets used as-is, and only one that cannot even reach WCAG's large-text
+ * floor is overridden.
+ */
 private const val TEXT_CONTRAST = 3f
 
 /** [this] unless it is indistinguishable from [floor], in which case [fallback]. */
@@ -421,8 +514,10 @@ private fun Color.washableOver(floor: Color, alsoClearing: Color, fallback: Colo
  * "does it look themed". Pure and internal so it can be pinned like the rest of the
  * derivation - the composable only supplies the three colors.
  */
-internal fun runIconTint(base: Color, floor: Color, text: Color): Color =
-    if (contrastRatio(base.over(floor), floor) >= WASH_CONTRAST) base.over(floor) else text
+internal fun runIconTint(base: Color, floor: Color, text: Color): Color {
+    val composited = base.over(floor)
+    return if (contrastRatio(composited, floor) >= WASH_CONTRAST) composited else text
+}
 
 /** Whether [theme] is the one derived from the host, rather than a fixed choice. */
 internal fun followsHostTheme(theme: EditorTheme): Boolean = theme.name == FOLLOW_HOST_THEME_NAME
@@ -445,11 +540,17 @@ internal fun visiblyDiffers(a: Color, b: Color): Boolean =
  * blends opaque colors. The floor itself is composited onto black - it is the
  * bottom of the stack, and there is nothing behind it to show through.
  */
-private fun HostChromeTokens.flattenedOntoFloor(): HostChromeTokens {
-    val floor = ink.over(Color.Black)
+private fun HostChromeTokens.flattenedOntoFloor(): HostChromeTokens = flattenedOnto(ink)
+
+/**
+ * Every token composited onto [backdrop] - the surface they are actually drawn on,
+ * which is the floor for the editor canvas and `panel` for the status bar.
+ */
+private fun HostChromeTokens.flattenedOnto(backdrop: Color): HostChromeTokens {
+    val floor = backdrop.over(Color.Black)
     return HostChromeTokens(
-        ink = floor,
-        panel = panel.over(floor),
+        ink = if (backdrop == ink) floor else ink.over(floor),
+        panel = if (backdrop == panel) floor else panel.over(floor),
         line = line.over(floor),
         textPrimary = textPrimary.over(floor),
         textSecondary = textSecondary.over(floor),

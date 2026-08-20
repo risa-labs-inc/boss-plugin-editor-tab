@@ -74,6 +74,7 @@ import ai.rever.bosseditor.rendering.EditorToken
 import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -1445,52 +1446,6 @@ class EditorTabComponent(
     }
 }
 
-/** Colors for [EditorStatusBar], taken from the host or from the editor theme. */
-private data class StatusBarColors(
-    val fill: Color,
-    val border: Color,
-    val primary: Color,
-    val secondary: Color,
-    val muted: Color,
-    val accent: Color,
-    val error: Color,
-)
-
-/**
- * Host chrome while the editor follows the host, the editor's own theme otherwise,
- * so the bar always belongs to whatever is directly above it.
- *
- * Keyed on the resolved theme rather than on the setting: `followHostTheme = false`
- * with a blank or retired theme name still resolves to the host theme, and keying on
- * the setting made the bar disagree with the canvas in exactly that case.
- */
-@Composable
-private fun statusBarColors(): StatusBarColors {
-    val theme = LocalEditorTheme.current
-    val editor = theme.colors
-    return if (followsHostTheme(theme)) {
-        StatusBarColors(
-            fill = BossThemeColors.SurfaceColor,
-            border = BossThemeColors.BorderColor,
-            primary = BossThemeColors.TextPrimary,
-            secondary = BossThemeColors.TextSecondary,
-            muted = BossThemeColors.TextMuted,
-            accent = BossThemeColors.AccentColor,
-            error = BossThemeColors.ErrorColor,
-        )
-    } else {
-        StatusBarColors(
-            fill = editor.gutterBackground,
-            border = editor.gutterBorder,
-            primary = editor.text,
-            secondary = editor.lineNumber,
-            muted = editor.foldIndicator,
-            accent = editor.caret,
-            error = editor.error,
-        )
-    }
-}
-
 /**
  * Status bar for the editor showing file info, cursor position, and save status.
  */
@@ -1511,19 +1466,21 @@ private fun EditorStatusBar(
     // while the editor does, and the editor theme once a fixed theme is chosen -
     // otherwise a Dracula canvas in a light window would get a light bar welded to
     // it, which is the same seam this bridge exists to remove, just inverted.
-    val bar = statusBarColors()
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(1.dp)
-                .background(bar.border)
-        )
+    val bar = statusBarColors(hostChromeTokens(), LocalEditorTheme.current)
+    // The hairline is drawn inside the 24.dp rather than stacked above it, so the bar
+    // occupies exactly the height it always did.
+    Box(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(24.dp)
                 .background(bar.fill)
+                .drawBehind {
+                    drawRect(
+                        color = bar.border,
+                        size = androidx.compose.ui.geometry.Size(size.width, 1.dp.toPx()),
+                    )
+                }
                 .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween

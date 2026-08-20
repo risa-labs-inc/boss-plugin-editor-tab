@@ -91,6 +91,11 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         autoSaveSettingsManager?.dispose()
         autoSaveSettingsManager = null
 
+        // Undo what register() published. The registry and the chrome holder live in
+        // this plugin's classloader, so a reload replaces them anyway - symmetry is
+        // cheaper than depending on that reasoning staying true.
+        runCatching { unpublishHostThemeFromEditor() }
+
         // Tear down the bundled PSI stack (previously the host main.kt shutdown
         // hook's job, when BossEditor lived on the host classpath).
         runCatching { ProjectIndexer.shutdownGlobal() }
