@@ -42,7 +42,7 @@ import kotlin.math.abs
  * Aliases the library's constant rather than repeating the string - the two halves
  * have to agree or the preview silently shows Dark.
  */
-const val FOLLOW_HOST_THEME_NAME: String = EditorTheme.FOLLOW_HOST_THEME
+val FOLLOW_HOST_THEME_NAME: String = EditorTheme.FOLLOW_HOST_THEME
 
 /**
  * The live host-derived editor theme, registered with BossEditor's custom-theme
@@ -79,9 +79,33 @@ fun EditorHostThemeEffects() {
     ApplyHostChromeToEditor()
 }
 
-/** The host's live chrome tokens, read reactively. */
+/**
+ * Publishes the derived theme and the host chrome once, outside composition.
+ *
+ * Called from plugin `register()`. `SideEffect` cannot cover the first frame on its
+ * own: BossEditor's theme registry is a plain synchronized map, not snapshot state,
+ * so a settings panel that reads it during the same composition pass sees nothing
+ * and nothing invalidates that read. Seeding at load means the registry and the
+ * chrome are never empty, and the effects keep them current from there.
+ */
+fun publishHostThemeToEditor() {
+    val tokens = hostChromeTokensNow()
+    EditorTheme.registerTheme(buildHostEditorTheme(tokens))
+    EditorChrome.apply(hostChromeColors(tokens))
+}
+
+/** The host's live chrome tokens, read reactively when called from a composition. */
 @Composable
-private fun hostChromeTokens(): HostChromeTokens {
+private fun hostChromeTokens(): HostChromeTokens = hostChromeTokensNow()
+
+/**
+ * The host's chrome tokens as of now.
+ *
+ * Not `@Composable`, but snapshot reads are recorded by whatever snapshot observer is
+ * active - so calling this from a composition still makes that composition follow a
+ * theme switch, and calling it from `register()` simply reads the current values.
+ */
+private fun hostChromeTokensNow(): HostChromeTokens {
     return HostChromeTokens(
         ink = BossThemeColors.BackgroundColor,
         panel = BossThemeColors.SurfaceColor,
@@ -107,18 +131,7 @@ private fun hostChromeTokens(): HostChromeTokens {
  */
 @Composable
 fun ApplyHostChromeToEditor() {
-    val chrome = ChromeColors(
-        surface = BossThemeColors.SurfaceColor,
-        background = BossThemeColors.BackgroundColor,
-        accent = BossThemeColors.AccentColor,
-        border = BossThemeColors.BorderColor,
-        textPrimary = BossThemeColors.TextPrimary,
-        textSecondary = BossThemeColors.TextSecondary,
-        textMuted = BossThemeColors.TextMuted,
-        // Content on an accent fill: the host has no token for it, and neither white
-        // nor the panel's own text color is right for every theme's accent.
-        onAccent = ChromeColors.contentFor(BossThemeColors.AccentColor),
-    )
+    val chrome = hostChromeColors(hostChromeTokens())
     // Same reasoning as the theme registration above: applied within the frame, and
     // idempotent, so a recomposition that changes nothing writes nothing.
     SideEffect { EditorChrome.apply(chrome) }
@@ -144,6 +157,29 @@ internal fun resolveEditorTheme(
     themeName == FOLLOW_HOST_THEME_NAME -> hostTheme
     themeName in EditorTheme.availableThemes -> EditorTheme.forName(themeName)
     else -> hostTheme
+}
+
+/**
+ * BossEditor's chrome colors for a set of host tokens.
+ *
+ * The accent is composited before its content color is chosen: `contentFor` picks
+ * light or dark by luminance, and a translucent accent read as a raw triple flips
+ * that choice - the same premultiplication rule [flattenedOntoFloor] applies inside
+ * the derivation. The rest are pairs the host has already balanced against each
+ * other, so they pass through as they are.
+ */
+internal fun hostChromeColors(t: HostChromeTokens): ChromeColors {
+    val accentOnPanel = t.signal.over(t.panel)
+    return ChromeColors(
+        surface = t.panel,
+        background = t.ink,
+        accent = t.signal,
+        border = t.line,
+        textPrimary = t.textPrimary,
+        textSecondary = t.textSecondary,
+        textMuted = t.textMuted,
+        onAccent = ChromeColors.contentFor(accentOnPanel),
+    )
 }
 
 /** The host chrome tokens the derivation reads, captured so it can be unit-tested. */

@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.bosseditor.settings.EditorSettings
+import ai.rever.bosseditor.theme.ChromeColors
+import ai.rever.bosseditor.theme.EditorChrome
 import ai.rever.bosseditor.theme.EditorTheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -283,6 +285,38 @@ class HostEditorThemeTest {
     }
 
     @Test
+    fun `seeding at plugin load fills the registry and the chrome`() {
+        // What register() does, and what the settings panel depends on: SideEffect
+        // cannot cover a first composition that reads a plain, non-snapshot map.
+        EditorTheme.unregisterTheme(FOLLOW_HOST_THEME_NAME)
+        EditorChrome.reset()
+        try {
+            assertEquals(EditorTheme.Dark, EditorTheme.forName(FOLLOW_HOST_THEME_NAME))
+
+            publishHostThemeToEditor()
+
+            assertEquals(FOLLOW_HOST_THEME_NAME, EditorTheme.forName(FOLLOW_HOST_THEME_NAME).name)
+            assertNotEquals(ChromeColors.Default, EditorChrome.colors)
+        } finally {
+            EditorTheme.unregisterTheme(FOLLOW_HOST_THEME_NAME)
+            EditorChrome.reset()
+        }
+    }
+
+    @Test
+    fun `chrome content on the accent survives a translucent accent`() {
+        // contentFor picks light or dark content by luminance, so a translucent accent
+        // read as a raw triple flips the choice: 10% white over a dark panel is dark
+        // and needs white content, but reads as near-white if the alpha is ignored.
+        val translucent = blueprint.copy(signal = Color.White.copy(alpha = 0.10f))
+        val chrome = hostChromeColors(translucent)
+
+        assertEquals(Color.White, chrome.onAccent, "content on a nearly-transparent accent")
+        assertEquals(blueprint.panel, chrome.surface)
+        assertEquals(blueprint.ink, chrome.background)
+    }
+
+    @Test
     fun `the run icon tint falls back when it collapses into the gutter`() {
         val gutter = Color(0xFF282A36) // Dracula's gutter
         val text = Color(0xFFF8F8F2)
@@ -352,19 +386,28 @@ class HostEditorThemeTest {
 
         val missing = mutableListOf<String>()
         val differing = mutableListOf<String>()
-        for (property in PluginEditorSettingsData::class.memberProperties) {
+        val mirrorProps = PluginEditorSettingsData::class.memberProperties.associateBy { it.name }
+        for (property in mirrorProps.values) {
             val theirs = libraryProps[property.name]
             if (theirs == null) {
                 missing += property.name
                 continue
             }
             val ours = property.getter.call(mirror)
-            val library1 = theirs.getter.call(library)
-            if (ours != library1) differing += "${property.name} (mirror=$ours, library=$library1)"
+            val libraryValue = theirs.getter.call(library)
+            if (ours != libraryValue) differing += "${property.name} (mirror=$ours, library=$libraryValue)"
         }
+
+        // Both directions. A field the library gained and the mirror lacks is the
+        // failure ignoreUnknownKeys actually hides: the tab silently keeps this
+        // mirror's default forever, whatever the panel writes. Anything deliberately
+        // unmirrored belongs in the allowlist, with a reason.
+        val deliberatelyUnmirrored = emptySet<String>()
+        val unmirrored = libraryProps.keys - mirrorProps.keys - deliberatelyUnmirrored
 
         assertTrue(missing.isEmpty(), "fields the library no longer has: $missing")
         assertTrue(differing.isEmpty(), "defaults that disagree: $differing")
+        assertTrue(unmirrored.isEmpty(), "settings the library has and this mirror does not: $unmirrored")
     }
 
     @Test

@@ -48,6 +48,11 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         val autoSaveSettings = AutoSaveSettingsManager(storage = storage)
         autoSaveSettingsManager = autoSaveSettings
 
+        // Seed BossEditor with the host theme before anything composes: the settings
+        // panel can be the first thing to render, and it resolves the follow-host
+        // theme through a registry that is a plain map, not snapshot state.
+        publishHostThemeToEditor()
+
         // Register as a main panel TAB TYPE (not a sidebar panel!)
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
             EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings)
