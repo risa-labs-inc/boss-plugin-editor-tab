@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.editortab
 import ai.rever.boss.plugin.api.EditorTabPluginAPI
 import ai.rever.boss.plugin.dynamic.editortab.settings.LspSettingsContent
 import ai.rever.boss.plugin.dynamic.editortab.settings.AutoSaveSettingsContent
+import ai.rever.boss.plugin.dynamic.editortab.settings.ExternalReloadSettingsContent
 import ai.rever.boss.plugin.dynamic.editortab.settings.MarkdownViewSettingsContent
 import ai.rever.boss.plugin.ui.BossDarkBorder
 import ai.rever.bosseditor.settings.EditorSettingsManager
@@ -31,7 +32,8 @@ import kotlinx.coroutines.flow.StateFlow
  */
 class EditorTabPluginAPIImpl(
     private val markdownSettingsManager: MarkdownViewSettingsManager,
-    private val autoSaveSettingsManager: AutoSaveSettingsManager
+    private val autoSaveSettingsManager: AutoSaveSettingsManager,
+    private val externalReloadSettingsManager: ExternalReloadSettingsManager
 ) : EditorTabPluginAPI {
 
     override fun autoSaveEnabled(): StateFlow<Boolean> = autoSaveSettingsManager.enabled
@@ -55,6 +57,7 @@ class EditorTabPluginAPIImpl(
         val currentSettings by settingsManager.settings.collectAsState()
         val markdownSettings by markdownSettingsManager.settings.collectAsState()
         val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
+        val externalReloadEnabled by externalReloadSettingsManager.enabled.collectAsState()
         val markdownSettingsLoaded by markdownSettingsManager.isLoaded.collectAsState()
 
         Column(modifier = modifier.fillMaxSize()) {
@@ -83,6 +86,19 @@ class EditorTabPluginAPIImpl(
             AutoSaveSettingsContent(
                 enabled = autoSaveEnabled,
                 onEnabledChange = autoSaveSettingsManager::setEnabled,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(BossDarkBorder)
+            )
+
+            ExternalReloadSettingsContent(
+                enabled = externalReloadEnabled,
+                onEnabledChange = externalReloadSettingsManager::setEnabled,
                 modifier = Modifier.fillMaxWidth()
             )
 

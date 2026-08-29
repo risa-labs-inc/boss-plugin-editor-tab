@@ -34,12 +34,14 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     private var pluginContext: PluginContext? = null
     private var markdownSettingsManager: MarkdownViewSettingsManager? = null
     private var autoSaveSettingsManager: AutoSaveSettingsManager? = null
+    private var externalReloadSettingsManager: ExternalReloadSettingsManager? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
 
         markdownSettingsManager?.dispose()
         autoSaveSettingsManager?.dispose()
+        externalReloadSettingsManager?.dispose()
         val storage = runCatching {
             context.pluginStorageFactory?.createStorage(pluginId)
         }.getOrNull()
@@ -47,6 +49,8 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         markdownSettingsManager = markdownSettings
         val autoSaveSettings = AutoSaveSettingsManager(storage = storage)
         autoSaveSettingsManager = autoSaveSettings
+        val externalReloadSettings = ExternalReloadSettingsManager(storage = storage)
+        externalReloadSettingsManager = externalReloadSettings
 
         // Seed BossEditor with the host theme before anything composes: the settings
         // panel can be the first thing to render, and it resolves the follow-host
@@ -55,7 +59,7 @@ class EditorTabDynamicPlugin : DynamicPlugin {
 
         // Register as a main panel TAB TYPE (not a sidebar panel!)
         context.tabRegistry.registerTabType(EditorTabType) { tabInfo, ctx ->
-            EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings)
+            EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings, externalReloadSettings)
         }
 
         // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
@@ -69,7 +73,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // still render their own editor settings from their own BossEditor
         // dependency, so skipping registration degrades nothing there.
         try {
-            context.registerPluginAPI(EditorTabPluginAPIImpl(markdownSettings, autoSaveSettings))
+            context.registerPluginAPI(
+                EditorTabPluginAPIImpl(markdownSettings, autoSaveSettings, externalReloadSettings)
+            )
         } catch (e: LinkageError) {
             // Host predates EditorTabPluginAPI — skip; everything else works.
         }
@@ -90,6 +96,8 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         markdownSettingsManager = null
         autoSaveSettingsManager?.dispose()
         autoSaveSettingsManager = null
+        externalReloadSettingsManager?.dispose()
+        externalReloadSettingsManager = null
 
         // Undo what register() published. The registry and the chrome holder live in
         // this plugin's classloader, so a reload replaces them anyway - symmetry is
