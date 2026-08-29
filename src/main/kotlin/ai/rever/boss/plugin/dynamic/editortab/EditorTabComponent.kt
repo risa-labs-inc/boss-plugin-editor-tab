@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.IntOffset
 import ai.rever.bosseditor.core.EditorPosition
 import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
+import ai.rever.bosseditor.core.ScrollOffset
 import ai.rever.bosseditor.core.VisibleViewport
 import ai.rever.bosseditor.highlight.Token
 import ai.rever.bosseditor.highlight.TokenCache
@@ -74,6 +75,8 @@ import ai.rever.bosseditor.rendering.EditorToken
 import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -110,17 +113,22 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -201,7 +209,8 @@ class EditorTabComponent(
     override val config: TabInfo,
     private val context: PluginContext,
     private val markdownSettingsManager: MarkdownViewSettingsManager,
-    private val autoSaveSettingsManager: AutoSaveSettingsManager
+    private val autoSaveSettingsManager: AutoSaveSettingsManager,
+    private val externalReloadSettingsManager: ExternalReloadSettingsManager
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = EditorTabType
@@ -241,9 +250,17 @@ class EditorTabComponent(
     private var isLargeFile: Boolean = false
     private var fileSizeBytes: Long = 0L
 
-    // File modification tracking (matches bundled FileModificationTracker)
-    private var lastKnownModifiedTime: Long = 0L
+    // What the tab believes is on disk, as of the last load, save or accepted reload. The
+    // snapshot is what a poll compares against; the content is what separates a real rewrite
+    // from a bare mtime bump (touch, a formatter with nothing to reformat, our own save seen
+    // a moment late), which must not prompt anybody.
+    private var diskBaseline: DiskSnapshot = DiskSnapshot.MISSING
     private var originalContent: String = ""
+
+    // Mutated from the UI thread only: loadFileContent runs in init before anything composes,
+    // and every later accept() happens in the watcher or in persistDocument after their IO
+    // has already come back to Main. Keep it that way - it is a plain, unsynchronized object.
+    private val changeDetector = ExternalChangeDetector(DiskSnapshot.MISSING)
 
     // Language detection
     private val language: String = detectLanguage(filePath)
@@ -277,7 +294,11 @@ class EditorTabComponent(
             }
 
             fileSizeBytes = file.length()
-            lastKnownModifiedTime = file.lastModified()
+            // Stat BEFORE reading, never after: a write landing between the two would
+            // otherwise be adopted as our baseline while we hold the pre-write content, and
+            // the tab would sit stale forever. This way round the next poll simply sees a
+            // difference, re-reads, and finds the content already matches.
+            adoptDiskState(snapshotFile())
 
             // Check if this is a large file (>10MB)
             if (LargeFileDocument.shouldUseLargeFileAdapter(file)) {
@@ -310,70 +331,80 @@ class EditorTabComponent(
         }
     }
 
-    private fun saveFile(content: String): Boolean {
-        if (filePath.isEmpty()) return false
+    /**
+     * Writes [content] and returns the snapshot of what is now on disk, or null if the write
+     * failed.
+     *
+     * The caller re-baselines with that snapshot rather than this doing it, so every mutation
+     * of [changeDetector] happens on the UI thread even though the write itself runs on IO.
+     */
+    private fun saveFile(content: String): DiskSnapshot? {
+        if (filePath.isEmpty()) return null
 
         return try {
             val file = File(filePath)
             // Create parent directories if they don't exist (matches bundled editor)
             file.parentFile?.mkdirs()
             file.writeText(content)
-            // Update tracking state after successful save
-            lastKnownModifiedTime = file.lastModified()
-            originalContent = content
-            true
+            snapshotFile()
         } catch (e: Exception) {
             System.err.println("[EditorTabComponent] Failed to save file '$filePath': ${e.message}")
-            false
+            null
+        }
+    }
+
+    /** One stat of the open file: cheap, and the only thing the poll does while nothing moves. */
+    private fun snapshotFile(): DiskSnapshot {
+        if (filePath.isEmpty()) return DiskSnapshot.MISSING
+
+        return try {
+            val file = File(filePath)
+            if (!file.exists()) {
+                DiskSnapshot.MISSING
+            } else {
+                DiskSnapshot(exists = true, lastModified = file.lastModified(), size = file.length())
+            }
+        } catch (e: Exception) {
+            // A stat that throws (permissions, a filesystem going away) is not evidence the
+            // file was deleted, so report no news rather than inventing a deletion.
+            System.err.println("[EditorTabComponent] Error checking file '$filePath': ${e.message}")
+            diskBaseline
+        }
+    }
+
+    /** Records [snapshot] as ours, so the watcher stops treating it as news. */
+    private fun adoptDiskState(snapshot: DiskSnapshot) {
+        diskBaseline = snapshot
+        changeDetector.accept(snapshot)
+    }
+
+    /** The file's current bytes, or null if it is gone or unreadable. */
+    private fun readDiskText(): String? {
+        if (filePath.isEmpty()) return null
+
+        return try {
+            val file = File(filePath)
+            if (!file.exists()) null else file.readText()
+        } catch (e: Exception) {
+            System.err.println("[EditorTabComponent] Error reading file '$filePath': ${e.message}")
+            null
         }
     }
 
     /**
-     * Checks if the file on disk has been modified externally since we last loaded/saved.
-     * Matches bundled FileModificationTracker.hasExternalChanges().
+     * Whether the file's *content* has moved off what we last loaded or wrote.
+     *
+     * Used to stop a save - an auto save debounce especially - from silently overwriting
+     * something another program just wrote. Content-based rather than snapshot-based on
+     * purpose: an mtime that moved while the bytes stayed the same is no reason to block a save.
      */
     private suspend fun hasExternalChanges(): Boolean {
         if (filePath.isEmpty()) return false
 
         return withContext(Dispatchers.IO) {
-            try {
-                val file = File(filePath)
-                if (!file.exists()) return@withContext false
-
-                // First check modification time (fast check)
-                val currentModTime = file.lastModified()
-                if (currentModTime == lastKnownModifiedTime) return@withContext false
-
-                // If time changed, verify content actually differs
-                val diskContent = file.readText()
-                diskContent != originalContent
-            } catch (e: Exception) {
-                System.err.println("[EditorTabComponent] Error checking external changes: ${e.message}")
-                false
-            }
-        }
-    }
-
-    /**
-     * Reloads the file content from disk.
-     * Matches bundled FileModificationTracker.reload().
-     */
-    private suspend fun reloadFileFromDisk(): String? {
-        if (filePath.isEmpty()) return null
-
-        return withContext(Dispatchers.IO) {
-            try {
-                val file = File(filePath)
-                if (!file.exists()) return@withContext null
-
-                val newContent = file.readText()
-                lastKnownModifiedTime = file.lastModified()
-                originalContent = newContent
-                newContent
-            } catch (e: Exception) {
-                System.err.println("[EditorTabComponent] Error reloading file: ${e.message}")
-                null
-            }
+            if (snapshotFile() == diskBaseline) return@withContext false
+            val diskContent = readDiskText() ?: return@withContext false
+            diskContent != originalContent
         }
     }
 
@@ -584,11 +615,16 @@ class EditorTabComponent(
         // recreate the lambda, which triggers the editor to re-render with semantic colors.
         var semanticVersion by remember { mutableStateOf(0) }
 
+        // Bumped by every reload from disk. `initialContent` is a plain field rather than
+        // snapshot state, so the two effects below would otherwise never re-run and the tab
+        // would keep highlighting - and offering run icons for - the content it opened with.
+        var contentVersion by remember { mutableStateOf(0) }
+
         // Trigger PSI semantic analysis on initial load. The plugin owns the PSI
         // stack (BossEditor is bundled in this JAR), so the provider writes
         // straight into the SemanticCache the editor's tokenProvider reads —
         // the old host-cache bridge is gone.
-        LaunchedEffect(filePath, initialContent) {
+        LaunchedEffect(filePath, contentVersion) {
             if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
                 semanticTokens.analyzeFile(filePath, initialContent)
                 semanticVersion++
@@ -596,7 +632,7 @@ class EditorTabComponent(
         }
 
         // Detect main functions when content changes
-        LaunchedEffect(initialContent, filePath, language) {
+        LaunchedEffect(contentVersion, filePath, language) {
             if (filePath.isNotEmpty() && initialContent.isNotEmpty()) {
                 withContext(Dispatchers.IO) {
                     try {
@@ -705,18 +741,77 @@ class EditorTabComponent(
             settings.minimapForegroundColor?.let { parseHexColor(it) }
         }
 
+        // --- Following the file on disk -------------------------------------------------
+
+        val externalReloadEnabled by externalReloadSettingsManager.enabled.collectAsState()
+
+        // Set when the file changed under a tab that has unsaved edits: what is on disk now,
+        // held until the user says which version wins.
+        var diskConflict by remember { mutableStateOf<DiskConflict?>(null) }
+
+        // Sticky line for the status bar, for the cases there is nothing to swap in: the file
+        // was deleted, or it is a large file whose buffer is only a truncated preview.
+        var diskNotice by remember { mutableStateOf<String?>(null) }
+
+        // Swaps disk content into the buffer without losing the reader's place. setText resets
+        // the caret to 0,0 and clears undo, so position is captured first and put back after -
+        // a `git checkout` under a file you were reading should not scroll you to the top of it.
+        fun applyReload(text: String, snapshot: DiskSnapshot) {
+            val caret = editorState.caretPosition.value
+            val scroll = editorState.scrollOffset.value
+
+            editorState.setText(text)
+            // moveCaret clamps into the new document itself; the scroll offset does not, so a
+            // file that got shorter would otherwise leave the viewport past its last line.
+            editorState.moveCaret(caret)
+            val maxScrollY = ((editorState.document.lineCount - 1) * lineHeightPx)
+                .coerceAtLeast(0f)
+                .toInt()
+            editorState.setScrollOffset(ScrollOffset(scroll.x, scroll.y.coerceIn(0, maxScrollY)))
+
+            initialContent = text
+            originalContent = text
+            adoptDiskState(snapshot)
+            contentVersion++
+            diskNotice = null
+
+            if (isMarkdown) markdownText = text
+            // SearchManager holds offsets into the text that just went away.
+            searchMatches = emptyList()
+            currentSearchMatchIndex = -1
+        }
+
         // One save path for both Cmd+S and auto save, so they cannot drift on what counts as
         // saved or how failure is surfaced.
         suspend fun persistDocument() {
             if (isLargeFile || filePath.isEmpty()) return
             if (!editorState.isModified.value) return
 
+            // Never write over something another program put there. This matters most for
+            // auto save, which fires on a timer the user is not thinking about: without the
+            // check, a debounce landing after vim wrote the file would erase that write with
+            // no prompt and no trace.
+            //
+            // Not gated on the reload setting. That setting is about whether the tab follows
+            // the file; this is about not destroying someone else's work on the way out, which
+            // is worth asking about however the tab is configured.
+            if (hasExternalChanges()) {
+                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
+                val text = withContext(Dispatchers.IO) { readDiskText() }
+                if (text != null) {
+                    diskConflict = DiskConflict(text, snapshot)
+                    return
+                }
+            }
+
             isSaving = true
             saveError = null
             val content = editorState.document.getText()
-            val success = withContext(Dispatchers.IO) { saveFile(content) }
-            if (success) {
+            val snapshot = withContext(Dispatchers.IO) { saveFile(content) }
+            if (snapshot != null) {
                 editorState.markAsSaved()
+                originalContent = content
+                adoptDiskState(snapshot)
             } else {
                 saveError = "Failed to save file"
             }
@@ -730,6 +825,74 @@ class EditorTabComponent(
             if (!autoSaveEnabled) return@LaunchedEffect
             delay(AUTO_SAVE_DEBOUNCE_MILLIS)
             persistDocument()
+        }
+
+        // Watch the file for writes from anywhere else: vim, a formatter, git, an AI CLI in a
+        // BossTerm split, or BOSS's own editor_write_file MCP tool.
+        //
+        // Keyed on window focus, which does two jobs. The effect restarts when focus returns,
+        // and its first act is a check - so alt-tabbing back from an external editor shows
+        // fresh content at once. And it backs the poll off to a crawl while BOSS is in the
+        // background, since anything that happens there is caught by that check on the way
+        // back. What is left is one stat per second per open tab while you are looking at BOSS.
+        val windowFocused = LocalWindowInfo.current.isWindowFocused
+        LaunchedEffect(filePath, externalReloadEnabled, windowFocused, editorState) {
+            if (filePath.isEmpty() || !externalReloadEnabled) return@LaunchedEffect
+
+            val quietInterval =
+                if (windowFocused) DISK_POLL_INTERVAL_MILLIS else DISK_BACKGROUND_POLL_INTERVAL_MILLIS
+
+            // Returns how long to wait before looking again: a short beat while something is
+            // still moving, the quiet interval once things have stopped.
+            suspend fun checkDisk(): Long {
+                // A conflict is already on screen and the answer is the user's to give. Do not
+                // observe while it is open, so the baseline is still the pre-change one when
+                // they answer - whichever way they answer re-baselines it.
+                if (diskConflict != null) return quietInterval
+
+                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
+                when (changeDetector.observe(snapshot)) {
+                    DiskState.UNCHANGED -> return quietInterval
+                    DiskState.SETTLING -> return DISK_SETTLE_INTERVAL_MILLIS
+
+                    DiskState.DELETED -> {
+                        // Deliberately no reload and no emptying of the buffer: the text on
+                        // screen may be the only copy left. saveFile recreates parent
+                        // directories, so Cmd+S puts it back.
+                        diskNotice = "deleted on disk"
+                        return quietInterval
+                    }
+
+                    DiskState.CHANGED -> {
+                        diskNotice = null
+
+                        if (isLargeFile) {
+                            // The buffer holds a truncated preview rather than the file, so
+                            // swapping in a fresh truncation would just be a newer lie.
+                            diskNotice = "changed on disk - reopen to refresh"
+                            adoptDiskState(snapshot)
+                            return quietInterval
+                        }
+
+                        val text = withContext(Dispatchers.IO) { readDiskText() }
+                            ?: return DISK_SETTLE_INTERVAL_MILLIS
+
+                        when (reloadAction(text, editorState.document.getText(), editorState.isModified.value)) {
+                            ReloadAction.NONE -> {
+                                originalContent = text
+                                adoptDiskState(snapshot)
+                            }
+                            ReloadAction.RELOAD -> applyReload(text, snapshot)
+                            ReloadAction.PROMPT -> diskConflict = DiskConflict(text, snapshot)
+                        }
+                        return quietInterval
+                    }
+                }
+            }
+
+            while (isActive) {
+                delay(checkDisk())
+            }
         }
 
         // Helper function to perform search and update state
@@ -1392,6 +1555,26 @@ class EditorTabComponent(
                 }
             }  // End Row
 
+            // Sits out here rather than inside the editor Box: a Markdown tab in Preview mode
+            // composes no editor at all, and that tab still has a buffer worth protecting.
+            diskConflict?.let { conflict ->
+                FileChangedOnDiskDialog(
+                    fileName = filePath.substringAfterLast('/').ifEmpty { "This file" },
+                    onReload = {
+                        applyReload(conflict.content, conflict.snapshot)
+                        diskConflict = null
+                    },
+                    onKeepMine = {
+                        // Adopt the disk state without adopting the disk content: the buffer
+                        // stays dirty and wins the next save, and we stop asking about a
+                        // change the user has already answered for.
+                        originalContent = conflict.content
+                        adoptDiskState(conflict.snapshot)
+                        diskConflict = null
+                    }
+                )
+            }
+
             // Status bar (matches bundled editor)
             EditorStatusBar(
                 filePath = filePath,
@@ -1401,6 +1584,7 @@ class EditorTabComponent(
                 isModified = isModified,
                 isSaving = isSaving,
                 error = saveError,
+                diskNotice = diskNotice,
                 viewMode = if (isMarkdown) viewMode else null,
                 onViewModeChange = { newMode ->
                     viewMode = newMode
@@ -1446,6 +1630,80 @@ class EditorTabComponent(
     }
 }
 
+/** A settled external change waiting on the user, because taking it would lose their edits. */
+private data class DiskConflict(val content: String, val snapshot: DiskSnapshot)
+
+/**
+ * Asked only when both versions are real: unsaved edits in the tab, and a different file on
+ * disk. There is no safe default between the two, so there is no dismiss-to-nowhere either -
+ * clicking outside means "keep mine", which is the choice that destroys nothing.
+ */
+@Composable
+private fun FileChangedOnDiskDialog(
+    fileName: String,
+    onReload: () -> Unit,
+    onKeepMine: () -> Unit
+) {
+    val colors = LocalEditorTheme.current.colors
+
+    Dialog(
+        onDismissRequest = onKeepMine,
+        properties = DialogProperties(dismissOnClickOutside = true, dismissOnBackPress = true)
+    ) {
+        Column(
+            modifier = Modifier
+                .width(420.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(colors.background)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "$fileName changed on disk",
+                color = colors.text,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "Something else wrote to this file while you had unsaved changes here. " +
+                    "Reloading takes the version on disk and discards yours. Keeping yours " +
+                    "leaves the tab as it is, and saving again overwrites the file.",
+                color = colors.lineNumber,
+                fontSize = 13.sp
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                DialogAction(label = "Keep my version", primary = false, onClick = onKeepMine)
+                DialogAction(label = "Reload from disk", primary = true, onClick = onReload)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialogAction(label: String, primary: Boolean, onClick: () -> Unit) {
+    val colors = LocalEditorTheme.current.colors
+    // The same blue LargeFileLimitationsDialog uses, so the two editor dialogs agree.
+    val accent = Color(0xFF3B82F6)
+
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (primary) accent else colors.gutterBackground)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Text(
+            text = label,
+            color = if (primary) Color.White else colors.text,
+            fontSize = 13.sp
+        )
+    }
+}
+
 /**
  * Status bar for the editor showing file info, cursor position, and save status.
  */
@@ -1458,6 +1716,7 @@ private fun EditorStatusBar(
     isModified: Boolean,
     isSaving: Boolean,
     error: String?,
+    diskNotice: String? = null,
     viewMode: MarkdownViewMode? = null,
     onViewModeChange: (MarkdownViewMode) -> Unit = {}
 ) {
@@ -1504,6 +1763,16 @@ private fun EditorStatusBar(
                     color = bar.secondary,
                     fontSize = 11.sp
                 )
+
+                // Something happened to the file that the tab could not just absorb: it was
+                // deleted, or it is too large to swap in place.
+                if (diskNotice != null) {
+                    Text(
+                        text = diskNotice,
+                        color = bar.accent,
+                        fontSize = 11.sp
+                    )
+                }
             }
 
             // Right: Cursor position and status
