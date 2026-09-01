@@ -5,6 +5,10 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.bosseditor.psi.PSIBootstrap
 import ai.rever.bosseditor.psi.PSIThreadBridge
 import ai.rever.bosseditor.psi.ProjectIndexer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 /**
  * Code Editor Tab dynamic plugin - Loaded from external JAR.
@@ -26,7 +30,7 @@ import ai.rever.bosseditor.psi.ProjectIndexer
 class EditorTabDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.editortab"
     override val displayName: String = "Code Editor Tab"
-    override val version: String = "1.4.0"
+    override val version: String = "1.6.0"
     override val description: String = "Code editor tab with syntax highlighting, code folding, and run gutter icons"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-editor-tab"
@@ -35,6 +39,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     private var markdownSettingsManager: MarkdownViewSettingsManager? = null
     private var autoSaveSettingsManager: AutoSaveSettingsManager? = null
     private var externalReloadSettingsManager: ExternalReloadSettingsManager? = null
+    private var composerAgent: ComposerAgent? = null
+    private var composerSessions: ComposerSessions? = null
+    private var pluginScope: CoroutineScope? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
@@ -62,23 +69,85 @@ class EditorTabDynamicPlugin : DynamicPlugin {
             EditorTabComponent(ctx, tabInfo, context, markdownSettings, autoSaveSettings, externalReloadSettings)
         }
 
-        // Contribute editor_read_file/write_file/detect_language MCP tools; auto-removed on disable/unload.
-        context.registerMcpToolProvider(EditorTabMcpToolProvider(pluginId, context.editorContentProvider))
+        // The diff tab renders here, not in the host: it is a variation of the
+        // editor tab, and the lexer, semantic tokens and overview ruler that
+        // make it readable are bundled in this plugin and unreachable from the
+        // host. The host still creates and persists the config; it reaches us
+        // as a DiffTabConfig (api 1.0.87).
+        context.tabRegistry.registerTabType(DiffTabType) { tabInfo, ctx ->
+            DiffTabComponent(ctx, tabInfo, context)
+        }
 
-        // Serve editor + LSP settings panels to the host: the Settings window's
-        // BOSS_EDITOR and LANGUAGE_SERVERS sections delegate through this API.
+        // Build the EditorTabPluginAPI impl once, shared by the settings panels and
+        // the buffer MCP tools.
         //
         // Guarded: EditorTabPluginAPI is a shared-package (parent-first) class,
         // so on hosts that predate it the impl class fails to link. Those hosts
         // still render their own editor settings from their own BossEditor
-        // dependency, so skipping registration degrades nothing there.
-        try {
-            context.registerPluginAPI(
-                EditorTabPluginAPIImpl(markdownSettings, autoSaveSettings, externalReloadSettings)
-            )
-        } catch (e: LinkageError) {
-            // Host predates EditorTabPluginAPI — skip; everything else works.
+        // dependency, so skipping registration degrades nothing there (the
+        // buffer MCP tools report "API unavailable" instead).
+        val editorApi =
+            try {
+                EditorTabPluginAPIImpl(context, markdownSettings, autoSaveSettings, externalReloadSettings)
+            } catch (e: LinkageError) {
+                null
+            }
+
+        // Composer (IDE batch P4.3): a plugin-level agent shared by every composer
+        // tab and the ai_compose* MCP tools, keyed by session id. Built only
+        // when the buffer API linked - the agent references its members, so a
+        // host that predates them would fail to link it.
+        //
+        // Session STATE is plugin-level too (ComposerSessions), not tab-level:
+        // a run has to survive the tab being switched away from, closed, or
+        // reopened - see the class comment there.
+        val composerSessions =
+            if (editorApi != null) {
+                pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+                ComposerSessions(
+                    store = runCatching { context.pluginStorageFactory?.createStorage(pluginId) }
+                        .getOrNull()?.let { ComposerSessionStore(it) },
+                    scope = pluginScope!!,
+                )
+            } else {
+                null
+            }
+        val composerAgent =
+            if (editorApi != null && composerSessions != null) {
+                runCatching { ComposerAgent(context, editorApi, pluginScope!!, composerSessions) }.getOrNull()
+            } else {
+                null
+            }
+        if (composerAgent != null && composerSessions != null) {
+            this.composerAgent = composerAgent
+            this.composerSessions = composerSessions
+            context.tabRegistry.registerTabType(ComposerTabType) { tabInfo, cctx ->
+                ComposerTabComponent(cctx, tabInfo, composerAgent, composerSessions)
+            }
         }
+
+        // Contribute editor_read_file/write_file/detect_language plus the 1.0.87
+        // buffer tools and the composer tools; auto-removed on disable/unload.
+        context.registerMcpToolProvider(
+            EditorTabMcpToolProvider(
+                pluginId,
+                context,
+                context.editorContentProvider,
+                editorApi,
+                composerAgent,
+                composerSessions,
+            ),
+        )
+
+        editorApi?.let { context.registerPluginAPI(it) }
+
+        // Watch the files behind open buffers. Started here rather than per
+        // tab so that one poll covers every viewport, including the diff tab's
+        // editable pane, which shares the same buffers.
+        val watcherScope = pluginScope ?: CoroutineScope(SupervisorJob() + Dispatchers.Main).also {
+            pluginScope = it
+        }
+        ExternalChangeWatcher.install(watcherScope) { context.gitDataProvider }
 
         // Warm up the bundled PSI stack off the UI thread. The host did this at
         // startup while BossEditor was on its classpath; the plugin owns it now.
@@ -88,9 +157,19 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     }
 
     override fun dispose() {
-        // Unregister tab type when plugin is unloaded
+        // Unregister tab types when plugin is unloaded
         pluginContext?.tabRegistry?.unregisterTabType(EditorTabType.typeId)
+        pluginContext?.tabRegistry?.unregisterTabType(DiffTabType.typeId)
+        pluginContext?.tabRegistry?.unregisterTabType(ComposerTabType.typeId)
         pluginContext = null
+
+        composerAgent = null
+        // Written out before the scope that persists them is cancelled.
+        composerSessions?.flushAll()
+        composerSessions = null
+        ExternalChangeWatcher.uninstall()
+        pluginScope?.cancel()
+        pluginScope = null
 
         markdownSettingsManager?.dispose()
         markdownSettingsManager = null

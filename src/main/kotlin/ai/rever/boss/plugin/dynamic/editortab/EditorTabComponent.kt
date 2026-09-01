@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
+import ai.rever.boss.plugin.ui.ContextMenuItemData
 import ai.rever.bosseditor.compose.BossEditor
 import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
@@ -72,6 +73,7 @@ import ai.rever.bosseditor.highlight.lexers.PHPLexer
 import ai.rever.bosseditor.highlight.lexers.PerlLexer
 import ai.rever.bosseditor.highlight.lexers.LuaLexer
 import ai.rever.bosseditor.rendering.EditorToken
+import ai.rever.bosseditor.theme.EditorTheme
 import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -116,6 +118,7 @@ import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
@@ -273,6 +276,12 @@ class EditorTabComponent(
             callbacks = object : Lifecycle.Callbacks {
                 override fun onDestroy() {
                     coroutineScope.cancel()
+                    // Drop this viewport's reference on the shared buffer; the
+                    // registry removes the buffer only when the last viewport
+                    // goes.
+                    if (filePath.isNotEmpty()) {
+                        EditorBufferRegistry.release(filePath)
+                    }
                 }
             }
         )
@@ -346,6 +355,9 @@ class EditorTabComponent(
             // Create parent directories if they don't exist (matches bundled editor)
             file.parentFile?.mkdirs()
             file.writeText(content)
+            // SHARED bookkeeping, so the watcher does not report our own write -
+            // and so a save made here is seen by every other viewport on this buffer.
+            EditorBufferRegistry.find(filePath)?.noteWrittenByUs()
             snapshotFile()
         } catch (e: Exception) {
             System.err.println("[EditorTabComponent] Failed to save file '$filePath': ${e.message}")
@@ -477,10 +489,39 @@ class EditorTabComponent(
             return
         }
 
-        // Create editor state
-        val editorState = remember(filePath) {
-            EditorState(initialContent, filePath.ifEmpty { null })
+        // Create editor state. Files with a path share ONE buffer per path across
+        // tabs and splits (decision D3): the registry hands every viewport the
+        // same EditorState, so edits in one are instantly visible in the
+        // others. Untitled documents keep a private state.
+        val editorBuffer = remember(filePath) {
+            if (filePath.isNotEmpty()) {
+                EditorBufferRegistry.acquire(filePath, initialContent, language)
+            } else {
+                null
+            }
         }
+        val editorState =
+            editorBuffer?.editorState ?: remember(filePath) {
+                EditorState(initialContent, null)
+            }
+
+        // AI tab completion (ghost text) via the ai-gateway plugin. Guarded like
+        // EditorTabPluginAPIImpl's registration: AiGatewayAPI is a parent-first
+        // api class that hosts before 9.4.5 don't carry, so on those the service
+        // fails to link and the feature silently vanishes.
+        val aiCompletion = remember(filePath) {
+            runCatching { AiTabCompletionService(context, coroutineScope) }.getOrNull()
+        }
+        val ghostSuggestion = aiCompletion?.suggestion?.collectAsState()?.value
+        val completionSettings by AiCompletionSettings.settings.collectAsState()
+
+        // Inline AI edit (Cmd+K). Same guard as tab completion: it references
+        // AiGatewayAPI, which pre-9.4.5 hosts don't carry.
+        val aiInlineEdit = remember(filePath) {
+            runCatching { AiInlineEditService(context, coroutineScope) }.getOrNull()
+        }
+        aiInlineEdit?.bind(editorBuffer, editorState)
+        val aiEditSession = aiInlineEdit?.session?.collectAsState()?.value
 
         // Get window ID for filtering navigation events (exactly like bundled editor)
         val windowId = context.windowId ?: ""
@@ -925,10 +966,44 @@ class EditorTabComponent(
             modifier = Modifier
                 .fillMaxSize()
                 .focusRequester(editorFocusRequester)
+                .onPreviewKeyEvent { event ->
+                    // Preview (tunneling) phase, so this runs before the editor's
+                    // own handler: with a ghost suggestion showing, Tab must
+                    // accept it instead of inserting an indent, Esc must dismiss
+                    // it instead of closing the search bar.
+                    if (event.type != KeyEventType.KeyDown || ghostSuggestion == null) {
+                        false
+                    } else {
+                        when {
+                            event.key == Key.Tab && !event.isShiftPressed && !event.isMetaPressed &&
+                                !event.isCtrlPressed && !event.isAltPressed ->
+                                aiCompletion.accept(editorState)
+                            event.key == Key.Escape -> aiCompletion.dismiss()
+                            else -> false
+                        }
+                    }
+                }
                 .onKeyEvent { event ->
                     if (event.type == KeyEventType.KeyDown) {
                         val isMeta = event.isMetaPressed || event.isCtrlPressed
                         when {
+                            // Platform text-editing shortcuts the bundled
+                            // editor does not implement. Skipped when there is
+                            // a selection, where the editor's own Backspace
+                            // (delete the selection) is already correct.
+                            !isLargeFile && !editorState.hasSelection &&
+                                editingShortcutRange(event, isMeta, editorState) != null -> {
+                                val range = editingShortcutRange(event, isMeta, editorState)!!
+                                editorState.document.replace(range.first, range.last + 1, "")
+                                true
+                            }
+
+                            !isLargeFile && caretShortcutTarget(event, isMeta, editorState) != null -> {
+                                val target = caretShortcutTarget(event, isMeta, editorState)!!
+                                editorState.moveCaret(editorState.document.offsetToPosition(target))
+                                true
+                            }
+
                             // Cmd+F or Ctrl+F: Show find
                             isMeta && event.key == Key.F -> {
                                 showSearchBar = true
@@ -950,6 +1025,11 @@ class EditorTabComponent(
                             isMeta && event.key == Key.Y -> {
                                 editorState.redo()
                                 true
+                            }
+                            // Cmd+K: AI inline edit on the selection (or current line).
+                            // Not consumed when no AI gateway is available.
+                            isMeta && event.key == Key.K && !isLargeFile -> {
+                                aiInlineEdit?.start(editorState, language) == true
                             }
                             // Cmd+S or Ctrl+S: Save file
                             isMeta && event.key == Key.S && !isLargeFile -> {
@@ -1022,6 +1102,23 @@ class EditorTabComponent(
                 )
             }
 
+            // The file changed underneath us, or went away. Above the editor
+            // rather than in the status bar: a conflict is a decision the user
+            // has to make, not a status to glance at.
+            if (editorBuffer != null) {
+                ExternalChangeBar(
+                    buffer = editorBuffer,
+                    onReload = {
+                        ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
+                        originalContent = editorState.document.getText()
+                        adoptDiskState(snapshotFile())
+                    },
+                    onKeepMine = {
+                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                    },
+                )
+            }
+
             // Main editor area with run gutter
             Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 // Run gutter (for detected main functions)
@@ -1073,7 +1170,29 @@ class EditorTabComponent(
 
                 // Editor content (hidden when a markdown file is in Preview-only mode)
                 if (!(isMarkdown && viewMode == MarkdownViewMode.PREVIEW)) {
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                // "Open Diff" on right-click of the editor surface (IDE batch P1.4): the
+        // host's diff tab shows this file's working-tree diff. The menu only
+        // appears when a git data provider exists; for untracked files the
+        // diff tab itself reports "no diff".
+        val editorSurfaceModifier =
+            context.contextMenuProvider?.applyContextMenu(
+                Modifier,
+                if (filePath.isNotEmpty() && context.gitDataProvider != null) {
+                    listOf(
+                        ContextMenuItemData(
+                            label = "Open Diff",
+                            onClick = { context.gitDataProvider?.openDiff(filePath, context.windowId ?: "", staged = false) },
+                        ),
+                    )
+                } else {
+                    emptyList()
+                },
+            ) ?: Modifier
+        // Uncommitted changes for the left gutter. Empty for an untitled
+        // document, which has no buffer and so no file to compare.
+        val gitMarks: Map<Int, LineDiff.Mark> =
+            editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+        Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
                     state = editorState,
@@ -1093,6 +1212,13 @@ class EditorTabComponent(
                     minimapBackgroundColor = minimapBgColor,
                     minimapForegroundColor = minimapFgColor,
                     tokenProvider = tokenProvider,
+                    // Transparent, purely to make the editor reserve its gutter
+                    // icon strip; GitGutterMarks draws the glyphs into it,
+                    // because drawGutterIconForLine can paint a shape but never
+                    // text.
+                    gutterIcons = remember(gitMarks, editorBuffer) {
+                        reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
+                    },
                     searchMatches = searchMatches,
                     currentSearchMatchIndex = currentSearchMatchIndex,
                     // Don't use custom navigationResolver - let BossEditor use internal NavigationManager
@@ -1112,11 +1238,19 @@ class EditorTabComponent(
                                 semanticVersion++
                             }
                         }
+                        // Debounced ghost-text request at the new caret position
+                        if (!isLargeFile) {
+                            aiCompletion?.schedule(editorState, filePath, language, completionSettings)
+                        }
                     },
                     onCaretPositionChanged = { position ->
                         // Convert to 1-based line/column for compatibility
                         cursorLine = position.line + 1
                         cursorColumn = position.column + 1
+                        aiCompletion?.onCaretMoved(position)
+                        // Caret activity is the "focused document" heuristic
+                        // for focusedDocument(): the user is here.
+                        editorBuffer?.let { EditorBufferRegistry.markFocused(it) }
                     },
                     onSelectionChanged = { _ ->
                         // Selection changed - could integrate with mark occurrences
@@ -1291,6 +1425,25 @@ class EditorTabComponent(
                     }
                 )
 
+                // Uncommitted-change markers in the editor's own gutter strip.
+                // The diff tab draws its own gutter and never reaches this
+                // path, so the two cannot fight.
+                GitGutterMarks(gitMarks, editorState)
+
+                // AI ghost-text overlay. Plugin-side stand-in for a real inline
+                // suggestion mechanism (the bundled BossEditor has none);
+                // anchoring math mirrors the rename dialog and run gutter.
+                if (ghostSuggestion != null && !isLargeFile) {
+                    GhostTextOverlay(
+                        suggestion = ghostSuggestion,
+                        editorState = editorState,
+                        fallbackLineHeight = lineHeightPx,
+                        fontFamily = composeFontFamily,
+                        fontSize = settings.fontSize,
+                        editorTheme = editorTheme
+                    )
+                }
+
                 // Usages popup overlay (exactly like bundled editor)
                 if (usagesPopupState.isVisible && usagesPopupState.definition != null) {
                     UsagesPopup(
@@ -1358,6 +1511,27 @@ class EditorTabComponent(
                                 else -> null
                             }
                         }
+                    )
+                }
+
+                // AI inline edit (Cmd+K): one inline card over the editor,
+                // Cursor-style - prompt, generation and the accept/reject diff
+                // in the same place. It replaced an AlertDialog plus the
+                // library's RefactorPreviewDialog, which took focus off the
+                // editor and covered the code being edited.
+                if (aiEditSession != null) {
+                    val inlineEditService = aiInlineEdit
+                    AiInlineEditBar(
+                        session = aiEditSession,
+                        onPromptChange = { inlineEditService?.setPrompt(it) },
+                        onSubmit = { inlineEditService?.submit() },
+                        onAccept = {
+                            if (inlineEditService != null && !inlineEditService.applyAccepted()) {
+                                inlineEditService.markStale()
+                            }
+                        },
+                        onCancel = { inlineEditService?.cancel() },
+                        modifier = Modifier.align(Alignment.TopCenter),
                     )
                 }
 
@@ -1625,6 +1799,63 @@ class EditorTabComponent(
          */
         internal fun detectLanguage(filePath: String): String = LanguageDetection.detect(filePath)
 
+        /**
+         * A read-only BossEditor wired exactly as the editor tab wires its own:
+         * same lexer, same [TokenCache] for multi-line state, same theme and
+         * settings, minimap on.
+         *
+         * Shared rather than reimplemented so the diff cannot drift from the
+         * editor - a second highlighter is precisely what moving the diff tab
+         * into this plugin exists to avoid.
+         */
+        @Composable
+        internal fun DiffEditorSurface(
+            state: EditorState,
+            filePath: String,
+            context: PluginContext,
+            showMinimap: Boolean,
+            readOnly: Boolean = true,
+            showLineNumbers: Boolean = true,
+        ) {
+            val settings by PluginEditorSettings.settings.collectAsState()
+            val language = remember(filePath) { detectLanguage(filePath) }
+            val lexer = remember(language) { getLexerForLanguage(language) }
+            val tokenCache = remember(lexer, state.document) {
+                lexer?.let { TokenCache(state.document, it) }
+            }
+            DisposableEffect(tokenCache) { onDispose { tokenCache?.dispose() } }
+
+            val tokenProvider: (Int) -> List<EditorToken> = remember(tokenCache) {
+                { lineNumber -> EditorToken.fromTokens(tokenCache?.getLineTokens(lineNumber) ?: emptyList()) }
+            }
+            val composeFontFamily = FontFamily.Monospace
+            val hostTheme = rememberHostEditorTheme()
+            val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
+                resolveEditorTheme(settings.followHostTheme, settings.themeName, hostTheme)
+            }
+
+            BossEditor(
+                state = state,
+                modifier = Modifier.fillMaxSize(),
+                theme = editorTheme,
+                fontFamily = composeFontFamily,
+                fontSize = settings.fontSize,
+                lineSpacing = settings.lineSpacing,
+                showLineNumbers = settings.showLineNumbers && showLineNumbers,
+                highlightCurrentLine = !readOnly,
+                readOnly = readOnly,
+                filePath = filePath,
+                projectPath = context.projectPath,
+                // One minimap for the pair, on the right: two rulers of the
+                // same file is noise, and the right side is the "after" state
+                // a reader is navigating.
+                showMinimap = showMinimap && settings.showMinimap,
+                minimapWidth = settings.minimapWidth,
+                minimapUseEditorColors = settings.minimapUseEditorColors,
+                tokenProvider = tokenProvider,
+            )
+        }
+
         /** Lexer for [language], or null for plain text. See [LanguageDetection]. */
         internal fun getLexerForLanguage(language: String): BaseLexer? = LanguageDetection.lexerFor(language)
     }
@@ -1824,6 +2055,76 @@ private fun EditorStatusBar(
                     color = bar.secondary,
                     fontSize = 12.sp
                 )
+            }
+        }
+    }
+}
+
+// ========== AI Ghost Text Overlay ==========
+
+/**
+ * Ghost-text overlay for AI tab completion. Continuation lines float over
+ * whatever sits below the caret (on a translucent editor-background card
+ * rather than pushing text down) — the accepted trade-off of the plugin-side
+ * overlay until the BossEditor library grows inline-suggestion support.
+ */
+@Composable
+private fun GhostTextOverlay(
+    suggestion: GhostSuggestion,
+    editorState: EditorState,
+    fallbackLineHeight: Float,
+    fontFamily: FontFamily,
+    fontSize: Float,
+    editorTheme: EditorTheme
+) {
+    val viewport by editorState.visibleViewport.collectAsState()
+    val scrollOffset by editorState.scrollOffset.collectAsState()
+    val visualLineMapper by editorState.visualLineMapper.collectAsState()
+
+    // Caret line hidden inside a collapsed fold: nothing to anchor to
+    val visualLine = visualLineMapper.documentToVisual(suggestion.position.line)
+    if (visualLine < 0) return
+    // Caret line scrolled out of the viewport: the Box doesn't clip, so an
+    // off-screen anchor would paint over the search bar / status bar
+    if (viewport.visibleLineCount > 0 &&
+        (visualLine < viewport.firstVisibleLine ||
+            visualLine >= viewport.firstVisibleLine + viewport.visibleLineCount)
+    ) {
+        return
+    }
+
+    val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
+    val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
+    val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
+
+    val x = (gutterWidth + suggestion.position.column * charWidth - scrollOffset.x).toInt()
+    val y = ((visualLine * lineHeight) - scrollOffset.y).toInt()
+
+    val style = TextStyle(
+        fontFamily = fontFamily,
+        fontSize = fontSize.sp,
+        fontStyle = FontStyle.Italic,
+        color = editorTheme.colors.text.copy(alpha = 0.45f)
+    )
+    val lines = suggestion.text.lines()
+
+    // First line: inline at the caret, transparent background
+    Text(
+        text = lines.first(),
+        style = style,
+        maxLines = 1,
+        softWrap = false,
+        modifier = Modifier.offset { IntOffset(x, y) }
+    )
+    if (lines.size > 1) {
+        Column(
+            modifier = Modifier
+                .offset { IntOffset((gutterWidth - scrollOffset.x).toInt(), (y + lineHeight).toInt()) }
+                .background(editorTheme.colors.background.copy(alpha = 0.92f))
+                .padding(horizontal = 4.dp)
+        ) {
+            lines.drop(1).forEach { line ->
+                Text(text = line, style = style, maxLines = 1, softWrap = false)
             }
         }
     }
@@ -2800,4 +3101,47 @@ private fun GutterRunIcon(
             .hoverable(interactionSource)
             .clickable { onRun(detected) }
     )
+}
+
+/**
+ * The range a deletion shortcut removes, or null when this key is not one.
+ *
+ * ⌘⌫ / ⌘⌦ act on the line, ⌥⌫ / ⌥⌦ on the word. Returning null for a no-op
+ * (caret already at the boundary) matters: an empty edit would still cost an
+ * undo step.
+ */
+private fun editingShortcutRange(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    isMeta: Boolean,
+    state: EditorState,
+): IntRange? {
+    val text = state.document.getText()
+    val caret = state.caretOffset
+    return when {
+        isMeta && event.key == Key.Backspace -> MacEditingShortcuts.deleteToLineStart(text, caret)
+        isMeta && event.key == Key.Delete -> MacEditingShortcuts.deleteToLineEnd(text, caret)
+        event.isAltPressed && event.key == Key.Backspace -> MacEditingShortcuts.deletePreviousWord(text, caret)
+        event.isAltPressed && event.key == Key.Delete -> MacEditingShortcuts.deleteNextWord(text, caret)
+        else -> null
+    }
+}
+
+/** The offset a caret-movement shortcut targets, or null when not one. */
+private fun caretShortcutTarget(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    isMeta: Boolean,
+    state: EditorState,
+): Int? {
+    if (event.isShiftPressed) return null // selection variants stay with the editor
+    val text = state.document.getText()
+    val caret = state.caretOffset
+    return when {
+        isMeta && event.key == Key.DirectionLeft -> MacEditingShortcuts.lineStart(text, caret)
+        isMeta && event.key == Key.DirectionRight -> MacEditingShortcuts.lineEnd(text, caret)
+        isMeta && event.key == Key.DirectionUp -> 0
+        isMeta && event.key == Key.DirectionDown -> text.length
+        event.isAltPressed && event.key == Key.DirectionLeft -> MacEditingShortcuts.previousWordStart(text, caret)
+        event.isAltPressed && event.key == Key.DirectionRight -> MacEditingShortcuts.nextWordEnd(text, caret)
+        else -> null
+    }
 }
