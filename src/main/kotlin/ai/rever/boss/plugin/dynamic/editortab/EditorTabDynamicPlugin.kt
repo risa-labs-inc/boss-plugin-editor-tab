@@ -49,6 +49,21 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         markdownSettingsManager?.dispose()
         autoSaveSettingsManager?.dispose()
         externalReloadSettingsManager?.dispose()
+        // Same re-entry treatment for the plugin scope and the watcher:
+        // register can run again after an in-place update without a dispose,
+        // and an un-cancelled previous scope keeps its polls, the composer
+        // persistence jobs and the file watcher alive on the OLD git
+        // provider - while ExternalChangeWatcher.install would ignore its
+        // new arguments and the old watcher would sweep the new buffers.
+        if (pluginScope != null) {
+            ExternalChangeWatcher.uninstall()
+            AiCompletionSettings.stop()
+            PluginEditorSettings.stop()
+            pluginScope?.cancel()
+            pluginScope = null
+            composerSessions = null
+            composerAgent = null
+        }
         val storage = runCatching {
             context.pluginStorageFactory?.createStorage(pluginId)
         }.getOrNull()

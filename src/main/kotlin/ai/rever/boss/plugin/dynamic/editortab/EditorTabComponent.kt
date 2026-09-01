@@ -922,78 +922,80 @@ class EditorTabComponent(
                         // native word-wise behaviour in the editor.
                         val isMeta = event.isMetaPressed || event.isCtrlPressed
                         val isCmd = event.isMetaPressed
-                        when {
-                            // Platform text-editing shortcuts the bundled
-                            // editor does not implement. Skipped when there is
-                            // a selection, where the editor's own Backspace
-                            // (delete the selection) is already correct. Each
-                            // helper is evaluated ONCE: both copy the whole
-                            // document, and the old guard-then-!! pattern
-                            // paid that twice per key.
-                            !isLargeFile && !editorState.hasSelection -> {
-                                val range = editingShortcutRange(event, isCmd, editorState)
-                                if (range != null) {
-                                    editorState.document.replace(range.first, range.last + 1, "")
-                                    true
-                                } else {
-                                    val target = caretShortcutTarget(event, isCmd, editorState)
-                                    if (target != null) {
-                                        editorState.moveCaret(editorState.document.offsetToPosition(target))
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
+                        // Both shortcut helpers are evaluated at most ONCE per
+                        // key (each copies the whole document, and the old
+                        // guard-then-!! pattern paid that twice). The results
+                        // feed [editorShortcutFor], a pure function that
+                        // decides what this key does - tested as a table,
+                        // because a `when` branch whose condition matches is
+                        // the END of dispatch, and conditions on
+                        // isLargeFile/hasSelection alone match almost every
+                        // keydown (that mistake once made Cmd+S/F/K/F3/
+                        // Escape unreachable on every normal file). The
+                        // composable only executes the decision.
+                        val editRange =
+                            if (!isLargeFile && !editorState.hasSelection) {
+                                editingShortcutRange(event, isCmd, editorState)
+                            } else {
+                                null
+                            }
+                        val caretTarget =
+                            if (!isLargeFile) caretShortcutTarget(event, isCmd, editorState) else null
+                        val action =
+                            editorShortcutFor(
+                                key = event.key,
+                                isMeta = isMeta,
+                                isShift = event.isShiftPressed,
+                                isLargeFile = isLargeFile,
+                                showSearchBar = showSearchBar,
+                                editRange = editRange,
+                                caretTarget = caretTarget,
+                            )
+                        when (action) {
+                            is EditorKeyAction.EditRange -> {
+                                editorState.document.replace(action.range.first, action.range.last + 1, "")
+                                true
                             }
 
-                            !isLargeFile -> {
-                                // Selection present: only the caret-movement
-                                // variants apply (the editing shortcuts
-                                // above yield to the editor's selection
-                                // delete).
-                                val target = caretShortcutTarget(event, isCmd, editorState)
-                                if (target != null) {
-                                    editorState.moveCaret(editorState.document.offsetToPosition(target))
-                                    true
-                                } else {
-                                    false
-                                }
+                            is EditorKeyAction.MoveCaret -> {
+                                editorState.moveCaret(editorState.document.offsetToPosition(action.offset))
+                                true
                             }
 
                             // Cmd+F or Ctrl+F: Show find
-                            isMeta && event.key == Key.F -> {
+                            EditorKeyAction.ShowFind -> {
                                 showSearchBar = true
                                 showReplaceInSearchBar = false
                                 true
                             }
                             // Cmd+H or Ctrl+H: Show find and replace
-                            isMeta && event.key == Key.H -> {
+                            EditorKeyAction.ShowFindReplace -> {
                                 showSearchBar = true
                                 showReplaceInSearchBar = true
                                 true
                             }
                             // Cmd+G or Ctrl+G or Cmd+L: Go to line
-                            isMeta && (event.key == Key.G || event.key == Key.L) -> {
+                            EditorKeyAction.GoToLine -> {
                                 showGoToLineDialog = true
                                 true
                             }
                             // Cmd+Y: Redo (alternative to Cmd+Shift+Z)
-                            isMeta && event.key == Key.Y -> {
+                            EditorKeyAction.Redo -> {
                                 editorState.redo()
                                 true
                             }
                             // Cmd+K: AI inline edit on the selection (or current line).
                             // Not consumed when no AI gateway is available.
-                            isMeta && event.key == Key.K && !isLargeFile -> {
+                            EditorKeyAction.InlineAiEdit -> {
                                 aiInlineEdit?.start(editorState, language) == true
                             }
                             // Cmd+S or Ctrl+S: Save file
-                            isMeta && event.key == Key.S && !isLargeFile -> {
+                            EditorKeyAction.Save -> {
                                 scope.launch { persistDocument() }
                                 true
                             }
                             // F3: Find next
-                            event.key == Key.F3 && !event.isShiftPressed -> {
+                            EditorKeyAction.FindNext -> {
                                 if (searchManager.matchCount > 0) {
                                     searchManager.findNext()
                                     navigateToCurrentMatch()
@@ -1001,7 +1003,7 @@ class EditorTabComponent(
                                 true
                             }
                             // Shift+F3: Find previous
-                            event.key == Key.F3 && event.isShiftPressed -> {
+                            EditorKeyAction.FindPrevious -> {
                                 if (searchManager.matchCount > 0) {
                                     searchManager.findPrevious()
                                     navigateToCurrentMatch()
@@ -1009,7 +1011,7 @@ class EditorTabComponent(
                                 true
                             }
                             // Escape: Close search bar
-                            event.key == Key.Escape && showSearchBar -> {
+                            EditorKeyAction.CloseSearch -> {
                                 showSearchBar = false
                                 searchMatches = emptyList()
                                 currentSearchMatchIndex = -1
@@ -3002,6 +3004,69 @@ private fun GutterRunIcon(
 }
 
 /**
+ * What a key press on the editor does, decided by [editorShortcutFor].
+ *
+ * Pure data: the composable matches on this and executes, so the ORDERING of
+ * the dispatch (which shortcut wins on which key) lives in one tested
+ * function instead of being spread across a `when` inside the UI - where a
+ * branch condition that matches too broadly silently makes every later
+ * branch dead code.
+ */
+internal sealed interface EditorKeyAction {
+    /** Delete [range] (the Mac line/word deletion shortcuts). */
+    data class EditRange(val range: IntRange) : EditorKeyAction
+
+    /** Move the caret to document offset [offset]. */
+    data class MoveCaret(val offset: Int) : EditorKeyAction
+
+    data object ShowFind : EditorKeyAction
+    data object ShowFindReplace : EditorKeyAction
+    data object GoToLine : EditorKeyAction
+    data object Redo : EditorKeyAction
+    data object InlineAiEdit : EditorKeyAction
+    data object Save : EditorKeyAction
+    data object FindNext : EditorKeyAction
+    data object FindPrevious : EditorKeyAction
+    data object CloseSearch : EditorKeyAction
+}
+
+/**
+ * The editor's key dispatch, pure and testable.
+ *
+ * [editRange] and [caretTarget] are the pre-computed results of the two
+ * document-copying helpers (each evaluated at most once per key by the
+ * caller); the rest is decided from the key and modifiers alone.
+ *
+ * The two editing-shortcut results MUST stay the first branches: they are
+ * the only ones that must win over the platform shortcuts on their keys.
+ * Every later branch is a platform shortcut the bundled editor does not
+ * implement (find, go-to-line, redo, inline AI edit, save, F3, escape).
+ */
+internal fun editorShortcutFor(
+    key: Key,
+    isMeta: Boolean,
+    isShift: Boolean,
+    isLargeFile: Boolean,
+    showSearchBar: Boolean,
+    editRange: IntRange?,
+    caretTarget: Int?,
+): EditorKeyAction? =
+    when {
+        editRange != null -> EditorKeyAction.EditRange(editRange)
+        caretTarget != null -> EditorKeyAction.MoveCaret(caretTarget)
+        isMeta && key == Key.F -> EditorKeyAction.ShowFind
+        isMeta && key == Key.H -> EditorKeyAction.ShowFindReplace
+        isMeta && (key == Key.G || key == Key.L) -> EditorKeyAction.GoToLine
+        isMeta && key == Key.Y -> EditorKeyAction.Redo
+        isMeta && key == Key.K && !isLargeFile -> EditorKeyAction.InlineAiEdit
+        isMeta && key == Key.S && !isLargeFile -> EditorKeyAction.Save
+        key == Key.F3 && !isShift -> EditorKeyAction.FindNext
+        key == Key.F3 && isShift -> EditorKeyAction.FindPrevious
+        key == Key.Escape && showSearchBar -> EditorKeyAction.CloseSearch
+        else -> null
+    }
+
+/**
  * The range a deletion shortcut removes, or null when this key is not one.
  *
  * ⌘⌫ / ⌘⌦ act on the line, ⌥⌫ / ⌥⌦ on the word. Returning null for a no-op
@@ -3040,10 +3105,10 @@ private fun caretShortcutTarget(
     state: EditorState,
 ): Int? {
     if (event.isShiftPressed) return null // selection variants stay with the editor
+    // The four arrow keys, checked without allocating a set per key event.
     val isDirection =
-        event.key in setOf(
-            Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown,
-        )
+        event.key == Key.DirectionLeft || event.key == Key.DirectionRight ||
+            event.key == Key.DirectionUp || event.key == Key.DirectionDown
     val isAltHorizontal =
         event.isAltPressed &&
             (event.key == Key.DirectionLeft || event.key == Key.DirectionRight)

@@ -436,13 +436,25 @@ class DiffTabComponent(
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
 
-        val buffer =
-            remember(absolutePath, reconstructedNewText, diffScope.staged, diffScope.fromRef, diffScope.toRef) {
+        // The disk read and the buffer acquire run OFF the UI thread:
+        // the old remember { } paid a full-file read per key change
+        // mid-frame, and even after moving it into this effect it must not
+        // run on Main - the LaunchedEffect's own context IS Main. The buffer
+        // holds its previous value for at most a frame across a key change,
+        // matching how the read-only probe updates asynchronously.
+        var buffer by remember { mutableStateOf<EditorBuffer?>(null) }
+        LaunchedEffect(
+            absolutePath, reconstructedNewText,
+            diffScope.staged, diffScope.fromRef, diffScope.toRef,
+        ) {
+            buffer = withContext(Dispatchers.IO) {
                 editableBufferOrNull(diffScope, absolutePath, reconstructedNewText)
             }
+        }
 
         DisposableEffect(buffer) {
-            onDispose { if (buffer != null) EditorBufferRegistry.release(buffer.path) }
+            val held = buffer
+            onDispose { if (held != null) EditorBufferRegistry.release(held.path) }
         }
         LaunchedEffect(buffer) { onEditableChanged(buffer != null) }
 
@@ -471,30 +483,21 @@ class DiffTabComponent(
             ?.takeIf { it.lines() == reconstructedNewText.lines() }
 
     /**
-     * Whether the right pane may be edited.
-     *
-     * Only a working-tree diff: the index and a ref range have no file you can
-     * meaningfully write to. And only when the diff's post-image IS the file on
-     * disk - see [diskMatchingReconstruction].
-     *
-     * When a buffer for the path already exists (an editor tab has the file
-     * open) the editable pane would edit THAT buffer, not the disk - so its
-     * text must also match the post-image. Unsaved edits in the editor tab
-     * shift the buffer's line numbering against the diff, and editing it would
-     * put marks on the wrong lines.
+     * The read-only mode's gate. Delegates to [editableBufferOrNull] - the
+     * SAME predicate the editable pane uses - and releases the reference at
+     * once: two hand-rolled copies of "this diff can edit this file" could
+     * drift apart (one checking disk, the other the buffer), which is exactly
+     * the class of bug this file already shipped.
      */
-    private fun canEdit(
+    private suspend fun canEdit(
         diffScope: DiffTabConfig,
         absolutePath: String?,
         reconstructedNewText: String,
-    ): Boolean {
-        if (absolutePath == null) return false
-        if (diffScope.staged || diffScope.fromRef != null || diffScope.toRef != null) return false
-        if (diffScope.filePath.isBlank()) return false
-        if (diskMatchingReconstruction(absolutePath, reconstructedNewText) == null) return false
-        val buffer = EditorBufferRegistry.find(absolutePath) ?: return true
-        return buffer.editorState.document.getText().lines() == reconstructedNewText.lines()
-    }
+    ): Boolean =
+        editableBufferOrNull(diffScope, absolutePath, reconstructedNewText)?.let {
+            EditorBufferRegistry.release(it.path)
+            true
+        } ?: false
 
     /**
      * The buffer the editable right pane would write into, or null when the

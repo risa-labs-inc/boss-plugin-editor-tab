@@ -8,9 +8,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /**
  * The live composer sessions, owned by the PLUGIN rather than by a tab.
@@ -48,6 +50,15 @@ class ComposerSessions(
     @Synchronized
     private fun flowFor(sessionId: String): MutableStateFlow<ComposerSessionData?> =
         flows.getOrPut(sessionId) { MutableStateFlow(null) }
+
+    /**
+     * The session's flow WITHOUT creating it. Read-only callers must use
+     * this: a getOrPut here would resurrect a just-closed session as a
+     * permanent null flow (maybeCloseIfIdle did exactly that on its own
+     * `?: return` path), undoing what [close] is for.
+     */
+    @Synchronized
+    private fun peekFlow(sessionId: String): MutableStateFlow<ComposerSessionData?>? = flows[sessionId]
 
     @Synchronized
     private fun claimLoad(sessionId: String): Boolean = loadStarted.add(sessionId)
@@ -115,7 +126,7 @@ class ComposerSessions(
     }
 
     /** The live value, or null when this session has never been opened here. */
-    fun snapshot(sessionId: String): ComposerSessionData? = flowFor(sessionId).value
+    fun snapshot(sessionId: String): ComposerSessionData? = peekFlow(sessionId)?.value
 
     /** The live value, falling back to storage for a session with no tab open. */
     suspend fun read(sessionId: String): ComposerSessionData? =
@@ -129,15 +140,19 @@ class ComposerSessions(
     }
 
     /**
-     * Mutate a live session atomically. A no-op (returning null) for a session
-     * that is not loaded - callers start runs only on sessions they opened.
+     * Mutate a live session atomically. A no-op (returning null) for a
+     * session that is not loaded - callers start runs only on sessions they
+     * opened - and the no-op leaves no trace: the lookup must not CREATE the
+     * flow, or an update racing a close would re-insert the session that
+     * close just removed.
      */
     fun update(
         sessionId: String,
         transform: (ComposerSessionData) -> ComposerSessionData,
     ): ComposerSessionData? {
+        val flow = peekFlow(sessionId) ?: return null
         var latest: ComposerSessionData? = null
-        flowFor(sessionId).update { current ->
+        flow.update { current ->
             if (current == null) null else transform(current).also { latest = it }
         }
         latest?.let(::schedulePersist)
@@ -147,13 +162,22 @@ class ComposerSessions(
     /**
      * Write every live session out now. Blocking on purpose: this runs from
      * plugin dispose, immediately before the scope that would have carried
-     * the writes is cancelled.
+     * the writes is cancelled. Bounded, because a hung filesystem must not
+     * freeze the app's UI thread during unload - losing the last writes is
+     * the lesser evil, and nothing is corrupted: the sessions stay live in
+     * memory until the process ends.
      */
     fun flushAll() {
         val live = synchronized(this) { flows.values.mapNotNull { it.value } }
         synchronized(this) { persistJobs.values.forEach { it.cancel() }; persistJobs.clear() }
         if (live.isEmpty() || store == null) return
-        runBlocking(Dispatchers.IO) { live.forEach { store.save(it) } }
+        try {
+            runBlocking(Dispatchers.IO) {
+                withTimeout(FLUSH_TIMEOUT_MS) { live.forEach { store.save(it) } }
+            }
+        } catch (e: TimeoutCancellationException) {
+            // See above: a hung store loses the tail of the flush, not the app.
+        }
     }
 
     private fun schedulePersist(session: ComposerSessionData) {
@@ -185,5 +209,6 @@ class ComposerSessions(
 
     private companion object {
         const val PERSIST_DEBOUNCE_MS = 400L
+        const val FLUSH_TIMEOUT_MS = 5_000L
     }
 }

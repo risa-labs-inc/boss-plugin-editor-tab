@@ -162,18 +162,68 @@ class ComposerTabComponent(
 
     fun acceptProposal(proposal: ComposerProposal) {
         val api = agent?.editorApi ?: return
+        val data = session.value ?: return
         coroutineScope.launch {
             markProposal(proposal, "applying", "")
             try {
+                // The recorded version is the buffer state when the proposal
+                // was MADE. Since then, the only legitimate mover of that
+                // version is accepting other proposals on the same file -
+                // each accept bumps it exactly once - so the current version
+                // must be the recorded one plus the accepted siblings that
+                // were recorded at or after this snapshot (their accepts all
+                // happened after this proposal was recorded). Anything else
+                // in the gap is an outside edit: fail, never apply over it.
+                val path = proposal.path
+                val current =
+                    api.readBuffer(path)?.version
+                        ?: run {
+                            markProposal(proposal, "failed", "no open buffer for this path")
+                            return@launch
+                        }
+                val siblings = data.proposals.filter { it.path == path && it.id != proposal.id }
+                val explained =
+                    siblings.count {
+                        it.status == "accepted" && it.expectedVersion >= proposal.expectedVersion
+                    }
+                if (current < proposal.expectedVersion ||
+                    current > proposal.expectedVersion + explained
+                ) {
+                    markProposal(
+                        proposal, "failed",
+                        "buffer moved since this was reviewed - re-run the task",
+                    )
+                    return@launch
+                }
+                // An accepted sibling from the SAME snapshot that starts at or
+                // above this range shifted (or overlaps) these lines, so the
+                // recorded line numbers are stale exactly in that case. Do
+                // not guess - re-run.
+                val shifter =
+                    siblings.firstOrNull {
+                        it.status == "accepted" &&
+                            it.expectedVersion == proposal.expectedVersion &&
+                            (it.startLine < proposal.endLine ||
+                                (it.startLine == proposal.endLine && it.startCol <= proposal.endCol))
+                    }
+                if (shifter != null) {
+                    markProposal(
+                        proposal, "failed",
+                        "these lines moved when ${shifter.id} was accepted - re-run the task",
+                    )
+                    return@launch
+                }
+                // Re-read, not recorded: a previously accepted sibling is a
+                // legitimate version move the recorded value cannot know.
                 val result =
                     api.applyEdit(
-                        path = proposal.path,
+                        path = path,
                         startLine = proposal.startLine,
                         startCol = proposal.startCol,
                         endLine = proposal.endLine,
                         endCol = proposal.endCol,
                         newText = proposal.newText,
-                        expectedVersion = proposal.expectedVersion,
+                        expectedVersion = current,
                     )
                 if (result.applied) {
                     markProposal(proposal, "accepted", "applied (buffer version ${result.newVersion})")

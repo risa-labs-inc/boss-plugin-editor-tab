@@ -376,25 +376,66 @@ internal class EditorTabMcpToolProvider(
                 if (targets.isEmpty()) {
                     return@McpToolHandler McpToolResult("Nothing pending to accept in session $id.")
                 }
+                // Apply per file, in DESCENDING start-line order: an edit shifts every line
+                // below it, so bottom-up keeps every recorded range valid.
+                // The version is re-read before each apply - the batch itself
+                // bumps it on every success, which the recorded value cannot
+                // know. The re-read must equal the proposal's recorded
+                // version plus only the earlier applies of THIS batch that it
+                // can explain (the ones recorded at or before its snapshot);
+                // anything else in the gap is an outside edit, and the rest
+                // of that file's group fails rather than being applied over.
+                val outcomes = HashMap<String, Pair<String, String>>()
+                for ((path, fileTargets) in targets.groupBy { it.path }) {
+                    val ordered =
+                        fileTargets.sortedWith(
+                            compareByDescending<ComposerProposal> { it.startLine }
+                                .thenByDescending { it.startCol },
+                        )
+                    val appliedEarlier = mutableListOf<ComposerProposal>()
+                    var aborted = ""
+                    for (p in ordered) {
+                        if (aborted.isNotEmpty()) {
+                            outcomes[p.id] = "failed" to aborted
+                            continue
+                        }
+                        val current = api.readBuffer(path)?.version
+                        if (current == null) {
+                            aborted = "no open buffer for this path"
+                            outcomes[p.id] = "failed" to aborted
+                            continue
+                        }
+                        val explained =
+                            appliedEarlier.count { it.expectedVersion <= p.expectedVersion }
+                        if (current != p.expectedVersion + explained.toLong()) {
+                            aborted = "buffer changed while this batch was applying - re-run the task"
+                            outcomes[p.id] = "failed" to aborted
+                            continue
+                        }
+                        val r =
+                            api.applyEdit(
+                                path = path,
+                                startLine = p.startLine,
+                                startCol = p.startCol,
+                                endLine = p.endLine,
+                                endCol = p.endCol,
+                                newText = p.newText,
+                                expectedVersion = current,
+                            )
+                        if (r.applied) {
+                            outcomes[p.id] = "accepted" to "buffer version ${r.newVersion}"
+                            appliedEarlier += p
+                        } else {
+                            aborted = r.reason ?: "not applied"
+                            outcomes[p.id] = "failed" to aborted
+                        }
+                    }
+                }
                 val updated =
                     data.proposals.map { p ->
-                        if (p.id !in targets.map { t -> t.id }) p else {
-                            val r =
-                                api.applyEdit(
-                                    path = p.path,
-                                    startLine = p.startLine,
-                                    startCol = p.startCol,
-                                    endLine = p.endLine,
-                                    endCol = p.endCol,
-                                    newText = p.newText,
-                                    expectedVersion = p.expectedVersion,
-                                )
-                            if (r.applied) {
-                                p.copy(status = "accepted", statusMessage = "buffer version ${r.newVersion}")
-                            } else {
-                                p.copy(status = "failed", statusMessage = r.reason ?: "not applied")
-                            }
-                        }
+                        outcomes[p.id]?.let { (status, message) ->
+                            p.copy(status = status, statusMessage = message)
+                        } ?: p
                     }
                 // Merged into the live session by id: the run may have added
                 // proposals while these were being applied.
@@ -453,30 +494,6 @@ internal class EditorTabMcpToolProvider(
         val selEndCol: Int?,
     )
 
-    private fun lineLength(lines: List<String>, line: Int): Int =
-        if (line in lines.indices) lines[line - 1].length + 1 else 1
-
-    /** 1-based (line, col) inclusive-ish range to text; the editor's end semantics. */
-    private fun rangeText(
-        lines: List<String>,
-        startLine: Int,
-        startCol: Int,
-        endLine: Int,
-        endCol: Int,
-    ): String? {
-        if (startLine !in 1..lines.size || endLine !in 1..lines.size || startLine > endLine) return null
-        val start = (startCol - 1).coerceIn(0, lines[startLine - 1].length)
-        val end = (endCol - 1).coerceIn(0, lines[endLine - 1].length)
-        val sb = StringBuilder()
-        for (l in startLine..endLine) {
-            val lo = if (l == startLine) start else 0
-            val hi = if (l == endLine) end else lines[l - 1].length
-            if (hi > lo) sb.append(lines[l - 1].substring(lo, hi))
-            if (l != endLine) sb.append('\n')
-        }
-        return sb.toString()
-    }
-
     private fun pathSchema(desc: String): String =
         """{"type":"object","properties":{"path":{"type":"string","description":"$desc"}},"required":["path"]}"""
 
@@ -490,4 +507,38 @@ internal class EditorTabMcpToolProvider(
         const val APPLY_EDIT_SCHEMA =
             """{"type":"object","properties":{"path":{"type":"string","description":"Path of the open editor file (absolute or project-relative)."},"start_line":{"type":"integer","description":"1-based start line."},"start_col":{"type":"integer","description":"1-based start column."},"end_line":{"type":"integer","description":"1-based end line."},"end_col":{"type":"integer","description":"1-based end column (exclusive end of the replaced range)."},"new_text":{"type":"string","description":"Replacement text."},"expected_version":{"type":"integer","description":"buffer_version from editor_read_buffer/editor_get_selection; the edit is rejected when the buffer moved on."}},"required":["path","start_line","start_col","end_line","end_col","new_text","expected_version"]}"""
     }
+}
+
+/**
+ * The exclusive end column of 1-based line [line]: its length plus 1, so a
+ * range ending there covers the WHOLE line. (The old `line in lines.indices`
+ * test was off by one - 1-based lines against 0-based indices - so the last
+ * line, the only one ever asked for, fell through to 1 and dropped itself
+ * from the range.)
+ */
+internal fun lineLength(lines: List<String>, line: Int): Int =
+    if (line in 1..lines.size) lines[line - 1].length + 1 else 1
+
+/**
+ * 1-based (line, col) inclusive-ish range to text; the editor's end
+ * semantics. Top-level and pure so the off-by-ones have a home to be pinned.
+ */
+internal fun rangeText(
+    lines: List<String>,
+    startLine: Int,
+    startCol: Int,
+    endLine: Int,
+    endCol: Int,
+): String? {
+    if (startLine !in 1..lines.size || endLine !in 1..lines.size || startLine > endLine) return null
+    val start = (startCol - 1).coerceIn(0, lines[startLine - 1].length)
+    val end = (endCol - 1).coerceIn(0, lines[endLine - 1].length)
+    val sb = StringBuilder()
+    for (l in startLine..endLine) {
+        val lo = if (l == startLine) start else 0
+        val hi = if (l == endLine) end else lines[l - 1].length
+        if (hi > lo) sb.append(lines[l - 1].substring(lo, hi))
+        if (l != endLine) sb.append('\n')
+    }
+    return sb.toString()
 }

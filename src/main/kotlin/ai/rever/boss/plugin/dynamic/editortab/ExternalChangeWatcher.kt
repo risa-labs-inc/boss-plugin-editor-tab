@@ -282,6 +282,14 @@ internal class ExternalChangeWatcher(
         @Volatile
         private var instance: ExternalChangeWatcher? = null
 
+        /**
+         * One watcher per plugin classloader. The FIRST call's scope,
+         * git provider and autoReload win; a later install returns the
+         * existing watcher and restarts it - to reinstall with new arguments
+         * (a new scope after a re-register, a new git provider) call
+         * [uninstall] first. Silently taking the second call's arguments
+         * would orphan the first watcher's sweep on its old scope.
+         */
         fun install(
             scope: CoroutineScope,
             gitProvider: () -> GitDataProvider? = { null },

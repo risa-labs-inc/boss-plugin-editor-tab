@@ -101,53 +101,57 @@ class ComposerAgent(
                     messages = it.messages + ComposerMessage("user", task),
                 )
             } ?: return false
-        // The run is inserted into its slot by the launch itself: compute holds the
-        // map cell while the entry appears, so a run that finishes
-        // immediately removes the very entry it created. The old
-        // launch-then-assign ordering could leave a dead job in the slot -
-        // the finish removed nothing (the assignment had not happened yet)
-        // and the late assignment then re-inserted it.
-        var launched: Job? = null
-        runs.compute(sessionId) { _, current ->
-            if (current?.isActive == true) {
-                current
-            } else {
-                scope.launch(Dispatchers.IO) {
-                    val hasTools = AiGatewayAPI.CAPABILITY_TOOLS in gateway.capabilities()
-                    val result =
-                        withTimeoutOrNull(20 * 60_000 + 10_000) {
-                            gateway.runAgent(
-                                AiRequest(
-                                    system = SYSTEM_PROMPT,
-                                    messages = listOf(AiMessage.user(promptFor(task, started.selection))),
-                                    timeoutMs = 90_000,
-                                ),
-                                tools = if (hasTools) TOOL_SPECS else emptyList(),
-                                budget = AiBudget(maxSteps = 24, timeoutMs = 20 * 60_000),
-                            ) { call ->
-                                executeTool(sessionId, call)
-                            }
+        // Launch OUTSIDE the map: the CHM contract warns against map work from
+        // inside a mapping function, and the old launch-inside-compute only
+        // worked because the launched body ran on another thread and merely
+        // blocked on the bin lock. The slot is then swapped in atomically;
+        // if a newer active run wins the cell, this job is cancelled.
+        val job =
+            scope.launch(Dispatchers.IO) {
+                val hasTools = AiGatewayAPI.CAPABILITY_TOOLS in gateway.capabilities()
+                val result =
+                    withTimeoutOrNull(20 * 60_000 + 10_000) {
+                        gateway.runAgent(
+                            AiRequest(
+                                system = SYSTEM_PROMPT,
+                                messages = listOf(AiMessage.user(promptFor(task, started.selection))),
+                                timeoutMs = 90_000,
+                            ),
+                            tools = if (hasTools) TOOL_SPECS else emptyList(),
+                            budget = AiBudget(maxSteps = 24, timeoutMs = 20 * 60_000),
+                        ) { call ->
+                            executeTool(sessionId, call)
                         }
-                    result
-                        ?.fold(
-                            onSuccess = { r ->
-                                val msg =
-                                    r.text.ifBlank {
-                                        "The agent stopped before answering (${r.stopReason.name.lowercase()})."
-                                    }
-                                val stopNote =
-                                    if (r.stopReason == AiStopReason.COMPLETED) ""
-                                    else " [stopped: ${r.stopReason.name.lowercase()}]"
-                                finish(sessionId, msg + stopNote, "done", "")
-                            },
-                            onFailure = { e ->
-                                finish(sessionId, e.message ?: "The AI request failed.", "error", e.message ?: "failed")
-                            },
-                        ) ?: finish(sessionId, "The AI request timed out.", "error", "timeout")
-                }.also { launched = it }
+                    }
+                result
+                    ?.fold(
+                        onSuccess = { r ->
+                            val msg =
+                                r.text.ifBlank {
+                                    "The agent stopped before answering (${r.stopReason.name.lowercase()})."
+                                }
+                            val stopNote =
+                                if (r.stopReason == AiStopReason.COMPLETED) ""
+                                else " [stopped: ${r.stopReason.name.lowercase()}]"
+                            finish(sessionId, msg + stopNote, "done", "")
+                        },
+                        onFailure = { e ->
+                            finish(sessionId, e.message ?: "The AI request failed.", "error", e.message ?: "failed")
+                        },
+                    ) ?: finish(sessionId, "The AI request timed out.", "error", "timeout")
             }
-        }
-        return launched != null
+        // The two-arg remove in the completion handler is what keeps the slot
+        // honest: it evicts ONLY this job, so a run that finishes immediately
+        // clears the very entry it created (the old launch-then-assign
+        // ordering re-inserted dead jobs), while a NEWER run in the slot is
+        // never evicted by its predecessor's completion.
+        job.invokeOnCompletion { runs.remove(sessionId, job) }
+        val stored =
+            runs.compute(sessionId) { _, current ->
+                if (current?.isActive == true) current else job
+            }
+        if (stored !== job) job.cancel()
+        return stored === job
     }
 
     /**
@@ -187,10 +191,10 @@ class ComposerAgent(
     }
 
     /**
-     * Finish a run. Also drops the run's slot when it is still the one that
-     * just ended: removing it unconditionally would evict a NEWER run that
-     * started in the gap, and keeping a dead job there is what the old
-     * remove-before-insert ordering leaked.
+     * Finish a run. The run's SLOT is cleared by the job's
+     * [invokeOnCompletion] handler in [start] (a two-arg remove, so only the
+     * job that just ended is evicted) - clearing it here would never fire,
+     * because finish runs from inside the job, which is still active.
      */
     private fun finish(
         sessionId: String,
@@ -198,9 +202,6 @@ class ComposerAgent(
         status: String,
         statusMessage: String,
     ) {
-        if (runs[sessionId] != null && runs[sessionId]?.isActive == false) {
-            runs.remove(sessionId)
-        }
         sessions.update(sessionId) {
             it.copy(
                 status = status,
