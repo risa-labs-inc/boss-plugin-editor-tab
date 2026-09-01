@@ -137,12 +137,19 @@ class EditorBuffer(
      */
     fun observe(): Flow<BufferChange> = changes
 
-    fun acquire() {
+    /**
+     * Take/drop a reference. INTERNAL, and only ever called from the
+     * [EditorBufferRegistry] wrappers: [refCount] is a plain Int, so the
+     * registry's `@Synchronized` is the only thing making these safe. Keeping
+     * them off the public surface makes that a compiler-enforced fact rather
+     * than a convention for the next caller to discover.
+     */
+    internal fun acquire() {
         refCount++
     }
 
     /** @return true when the buffer became unreferenced and was closed. */
-    fun release(): Boolean {
+    internal fun release(): Boolean {
         refCount--
         return refCount <= 0
     }

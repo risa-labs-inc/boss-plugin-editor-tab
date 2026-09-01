@@ -8,11 +8,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlin.concurrent.thread
 
 /**
  * The live composer sessions, owned by the PLUGIN rather than by a tab.
@@ -166,18 +165,26 @@ class ComposerSessions(
      * freeze the app's UI thread during unload - losing the last writes is
      * the lesser evil, and nothing is corrupted: the sessions stay live in
      * memory until the process ends.
+     *
+     * The bound is on the WAIT, not on the work. `withTimeout` around the
+     * saves only fires at a suspension point, so a store blocked in
+     * uncancellable filesystem I/O sailed straight past it and froze the
+     * caller anyway - the mechanism promised less than the comment did. A
+     * daemon thread with a deadlined join() bounds the stall unconditionally:
+     * a stuck write keeps running on a thread nobody waits for, and the JVM
+     * does not wait for it either.
      */
     fun flushAll() {
         val live = synchronized(this) { flows.values.mapNotNull { it.value } }
         synchronized(this) { persistJobs.values.forEach { it.cancel() }; persistJobs.clear() }
         if (live.isEmpty() || store == null) return
-        try {
-            runBlocking(Dispatchers.IO) {
-                withTimeout(FLUSH_TIMEOUT_MS) { live.forEach { store.save(it) } }
+        val writer =
+            thread(name = "composer-session-flush", isDaemon = true) {
+                runBlocking(Dispatchers.IO) {
+                    live.forEach { runCatching { store.save(it) } }
+                }
             }
-        } catch (e: TimeoutCancellationException) {
-            // See above: a hung store loses the tail of the flush, not the app.
-        }
+        writer.join(FLUSH_TIMEOUT_MS)
     }
 
     private fun schedulePersist(session: ComposerSessionData) {

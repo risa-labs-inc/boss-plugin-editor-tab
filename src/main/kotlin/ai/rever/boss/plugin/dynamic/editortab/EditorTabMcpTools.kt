@@ -48,11 +48,15 @@ internal class EditorTabMcpToolProvider(
                 }
             },
         ),
-        McpToolDefinition(
+        // editor.write, like editor_apply_edit: this one overwrites a whole
+        // file on disk with no version guard at all, so of the two writers it
+        // is the one that most wants the permission.
+        McpToolDefinition.withRbac(
             name = "editor_write_file",
             description = "Write (create or overwrite) a file via the BOSS editor.",
             inputSchema = WRITE_SCHEMA,
             readOnly = false,
+            requiredPermissions = listOf("editor.write"),
             handler = McpToolHandler { args ->
                 val e = editor ?: return@McpToolHandler unavailable()
                 val path = args.string("path")
@@ -378,13 +382,17 @@ internal class EditorTabMcpToolProvider(
                 }
                 // Apply per file, in DESCENDING start-line order: an edit shifts every line
                 // below it, so bottom-up keeps every recorded range valid.
-                // The version is re-read before each apply - the batch itself
-                // bumps it on every success, which the recorded value cannot
-                // know. The re-read must equal the proposal's recorded
-                // version plus only the earlier applies of THIS batch that it
-                // can explain (the ones recorded at or before its snapshot);
-                // anything else in the gap is an outside edit, and the rest
-                // of that file's group fails rather than being applied over.
+                // The version is re-read before each apply, because the batch
+                // itself moves it on every success - something the recorded
+                // value cannot know. What the re-read must EQUAL is
+                // applyEdit's own reported newVersion from the previous step
+                // (and, before this batch has touched the file, the
+                // proposal's recorded version). The earlier shape counted the
+                // applies and assumed each bumped the document by exactly
+                // one; the API already answers that question, and its answer
+                // stays right whatever document.replace does to the version.
+                // Anything else in the gap is an outside edit, and the rest of
+                // that file's group fails rather than being applied over.
                 val outcomes = HashMap<String, Pair<String, String>>()
                 for ((path, fileTargets) in targets.groupBy { it.path }) {
                     val ordered =
@@ -392,7 +400,9 @@ internal class EditorTabMcpToolProvider(
                             compareByDescending<ComposerProposal> { it.startLine }
                                 .thenByDescending { it.startCol },
                         )
-                    val appliedEarlier = mutableListOf<ComposerProposal>()
+                    // The version this batch has moved the file to; null
+                    // until it has applied anything.
+                    var appliedTo: Long? = null
                     var aborted = ""
                     for (p in ordered) {
                         if (aborted.isNotEmpty()) {
@@ -405,9 +415,7 @@ internal class EditorTabMcpToolProvider(
                             outcomes[p.id] = "failed" to aborted
                             continue
                         }
-                        val explained =
-                            appliedEarlier.count { it.expectedVersion <= p.expectedVersion }
-                        if (current != p.expectedVersion + explained.toLong()) {
+                        if (current != (appliedTo ?: p.expectedVersion)) {
                             aborted = "buffer changed while this batch was applying - re-run the task"
                             outcomes[p.id] = "failed" to aborted
                             continue
@@ -424,7 +432,15 @@ internal class EditorTabMcpToolProvider(
                             )
                         if (r.applied) {
                             outcomes[p.id] = "accepted" to "buffer version ${r.newVersion}"
-                            appliedEarlier += p
+                            // The api allows applyEdit to apply without
+                            // reporting a version. Stop the group there rather
+                            // than guessing one: the ranges below are still
+                            // valid, but nothing can vouch for the state they
+                            // would land on.
+                            appliedTo = r.newVersion
+                            if (appliedTo == null) {
+                                aborted = "the editor applied an edit without reporting the new buffer version"
+                            }
                         } else {
                             aborted = r.reason ?: "not applied"
                             outcomes[p.id] = "failed" to aborted

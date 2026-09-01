@@ -263,6 +263,27 @@ class EditorTabComponent(
     private var buffer: EditorBuffer? = null
         private set
 
+    // The AI services are built once per COMPONENT, not per composition. They
+    // are handed the component's coroutineScope, so a service rebuilt on
+    // re-entering the composition (a tab switch, a split re-layout) would
+    // leave the PREVIOUS one's in-flight request still streaming on that
+    // scope, into a StateFlow nobody reads, with the tokens already spent.
+    //
+    // runCatching rather than a try/catch on Exception because the failure
+    // being guarded is a LinkageError: AiGatewayAPI is a parent-first api
+    // class that hosts before 9.4.5 do not carry. Belt and braces only - this
+    // plugin's floor (minApiVersion 1.0.87, minBossVersion 9.5.7) is far above
+    // that, so such a host cannot load it at all and this guard cannot fire
+    // today. It is here for a future in which the floor drops, not for any
+    // shipping host.
+    private val aiCompletion: AiTabCompletionService? by lazy {
+        runCatching { AiTabCompletionService(context, coroutineScope) }.getOrNull()
+    }
+
+    private val aiInlineEdit: AiInlineEditService? by lazy {
+        runCatching { AiInlineEditService(context, coroutineScope) }.getOrNull()
+    }
+
     // The file as this tab last saw it, for the large-file poll alone. Normal
     // files baseline on the buffer's knownSignature (owned by the
     // plugin-wide watcher); large files have no buffer, so the poll keeps its
@@ -494,21 +515,14 @@ class EditorTabComponent(
                 EditorState(initialContent, null)
             }
 
-        // AI tab completion (ghost text) via the ai-gateway plugin. Guarded like
-        // EditorTabPluginAPIImpl's registration: AiGatewayAPI is a parent-first
-        // api class that hosts before 9.4.5 don't carry, so on those the service
-        // fails to link and the feature silently vanishes.
-        val aiCompletion = remember(filePath) {
-            runCatching { AiTabCompletionService(context, coroutineScope) }.getOrNull()
-        }
+        // AI tab completion (ghost text) and Cmd+K inline edit, from the
+        // component-level services - see their declarations for why they are
+        // not remembered per composition.
+        val aiCompletion = this.aiCompletion
         val ghostSuggestion = aiCompletion?.suggestion?.collectAsState()?.value
         val completionSettings by AiCompletionSettings.settings.collectAsState()
 
-        // Inline AI edit (Cmd+K). Same guard as tab completion: it references
-        // AiGatewayAPI, which pre-9.4.5 hosts don't carry.
-        val aiInlineEdit = remember(filePath) {
-            runCatching { AiInlineEditService(context, coroutineScope) }.getOrNull()
-        }
+        val aiInlineEdit = this.aiInlineEdit
         aiInlineEdit?.bind(editorBuffer, editorState)
         val aiEditSession = aiInlineEdit?.session?.collectAsState()?.value
 
@@ -1129,29 +1143,29 @@ class EditorTabComponent(
 
                 // Editor content (hidden when a markdown file is in Preview-only mode)
                 if (!(isMarkdown && viewMode == MarkdownViewMode.PREVIEW)) {
-                // "Open Diff" on right-click of the editor surface (IDE batch P1.4): the
-        // host's diff tab shows this file's working-tree diff. The menu only
-        // appears when a git data provider exists; for untracked files the
-        // diff tab itself reports "no diff".
-        val editorSurfaceModifier =
-            context.contextMenuProvider?.applyContextMenu(
-                Modifier,
-                if (filePath.isNotEmpty() && context.gitDataProvider != null) {
-                    listOf(
-                        ContextMenuItemData(
-                            label = "Open Diff",
-                            onClick = { context.gitDataProvider?.openDiff(filePath, context.windowId ?: "", staged = false) },
-                        ),
-                    )
-                } else {
-                    emptyList()
-                },
-            ) ?: Modifier
-        // Uncommitted changes for the left gutter. Empty for an untitled
-        // document, which has no buffer and so no file to compare.
-        val gitMarks: Map<Int, LineDiff.Mark> =
-            editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
-        Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
+                    // "Open Diff" on right-click of the editor surface (IDE batch P1.4): the
+                    // host's diff tab shows this file's working-tree diff. The menu only
+                    // appears when a git data provider exists; for untracked files the
+                    // diff tab itself reports "no diff".
+                    val editorSurfaceModifier =
+                        context.contextMenuProvider?.applyContextMenu(
+                            Modifier,
+                            if (filePath.isNotEmpty() && context.gitDataProvider != null) {
+                                listOf(
+                                    ContextMenuItemData(
+                                        label = "Open Diff",
+                                        onClick = { context.gitDataProvider?.openDiff(filePath, context.windowId ?: "", staged = false) },
+                                    ),
+                                )
+                            } else {
+                                emptyList()
+                            },
+                        ) ?: Modifier
+                    // Uncommitted changes for the left gutter. Empty for an untitled
+                    // document, which has no buffer and so no file to compare.
+                    val gitMarks: Map<Int, LineDiff.Mark> =
+                        editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+                    Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
                     state = editorState,

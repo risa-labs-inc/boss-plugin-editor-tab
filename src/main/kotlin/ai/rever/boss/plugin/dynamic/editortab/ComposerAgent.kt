@@ -251,21 +251,41 @@ class ComposerAgent(
                     } else {
                         val snap = editorApi.readBuffer(path)
                         val version = snap?.version ?: 0
-                        val proposalCount = sessions.snapshot(sessionId)?.proposals?.size ?: 0
-                        val p =
-                            ComposerProposal(
-                                id = "p${proposalCount + 1}",
-                                path = path,
-                                startLine = sl,
-                                startCol = sc,
-                                endLine = el,
-                                endCol = ec,
-                                newText = newText,
-                                expectedVersion = version,
+                        // The id is derived INSIDE the update, from the very
+                        // session the proposal is appended to. Reading the
+                        // count outside it meant a snapshot miss (a session
+                        // not loaded on this path) silently restarted
+                        // numbering at p1 - and both ai_compose_accept and
+                        // markProposal match proposals by id, so a collision
+                        // applies or marks the wrong edit.
+                        var id = ""
+                        val updated =
+                            sessions.update(sessionId) { s ->
+                                id = "p${s.proposals.size + 1}"
+                                s.copy(
+                                    proposals = s.proposals +
+                                        ComposerProposal(
+                                            id = id,
+                                            path = path,
+                                            startLine = sl,
+                                            startCol = sc,
+                                            endLine = el,
+                                            endCol = ec,
+                                            newText = newText,
+                                            expectedVersion = version,
+                                        ),
+                                )
+                            }
+                        if (updated == null) {
+                            AiToolOutcome(
+                                call.id,
+                                "Composer session $sessionId is no longer open; the proposal was not recorded.",
+                                isError = true,
                             )
-                        log("propose_edit($path, lines $sl:$sc-${el}:$ec) -> proposal ${p.id}")
-                        sessions.update(sessionId) { it.copy(proposals = it.proposals + p) }
-                        AiToolOutcome(call.id, "Recorded as proposal ${p.id}. It is NOT applied until the user accepts it.")
+                        } else {
+                            log("propose_edit($path, lines $sl:$sc-${el}:$ec) -> proposal $id")
+                            AiToolOutcome(call.id, "Recorded as proposal $id. It is NOT applied until the user accepts it.")
+                        }
                     }
                 }
 

@@ -101,6 +101,12 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // still render their own editor settings from their own BossEditor
         // dependency, so skipping registration degrades nothing there (the
         // buffer MCP tools report "API unavailable" instead).
+        //
+        // Belt and braces at the CURRENT floor: minApiVersion 1.0.87 and
+        // minBossVersion 9.5.7 both postdate the buffer model, so a host that
+        // could take this branch cannot load the plugin at all. Read the
+        // null-handling below as insurance against the floor dropping later,
+        // not as a path any shipping host walks.
         val editorApi =
             try {
                 EditorTabPluginAPIImpl(context, markdownSettings, autoSaveSettings, externalReloadSettings)

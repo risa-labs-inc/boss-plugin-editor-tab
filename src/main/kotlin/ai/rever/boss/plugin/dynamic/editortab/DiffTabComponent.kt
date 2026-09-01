@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -399,12 +400,11 @@ class DiffTabComponent(
         onEditableChanged: (Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
-        // The disk read is synchronous: run it off the UI thread, since this
-        // probe runs on every recomposition key change in read-only mode.
+        // [canEdit] hops its own dispatchers - the disk read to IO, the live
+        // document comparison to Main - so this effect only has to ask the
+        // question, once per key change while the pane is read-only.
         LaunchedEffect(absolutePath, unpaddedNewText, diffScope.staged, diffScope.fromRef, diffScope.toRef) {
-            onEditableChanged(
-                withContext(Dispatchers.IO) { canEdit(diffScope, absolutePath, unpaddedNewText) },
-            )
+            onEditableChanged(canEdit(diffScope, absolutePath, unpaddedNewText))
         }
     }
 
@@ -436,25 +436,31 @@ class DiffTabComponent(
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
 
-        // The disk read and the buffer acquire run OFF the UI thread:
-        // the old remember { } paid a full-file read per key change
-        // mid-frame, and even after moving it into this effect it must not
-        // run on Main - the LaunchedEffect's own context IS Main. The buffer
-        // holds its previous value for at most a frame across a key change,
-        // matching how the read-only probe updates asynchronously.
-        var buffer by remember { mutableStateOf<EditorBuffer?>(null) }
-        LaunchedEffect(
+        // Acquire and release are keyed IDENTICALLY, on the slot. The acquire
+        // has to be asynchronous (a whole-file read must not run on the
+        // composition thread), so the two halves cannot be one
+        // DisposableEffect - and anything looser leaks. Keying the release on
+        // the RESOLVED buffer, which is what this used to do, failed twice
+        // over: a cancellation landing after the acquire but before the
+        // assignment left a reference no effect was ever keyed on, and a
+        // re-resolve to the same EditorBuffer instance (the class has no
+        // equals) acquired a second time without re-running the release.
+        // [BufferSlot] closes both - it releases into an already-disposed slot
+        // at once, and it holds at most one reference at a time.
+        val slot = remember(
             absolutePath, reconstructedNewText,
             diffScope.staged, diffScope.fromRef, diffScope.toRef,
-        ) {
-            buffer = withContext(Dispatchers.IO) {
-                editableBufferOrNull(diffScope, absolutePath, reconstructedNewText)
+        ) { BufferSlot() }
+        var buffer by remember(slot) { mutableStateOf<EditorBuffer?>(null) }
+        DisposableEffect(slot) { onDispose { slot.dispose() } }
+        LaunchedEffect(slot) {
+            // NonCancellable spans the resolve AND the publish: a cancellation
+            // between them is precisely the orphaned reference above. The cost
+            // is that a tab closed mid-read waits out one file read, which
+            // happens off the UI thread anyway.
+            buffer = withContext(NonCancellable) {
+                slot.publish(editableBufferOrNull(diffScope, absolutePath, reconstructedNewText))
             }
-        }
-
-        DisposableEffect(buffer) {
-            val held = buffer
-            onDispose { if (held != null) EditorBufferRegistry.release(held.path) }
         }
         LaunchedEffect(buffer) { onEditableChanged(buffer != null) }
 
@@ -482,66 +488,95 @@ class DiffTabComponent(
         runCatching { File(absolutePath).readText() }.getOrNull()
             ?.takeIf { it.lines() == reconstructedNewText.lines() }
 
+    /** What a buffer for this pane would hold, and the language to open it with. */
+    private class EditableSource(val seedText: String, val language: String)
+
     /**
-     * The read-only mode's gate. Delegates to [editableBufferOrNull] - the
-     * SAME predicate the editable pane uses - and releases the reference at
-     * once: two hand-rolled copies of "this diff can edit this file" could
-     * drift apart (one checking disk, the other the buffer), which is exactly
-     * the class of bug this file already shipped.
+     * Whether this diff can hand over an editable buffer, and what that buffer
+     * would contain - resolved WITHOUT taking a registry reference.
+     *
+     * The scope gates come first (only a working-tree diff has a file you can
+     * write to), then the content gate: [EditorBufferRegistry.acquire] may
+     * hand back a buffer an editor tab already owns, and the pane edits
+     * exactly that document, marks and gutter numbering included. When it has
+     * diverged from the diff's post-image the pane must decline.
+     *
+     * Threading: the buffer's document is Compose-backed state the user may be
+     * typing into, so every read of it happens on Main. Reading it from
+     * Dispatchers.IO raced those keystrokes - the same mistake
+     * [EditorTabPluginAPIImpl] calls out on the apply side. Only
+     * `File.readText()` belongs on IO, and it runs at most once, only when no
+     * buffer exists yet: with an editor tab open the live buffer text IS the
+     * invariant to check, in memory.
+     */
+    private suspend fun editableSourceOrNull(
+        diffScope: DiffTabConfig,
+        absolutePath: String?,
+        reconstructedNewText: String,
+    ): EditableSource? {
+        if (absolutePath == null) return null
+        if (diffScope.staged || diffScope.fromRef != null || diffScope.toRef != null) return null
+        if (diffScope.filePath.isBlank()) return null
+
+        val live =
+            withContext(Dispatchers.Main) {
+                EditorBufferRegistry.find(absolutePath)?.let {
+                    it.editorState.document.getText() to it.language
+                }
+            }
+        if (live != null) {
+            val (text, language) = live
+            return if (text.lines() == reconstructedNewText.lines()) EditableSource(text, language) else null
+        }
+
+        return withContext(Dispatchers.IO) {
+            diskMatchingReconstruction(absolutePath, reconstructedNewText)
+                ?.let { EditableSource(it, EditorTabComponent.detectLanguage(absolutePath)) }
+        }
+    }
+
+    /**
+     * The read-only mode's gate: the SAME predicate the editable pane uses,
+     * asked without acquiring anything.
+     *
+     * Two hand-rolled copies of "this diff can edit this file" could drift
+     * apart (one checking disk, the other the buffer), which is exactly the
+     * class of bug this file already shipped. The previous shape shared the
+     * predicate but reached its Boolean by acquire-then-release, which for a
+     * file nothing has open BUILT a full EditorBuffer over the whole file -
+     * briefly visible to the change watcher - once per key change.
      */
     private suspend fun canEdit(
         diffScope: DiffTabConfig,
         absolutePath: String?,
         reconstructedNewText: String,
-    ): Boolean =
-        editableBufferOrNull(diffScope, absolutePath, reconstructedNewText)?.let {
-            EditorBufferRegistry.release(it.path)
-            true
-        } ?: false
+    ): Boolean = editableSourceOrNull(diffScope, absolutePath, reconstructedNewText) != null
 
     /**
-     * The buffer the editable right pane would write into, or null when the
-     * pane must fall back to the read-only reconstruction.
+     * The buffer the editable right pane writes into, or null when the pane
+     * must fall back to the read-only reconstruction.
      *
-     * [canEdit]'s scope gates first, then the buffer gate: [EditorBufferRegistry.acquire]
-     * may hand back a buffer an editor tab already owns, and the pane edits
-     * exactly that document, marks and gutter numbers included. When it has
-     * diverged from the post-image, release our reference and decline.
-     *
-     * The disk is read at most once, and only when no buffer exists yet:
-     * with an editor tab open the live buffer text is the invariant to check
-     * (in memory), and the read exists only to seed a brand-new buffer.
+     * The acquire re-checks the invariant on Main: another viewport may have
+     * created - or dirtied - the buffer for this path since
+     * [editableSourceOrNull] resolved, in which case the registry ignores the
+     * seed text and hands back that document instead.
      */
-    private fun editableBufferOrNull(
+    private suspend fun editableBufferOrNull(
         diffScope: DiffTabConfig,
         absolutePath: String?,
         reconstructedNewText: String,
     ): EditorBuffer? {
-        if (absolutePath == null) return null
-        if (diffScope.staged || diffScope.fromRef != null || diffScope.toRef != null) return null
-        if (diffScope.filePath.isBlank()) return null
-
-        // Fast path: an editor tab already owns this file. That buffer is the
-        // document the pane would edit, so it is the thing to check - and the
-        // check is an in-memory comparison, no disk read at all.
-        EditorBufferRegistry.find(absolutePath)?.let { existing ->
-            return if (existing.editorState.document.getText().lines() == reconstructedNewText.lines()) {
-                EditorBufferRegistry.acquire(existing.path, existing.content, existing.language)
+        val path = absolutePath ?: return null
+        val source = editableSourceOrNull(diffScope, path, reconstructedNewText) ?: return null
+        return withContext(Dispatchers.Main) {
+            val buffer = EditorBufferRegistry.acquire(path, source.seedText, source.language)
+            if (buffer.editorState.document.getText().lines() == reconstructedNewText.lines()) {
+                buffer
             } else {
+                EditorBufferRegistry.release(buffer.path)
                 null
             }
         }
-
-        // No buffer yet: the disk must be the post-image, and that one read
-        // also seeds the new buffer.
-        val onDisk = diskMatchingReconstruction(absolutePath, reconstructedNewText) ?: return null
-        val buffer =
-            EditorBufferRegistry.acquire(absolutePath, onDisk, EditorTabComponent.detectLanguage(absolutePath))
-        if (buffer.editorState.document.getText().lines() != reconstructedNewText.lines()) {
-            EditorBufferRegistry.release(buffer.path)
-            return null
-        }
-        return buffer
     }
 
     /** Cmd/Ctrl+S over the diff pane, writing the shared buffer back to disk. */
@@ -1196,3 +1231,57 @@ private fun overviewOf(marks: List<DiffLineKind?>): List<DiffSides.OverviewMark?
             else -> null
         }
     }
+
+/**
+ * One buffer reference held by one diff pane, released exactly once.
+ *
+ * The pane acquires asynchronously - a whole-file read must not run on the
+ * composition thread - but is disposed synchronously, so the acquire and the
+ * dispose can land in either order. The slot makes both orders safe:
+ * publishing into an already-disposed slot releases the reference on the
+ * spot, and disposing releases whatever was published. Either way the
+ * registry sees exactly one release per acquire, which is what keeps the
+ * one-buffer-per-path refcount honest across a cancelled acquire.
+ */
+internal class BufferSlot {
+    private var disposed = false
+    private var held: EditorBuffer? = null
+
+    /** True once [dispose] has run; every later [publish] is refused. */
+    val isDisposed: Boolean
+        @Synchronized get() = disposed
+
+    /** The reference currently held, or null before a publish and after a dispose. */
+    val current: EditorBuffer?
+        @Synchronized get() = held
+
+    /**
+     * Take ownership of a freshly acquired [buffer].
+     *
+     * @return the buffer while the slot is live; null once it has been
+     *   disposed - the reference is released here, so the caller is left
+     *   holding nothing rather than something nobody will release.
+     */
+    @Synchronized
+    fun publish(buffer: EditorBuffer?): EditorBuffer? {
+        if (buffer == null) return null
+        if (disposed) {
+            EditorBufferRegistry.release(buffer.path)
+            return null
+        }
+        // A second publish into a live slot would strand the first reference.
+        // The pane re-keys the slot rather than reusing it, so this only
+        // guards a future caller against getting that wrong.
+        held?.let { EditorBufferRegistry.release(it.path) }
+        held = buffer
+        return buffer
+    }
+
+    /** Release the held reference, and refuse every later publish. */
+    @Synchronized
+    fun dispose() {
+        disposed = true
+        held?.let { EditorBufferRegistry.release(it.path) }
+        held = null
+    }
+}

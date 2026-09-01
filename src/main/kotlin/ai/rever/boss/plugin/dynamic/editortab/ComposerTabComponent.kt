@@ -160,20 +160,27 @@ class ComposerTabComponent(
         agent?.stop(sessionId)
     }
 
+    // Per path, the buffer version this tab's last accepted proposal produced
+    // - applyEdit's own answer, not arithmetic over how many accepts have
+    // happened. Read in [acceptProposal].
+    private val lastAppliedVersion = HashMap<String, Long>()
+
     fun acceptProposal(proposal: ComposerProposal) {
         val api = agent?.editorApi ?: return
         val data = session.value ?: return
         coroutineScope.launch {
             markProposal(proposal, "applying", "")
             try {
-                // The recorded version is the buffer state when the proposal
-                // was MADE. Since then, the only legitimate mover of that
-                // version is accepting other proposals on the same file -
-                // each accept bumps it exactly once - so the current version
-                // must be the recorded one plus the accepted siblings that
-                // were recorded at or after this snapshot (their accepts all
-                // happened after this proposal was recorded). Anything else
-                // in the gap is an outside edit: fail, never apply over it.
+                // The recorded version is the buffer as it stood when the
+                // proposal was MADE. Since then the only legitimate mover is
+                // this tab accepting another proposal on the same file - and
+                // rather than counting those accepts and assuming each bumps
+                // the document by exactly one, remember what applyEdit
+                // actually reported. [lastAppliedVersion] is ignored once it
+                // predates the proposal's own snapshot, so a re-run against a
+                // hand-edited file is guarded by the fresh recorded value
+                // instead of a stale accept. Anything else in the gap is an
+                // outside edit: fail, never apply over it.
                 val path = proposal.path
                 val current =
                     api.readBuffer(path)?.version
@@ -182,13 +189,10 @@ class ComposerTabComponent(
                             return@launch
                         }
                 val siblings = data.proposals.filter { it.path == path && it.id != proposal.id }
-                val explained =
-                    siblings.count {
-                        it.status == "accepted" && it.expectedVersion >= proposal.expectedVersion
-                    }
-                if (current < proposal.expectedVersion ||
-                    current > proposal.expectedVersion + explained
-                ) {
+                val required =
+                    lastAppliedVersion[path]?.takeIf { it >= proposal.expectedVersion }
+                        ?: proposal.expectedVersion
+                if (current != required) {
                     markProposal(
                         proposal, "failed",
                         "buffer moved since this was reviewed - re-run the task",
@@ -226,6 +230,13 @@ class ComposerTabComponent(
                         expectedVersion = current,
                     )
                 if (result.applied) {
+                    // applyEdit's own answer, threaded forward. The api allows
+                    // it to decline to report one; forget the threaded value
+                    // then rather than guessing, so the next accept on this
+                    // file is guarded by the recorded version and fails closed.
+                    val produced = result.newVersion
+                    if (produced != null) lastAppliedVersion[path] = produced
+                    else lastAppliedVersion.remove(path)
                     markProposal(proposal, "accepted", "applied (buffer version ${result.newVersion})")
                 } else {
                     markProposal(proposal, "failed", result.reason ?: "not applied")

@@ -9,7 +9,7 @@
   "definedPermissions": [
     {
       "name": "editor.write",
-      "description": "Apply version-guarded edits to live editor buffers (editor_apply_edit, editor_inline_edit)"
+      "description": "Write files and live editor buffers (editor_write_file, editor_apply_edit, editor_inline_edit)"
     },
     {
       "name": "ai.edit",

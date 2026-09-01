@@ -124,6 +124,8 @@ internal class ExternalChangeWatcher(
         // The split and the LCS band are the expensive part and pure: run
         // them off the UI thread (this tick lands on Dispatchers.Main), and
         // hop back only to publish the marks.
+        // buffer.content is Compose-backed document state: read it HERE, on
+        // Main, and hand the plain String to the worker.
         val bufferText = buffer.content
         val marks = withContext(Dispatchers.Default) {
             LineDiff.of(head.split("\n"), bufferText.split("\n"))
@@ -148,7 +150,12 @@ internal class ExternalChangeWatcher(
      */
     private suspend fun headTextFor(git: GitDataProvider, path: String): String? =
         runCatching {
-            val diff = git.diffFile(path, staged = false).firstOrNull()
+            // The one expensive call left on the sweep thread. The sweep runs on
+            // the plugin scope's Dispatchers.Main, so shelling out to git here -
+            // once per open buffer, on every save and every HEAD_REFRESH_TICKS -
+            // stalled the UI in proportion to file size times open buffers. Every
+            // other heavy step in this file already hops; this one did not.
+            val diff = withContext(Dispatchers.IO) { git.diffFile(path, staged = false) }.firstOrNull()
             if (diff == null || diff.hunks.isEmpty()) {
                 withContext(Dispatchers.IO) { File(path).takeIf { it.exists() }?.readText() }
             } else {
@@ -175,6 +182,8 @@ internal class ExternalChangeWatcher(
         val diskText = withContext(Dispatchers.IO) {
             if (current.exists) runCatching { file.readText() }.getOrNull() else null
         }
+        // Compose-backed document state, both of them: read on Main (this
+        // sweep's own dispatcher) and passed to the pure policy as values.
         val bufferText = buffer.content
         val verdict = ExternalChangePolicy.decide(
             known = known,

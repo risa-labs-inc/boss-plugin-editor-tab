@@ -228,10 +228,24 @@ class AiInlineEditService(
             )
     }
 
+    /**
+     * The version the session's offsets were computed against, as it stands
+     * now - or null when there is no document to ask.
+     *
+     * Mirrors exactly what [start] captured: the shared buffer's version when
+     * there is one, the viewport's own document version when there is not.
+     * Consulting only the buffer left every buffer-less viewport (an untitled
+     * document, or any viewport holding a private EditorState) with NO
+     * staleness check at all, so a Cmd+K rewrite accepted after the user had
+     * typed applied at pre-typing offsets.
+     */
+    private fun currentVersion(): Long? = buffer?.version ?: editorState?.document?.documentVersion
+
     /** The captured buffer version must still match when the user applies. */
     fun isStale(): Boolean {
         val s = _session.value ?: return true
-        return buffer?.version?.let { it != s.bufferVersion } ?: false
+        val now = currentVersion() ?: return false
+        return now != s.bufferVersion
     }
 
     /**
@@ -243,7 +257,7 @@ class AiInlineEditService(
         val s = _session.value ?: return false
         val state = editorState ?: return false
         val doc = state.document
-        if (buffer != null && buffer!!.version != s.bufferVersion) return false
+        if (isStale()) return false
         // Position math is only valid while the version held; it still does.
         val start = doc.positionToOffset(s.startLine, s.startCol)
         val end = doc.positionToOffset(s.endLine, s.endCol)
