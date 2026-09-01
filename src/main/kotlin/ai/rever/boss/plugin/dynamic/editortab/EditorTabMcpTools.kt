@@ -139,7 +139,11 @@ internal class EditorTabMcpToolProvider(
                     ?: return@McpToolHandler McpToolResult("Missing required argument: end_line", isError = true)
                 val endCol = args.int("end_col")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: end_col", isError = true)
-                val expectedVersion = args.int("expected_version")?.toLong()
+                // A double, not an int: versions are Long everywhere, and
+                // args.int returns null beyond Int range, which would surface
+                // as "Missing required argument". Doubles carry these small
+                // integers exactly.
+                val expectedVersion = args.double("expected_version")?.toLong()
                     ?: return@McpToolHandler McpToolResult("Missing required argument: expected_version", isError = true)
                 val newVersion =
                     api.applyEdit(
@@ -217,7 +221,9 @@ internal class EditorTabMcpToolProvider(
                     sL1 = sL
                     sC1 = args.int("start_col") ?: 1
                     eL1 = eL
-                    eC1 = args.int("end_col") ?: 1
+                    // End of line, like the whole-file branch below: a default
+                    // of 1 would silently drop the last line from the range.
+                    eC1 = args.int("end_col") ?: lineLength(lines, eL1)
                 } else if (target.selStartLine != null && target.selEndLine != null) {
                     sL1 = target.selStartLine!!
                     sC1 = target.selStartCol!!
@@ -344,8 +350,9 @@ internal class EditorTabMcpToolProvider(
         McpToolDefinition.withRbac(
             name = "ai_compose_accept",
             description = "Apply a composer session's proposed edits through the version-guarded editor " +
-                "buffer API (one undo step each). Accepts every pending proposal, or only those whose " +
-                "path is in the comma-separated `paths`.",
+                "buffer API (one undo step each). Accepts every pending proposal (plus any stuck " +
+                "in 'applying' from an interrupted accept), or only those whose path is in the " +
+                "comma-separated `paths`.",
             inputSchema =
                 """{"type":"object","properties":{"session_id":{"type":"string","description":"Session id from ai_compose."},"paths":{"type":"string","description":"Optional comma-separated file paths to restrict the accept to."}},"required":["session_id"]}""",
             readOnly = false,
@@ -360,7 +367,10 @@ internal class EditorTabMcpToolProvider(
                     ?: return@McpToolHandler McpToolResult("No composer session: $id", isError = true)
                 val only =
                     args.string("paths")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
-                val pending = data.proposals.filter { it.status == "pending" }
+                // "applying" is included: it is transient, set while an accept is in flight,
+                // so a proposal interrupted mid-apply (app closed) must be
+                // re-acceptable here rather than stranded.
+                val pending = data.proposals.filter { it.status == "pending" || it.status == "applying" }
                 val targets =
                     if (only == null) pending else pending.filter { it.path in only || it.path.substringAfterLast('/') in only }
                 if (targets.isEmpty()) {
@@ -394,6 +404,9 @@ internal class EditorTabMcpToolProvider(
                         live.copy(proposals = live.proposals.map { byId[it.id] ?: it })
                     },
                 )
+                // Last action on an MCP-only session: nothing left to review
+                // and no tab watching, so the session can go.
+                sessions.maybeCloseIfIdle(id)
                 val acceptedCount = targets.count { t -> updated.first { it.id == t.id }.status == "accepted" }
                 McpToolResult(
                     "Accepted $acceptedCount of ${targets.size} proposal(s) in session $id. " +
@@ -402,11 +415,13 @@ internal class EditorTabMcpToolProvider(
                 )
             },
         ),
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = "ai_compose_stop",
             description = "Stop a running composer session. Proposals recorded so far remain reviewable.",
             inputSchema =
                 """{"type":"object","properties":{"session_id":{"type":"string","description":"Session id from ai_compose."}},"required":["session_id"]}""",
+            readOnly = false,
+            requiredPermissions = listOf("ai.compose"),
             handler = McpToolHandler { args ->
                 val agent = composerAgent ?: return@McpToolHandler composerUnavailable()
                 val id = args.string("session_id")

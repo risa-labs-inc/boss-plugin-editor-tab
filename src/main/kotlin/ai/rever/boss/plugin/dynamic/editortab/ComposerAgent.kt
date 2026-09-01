@@ -101,43 +101,53 @@ class ComposerAgent(
                     messages = it.messages + ComposerMessage("user", task),
                 )
             } ?: return false
-        val job =
-            scope.launch(Dispatchers.IO) {
-                val hasTools = AiGatewayAPI.CAPABILITY_TOOLS in gateway.capabilities()
-                val result =
-                    withTimeoutOrNull(20 * 60_000 + 10_000) {
-                        gateway.runAgent(
-                            AiRequest(
-                                system = SYSTEM_PROMPT,
-                                messages = listOf(AiMessage.user(promptFor(task, started.selection))),
-                                timeoutMs = 90_000,
-                            ),
-                            tools = if (hasTools) TOOL_SPECS else emptyList(),
-                            budget = AiBudget(maxSteps = 24, timeoutMs = 20 * 60_000),
-                        ) { call ->
-                            executeTool(sessionId, call)
+        // The run is inserted into its slot by the launch itself: compute holds the
+        // map cell while the entry appears, so a run that finishes
+        // immediately removes the very entry it created. The old
+        // launch-then-assign ordering could leave a dead job in the slot -
+        // the finish removed nothing (the assignment had not happened yet)
+        // and the late assignment then re-inserted it.
+        var launched: Job? = null
+        runs.compute(sessionId) { _, current ->
+            if (current?.isActive == true) {
+                current
+            } else {
+                scope.launch(Dispatchers.IO) {
+                    val hasTools = AiGatewayAPI.CAPABILITY_TOOLS in gateway.capabilities()
+                    val result =
+                        withTimeoutOrNull(20 * 60_000 + 10_000) {
+                            gateway.runAgent(
+                                AiRequest(
+                                    system = SYSTEM_PROMPT,
+                                    messages = listOf(AiMessage.user(promptFor(task, started.selection))),
+                                    timeoutMs = 90_000,
+                                ),
+                                tools = if (hasTools) TOOL_SPECS else emptyList(),
+                                budget = AiBudget(maxSteps = 24, timeoutMs = 20 * 60_000),
+                            ) { call ->
+                                executeTool(sessionId, call)
+                            }
                         }
-                    }
-                runs.remove(sessionId)
-                result
-                    ?.fold(
-                        onSuccess = { r ->
-                            val msg =
-                                r.text.ifBlank {
-                                    "The agent stopped before answering (${r.stopReason.name.lowercase()})."
-                                }
-                            val stopNote =
-                                if (r.stopReason == AiStopReason.COMPLETED) ""
-                                else " [stopped: ${r.stopReason.name.lowercase()}]"
-                            finish(sessionId, msg + stopNote, "done", "")
-                        },
-                        onFailure = { e ->
-                            finish(sessionId, e.message ?: "The AI request failed.", "error", e.message ?: "failed")
-                        },
-                    ) ?: finish(sessionId, "The AI request timed out.", "error", "timeout")
+                    result
+                        ?.fold(
+                            onSuccess = { r ->
+                                val msg =
+                                    r.text.ifBlank {
+                                        "The agent stopped before answering (${r.stopReason.name.lowercase()})."
+                                    }
+                                val stopNote =
+                                    if (r.stopReason == AiStopReason.COMPLETED) ""
+                                    else " [stopped: ${r.stopReason.name.lowercase()}]"
+                                finish(sessionId, msg + stopNote, "done", "")
+                            },
+                            onFailure = { e ->
+                                finish(sessionId, e.message ?: "The AI request failed.", "error", e.message ?: "failed")
+                            },
+                        ) ?: finish(sessionId, "The AI request timed out.", "error", "timeout")
+                }.also { launched = it }
             }
-        runs[sessionId] = job
-        return true
+        }
+        return launched != null
     }
 
     /**
@@ -171,14 +181,26 @@ class ComposerAgent(
         sessions.update(sessionId) {
             if (it.status == "running") it.copy(status = "stopped", statusMessage = "Stopped.") else it
         }
+        // A stop with no tab left open and nothing pending to review is the
+        // end of the session.
+        sessions.maybeCloseIfIdle(sessionId)
     }
 
+    /**
+     * Finish a run. Also drops the run's slot when it is still the one that
+     * just ended: removing it unconditionally would evict a NEWER run that
+     * started in the gap, and keeping a dead job there is what the old
+     * remove-before-insert ordering leaked.
+     */
     private fun finish(
         sessionId: String,
         text: String,
         status: String,
         statusMessage: String,
     ) {
+        if (runs[sessionId] != null && runs[sessionId]?.isActive == false) {
+            runs.remove(sessionId)
+        }
         sessions.update(sessionId) {
             it.copy(
                 status = status,
@@ -186,6 +208,9 @@ class ComposerAgent(
                 messages = it.messages + ComposerMessage("assistant", text),
             )
         }
+        // The run is over: if no tab still shows the session and nothing is
+        // left to accept, it can go (MCP-only runs have no tab at all).
+        sessions.maybeCloseIfIdle(sessionId)
     }
 
     /** Execute one tool call locally; errors are fed back to the model, not thrown. */

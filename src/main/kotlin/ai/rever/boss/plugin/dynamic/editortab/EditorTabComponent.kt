@@ -253,17 +253,21 @@ class EditorTabComponent(
     private var isLargeFile: Boolean = false
     private var fileSizeBytes: Long = 0L
 
-    // What the tab believes is on disk, as of the last load, save or accepted reload. The
-    // snapshot is what a poll compares against; the content is what separates a real rewrite
-    // from a bare mtime bump (touch, a formatter with nothing to reformat, our own save seen
-    // a moment late), which must not prompt anybody.
-    private var diskBaseline: DiskSnapshot = DiskSnapshot.MISSING
-    private var originalContent: String = ""
+    // The shared buffer this viewport holds a reference on (null: untitled
+    // document, a file that failed to load, or a large-file preview - the
+    // preview is a truncation, not the file, so it must not be registered).
+    // Acquired in init, released in onDestroy: a pair no composable early
+    // return can break. The old version acquired in a `remember` after two
+    // early returns while still releasing unconditionally, so a tab that
+    // failed to load over-released a sibling tab's live buffer.
+    private var buffer: EditorBuffer? = null
+        private set
 
-    // Mutated from the UI thread only: loadFileContent runs in init before anything composes,
-    // and every later accept() happens in the watcher or in persistDocument after their IO
-    // has already come back to Main. Keep it that way - it is a plain, unsynchronized object.
-    private val changeDetector = ExternalChangeDetector(DiskSnapshot.MISSING)
+    // The file as this tab last saw it, for the large-file poll alone. Normal
+    // files baseline on the buffer's knownSignature (owned by the
+    // plugin-wide watcher); large files have no buffer, so the poll keeps its
+    // own snapshot.
+    private var largeFileBaseline: DiskSnapshot = DiskSnapshot.MISSING
 
     // Language detection
     private val language: String = detectLanguage(filePath)
@@ -278,10 +282,10 @@ class EditorTabComponent(
                     coroutineScope.cancel()
                     // Drop this viewport's reference on the shared buffer; the
                     // registry removes the buffer only when the last viewport
-                    // goes.
-                    if (filePath.isNotEmpty()) {
-                        EditorBufferRegistry.release(filePath)
-                    }
+                    // goes. Only when we actually acquired one - a failed load
+                    // or a large-file preview did not, and releasing without
+                    // having acquired would drop a sibling tab's live buffer.
+                    buffer?.let { EditorBufferRegistry.release(it.path) }
                 }
             }
         )
@@ -289,6 +293,15 @@ class EditorTabComponent(
         // Load file content synchronously during init
         if (filePath.isNotEmpty()) {
             loadFileContent()
+            // Acquired here, not in the composable: loadFileContent can leave a
+            // loadError (missing file), and the composable returns early on it -
+            // an acquire after those returns could never pair with the release
+            // above. Large files keep a private EditorState (their buffer would
+            // hold a truncated preview that buffer tools would present as the
+            // live content).
+            if (loadError == null && !isLargeFile) {
+                buffer = EditorBufferRegistry.acquire(filePath, initialContent, language)
+            }
         } else {
             initialContent = "// New file\n// Start typing...\n"
         }
@@ -307,7 +320,11 @@ class EditorTabComponent(
             // otherwise be adopted as our baseline while we hold the pre-write content, and
             // the tab would sit stale forever. This way round the next poll simply sees a
             // difference, re-reads, and finds the content already matches.
-            adoptDiskState(snapshotFile())
+            //
+            // The baseline is the buffer's knownSignature for normal files (the
+            // plugin-wide watcher owns it from here); largeFileBaseline is for
+            // the large-file preview's own poll, since it has no buffer.
+            largeFileBaseline = snapshotFile()
 
             // Check if this is a large file (>10MB)
             if (LargeFileDocument.shouldUseLargeFileAdapter(file)) {
@@ -319,20 +336,18 @@ class EditorTabComponent(
                     file.readText()
                 } else {
                     file.inputStream().bufferedReader().use { reader ->
-                        val buffer = CharArray(previewSize.toInt())
-                        val read = reader.read(buffer)
-                        if (read > 0) String(buffer, 0, read) + "\n\n// ... [File truncated - ${formatSize(fileSizeBytes)} total] ..."
+                        val chars = CharArray(previewSize.toInt())
+                        val read = reader.read(chars)
+                        if (read > 0) String(chars, 0, read) + "\n\n// ... [File truncated - ${formatSize(fileSizeBytes)} total] ..."
                         else ""
                     }
                 }
-                originalContent = initialContent
                 loadError = null
                 return
             }
 
             isLargeFile = false
             initialContent = file.readText()
-            originalContent = initialContent
             loadError = null
         } catch (e: Exception) {
             loadError = "Error loading file: ${e.message}"
@@ -344,8 +359,9 @@ class EditorTabComponent(
      * Writes [content] and returns the snapshot of what is now on disk, or null if the write
      * failed.
      *
-     * The caller re-baselines with that snapshot rather than this doing it, so every mutation
-     * of [changeDetector] happens on the UI thread even though the write itself runs on IO.
+     * Re-baselining the buffer is done here through noteWrittenByUs() rather than by the
+     * caller: every save on this file (editor tab, diff tab, MCP tool) is invisible to the
+     * watcher the same way.
      */
     private fun saveFile(content: String): DiskSnapshot? {
         if (filePath.isEmpty()) return null
@@ -380,14 +396,8 @@ class EditorTabComponent(
             // A stat that throws (permissions, a filesystem going away) is not evidence the
             // file was deleted, so report no news rather than inventing a deletion.
             System.err.println("[EditorTabComponent] Error checking file '$filePath': ${e.message}")
-            diskBaseline
+            largeFileBaseline
         }
-    }
-
-    /** Records [snapshot] as ours, so the watcher stops treating it as news. */
-    private fun adoptDiskState(snapshot: DiskSnapshot) {
-        diskBaseline = snapshot
-        changeDetector.accept(snapshot)
     }
 
     /** The file's current bytes, or null if it is gone or unreadable. */
@@ -400,23 +410,6 @@ class EditorTabComponent(
         } catch (e: Exception) {
             System.err.println("[EditorTabComponent] Error reading file '$filePath': ${e.message}")
             null
-        }
-    }
-
-    /**
-     * Whether the file's *content* has moved off what we last loaded or wrote.
-     *
-     * Used to stop a save - an auto save debounce especially - from silently overwriting
-     * something another program just wrote. Content-based rather than snapshot-based on
-     * purpose: an mtime that moved while the bytes stayed the same is no reason to block a save.
-     */
-    private suspend fun hasExternalChanges(): Boolean {
-        if (filePath.isEmpty()) return false
-
-        return withContext(Dispatchers.IO) {
-            if (snapshotFile() == diskBaseline) return@withContext false
-            val diskContent = readDiskText() ?: return@withContext false
-            diskContent != originalContent
         }
     }
 
@@ -492,14 +485,10 @@ class EditorTabComponent(
         // Create editor state. Files with a path share ONE buffer per path across
         // tabs and splits (decision D3): the registry hands every viewport the
         // same EditorState, so edits in one are instantly visible in the
-        // others. Untitled documents keep a private state.
-        val editorBuffer = remember(filePath) {
-            if (filePath.isNotEmpty()) {
-                EditorBufferRegistry.acquire(filePath, initialContent, language)
-            } else {
-                null
-            }
-        }
+        // others. The reference was taken in init - see [buffer]; this tab
+        // holds it until onDestroy. Untitled documents and large-file
+        // previews have no buffer and keep a private state.
+        val editorBuffer = buffer
         val editorState =
             editorBuffer?.editorState ?: remember(filePath) {
                 EditorState(initialContent, null)
@@ -783,43 +772,46 @@ class EditorTabComponent(
         }
 
         // --- Following the file on disk -------------------------------------------------
-
-        val externalReloadEnabled by externalReloadSettingsManager.enabled.collectAsState()
-
-        // Set when the file changed under a tab that has unsaved edits: what is on disk now,
-        // held until the user says which version wins.
-        var diskConflict by remember { mutableStateOf<DiskConflict?>(null) }
-
-        // Sticky line for the status bar, for the cases there is nothing to swap in: the file
-        // was deleted, or it is a large file whose buffer is only a truncated preview.
+        //
+        // Normal files have exactly one owner: the plugin-wide
+        // [ExternalChangeWatcher] (installed in EditorTabDynamicPlugin), which
+        // walks the buffer registry - so the diff tab's editable pane is
+        // covered too, and the RELOAD verdict honors the user's "reload
+        // externally changed files" setting. There used to be a per-tab poll
+        // here running alongside the watcher: two decision surfaces for one
+        // event, two baselines (the watcher's reloads never updated this one),
+        // and two stat loops per file.
+        //
+        // Large files are the exception: their document is a truncated
+        // preview, not a registered buffer, so the watcher never sees them.
+        // This poll is their only owner - and since the preview cannot hold
+        // the file, it can only tell the user, never reload.
         var diskNotice by remember { mutableStateOf<String?>(null) }
 
-        // Swaps disk content into the buffer without losing the reader's place. setText resets
-        // the caret to 0,0 and clears undo, so position is captured first and put back after -
-        // a `git checkout` under a file you were reading should not scroll you to the top of it.
-        fun applyReload(text: String, snapshot: DiskSnapshot) {
-            val caret = editorState.caretPosition.value
-            val scroll = editorState.scrollOffset.value
+        val windowFocused = LocalWindowInfo.current.isWindowFocused
+        LaunchedEffect(filePath, windowFocused) {
+            if (!isLargeFile || filePath.isEmpty()) return@LaunchedEffect
 
-            editorState.setText(text)
-            // moveCaret clamps into the new document itself; the scroll offset does not, so a
-            // file that got shorter would otherwise leave the viewport past its last line.
-            editorState.moveCaret(caret)
-            val maxScrollY = ((editorState.document.lineCount - 1) * lineHeightPx)
-                .coerceAtLeast(0f)
-                .toInt()
-            editorState.setScrollOffset(ScrollOffset(scroll.x, scroll.y.coerceIn(0, maxScrollY)))
+            val quietInterval =
+                if (windowFocused) DISK_POLL_INTERVAL_MILLIS else DISK_BACKGROUND_POLL_INTERVAL_MILLIS
+            var baseline = largeFileBaseline
 
-            initialContent = text
-            originalContent = text
-            adoptDiskState(snapshot)
-            contentVersion++
-            diskNotice = null
-
-            if (isMarkdown) markdownText = text
-            // SearchManager holds offsets into the text that just went away.
-            searchMatches = emptyList()
-            currentSearchMatchIndex = -1
+            while (isActive) {
+                delay(quietInterval)
+                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
+                if (snapshot == baseline) continue
+                baseline = snapshot
+                largeFileBaseline = snapshot
+                diskNotice =
+                    if (snapshot.exists) {
+                        "changed on disk - reopen to refresh"
+                    } else {
+                        // Deliberately no emptying of the buffer: the text on screen may be
+                        // the only copy left. saveFile recreates parent directories, so
+                        // Cmd+S puts it back.
+                        "deleted on disk"
+                    }
+            }
         }
 
         // One save path for both Cmd+S and auto save, so they cannot drift on what counts as
@@ -836,23 +828,28 @@ class EditorTabComponent(
             // Not gated on the reload setting. That setting is about whether the tab follows
             // the file; this is about not destroying someone else's work on the way out, which
             // is worth asking about however the tab is configured.
-            if (hasExternalChanges()) {
-                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
-                val text = withContext(Dispatchers.IO) { readDiskText() }
-                if (text != null) {
-                    diskConflict = DiskConflict(text, snapshot)
-                    return
+            //
+            // Asked of the BUFFER's baseline, not a tab-private copy: the watcher owns
+            // external changes and re-baselines it after every verdict, so a save right
+            // after a watcher reload cannot re-report the same change. A real conflict is
+            // surfaced through the same bar the watcher uses - one decision surface, not a
+            // second dialog.
+            buffer?.let { b ->
+                val current = withContext(Dispatchers.IO) { signatureOf(File(filePath)) }
+                if (current != b.knownSignature && current.exists) {
+                    val diskText = withContext(Dispatchers.IO) { readDiskText() }
+                    if (diskText != null && diskText != editorState.document.getText()) {
+                        b.setExternalState(ExternalState.CONFLICT)
+                        return
+                    }
                 }
             }
 
             isSaving = true
             saveError = null
             val content = editorState.document.getText()
-            val snapshot = withContext(Dispatchers.IO) { saveFile(content) }
-            if (snapshot != null) {
+            if (withContext(Dispatchers.IO) { saveFile(content) } != null) {
                 editorState.markAsSaved()
-                originalContent = content
-                adoptDiskState(snapshot)
             } else {
                 saveError = "Failed to save file"
             }
@@ -866,74 +863,6 @@ class EditorTabComponent(
             if (!autoSaveEnabled) return@LaunchedEffect
             delay(AUTO_SAVE_DEBOUNCE_MILLIS)
             persistDocument()
-        }
-
-        // Watch the file for writes from anywhere else: vim, a formatter, git, an AI CLI in a
-        // BossTerm split, or BOSS's own editor_write_file MCP tool.
-        //
-        // Keyed on window focus, which does two jobs. The effect restarts when focus returns,
-        // and its first act is a check - so alt-tabbing back from an external editor shows
-        // fresh content at once. And it backs the poll off to a crawl while BOSS is in the
-        // background, since anything that happens there is caught by that check on the way
-        // back. What is left is one stat per second per open tab while you are looking at BOSS.
-        val windowFocused = LocalWindowInfo.current.isWindowFocused
-        LaunchedEffect(filePath, externalReloadEnabled, windowFocused, editorState) {
-            if (filePath.isEmpty() || !externalReloadEnabled) return@LaunchedEffect
-
-            val quietInterval =
-                if (windowFocused) DISK_POLL_INTERVAL_MILLIS else DISK_BACKGROUND_POLL_INTERVAL_MILLIS
-
-            // Returns how long to wait before looking again: a short beat while something is
-            // still moving, the quiet interval once things have stopped.
-            suspend fun checkDisk(): Long {
-                // A conflict is already on screen and the answer is the user's to give. Do not
-                // observe while it is open, so the baseline is still the pre-change one when
-                // they answer - whichever way they answer re-baselines it.
-                if (diskConflict != null) return quietInterval
-
-                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
-                when (changeDetector.observe(snapshot)) {
-                    DiskState.UNCHANGED -> return quietInterval
-                    DiskState.SETTLING -> return DISK_SETTLE_INTERVAL_MILLIS
-
-                    DiskState.DELETED -> {
-                        // Deliberately no reload and no emptying of the buffer: the text on
-                        // screen may be the only copy left. saveFile recreates parent
-                        // directories, so Cmd+S puts it back.
-                        diskNotice = "deleted on disk"
-                        return quietInterval
-                    }
-
-                    DiskState.CHANGED -> {
-                        diskNotice = null
-
-                        if (isLargeFile) {
-                            // The buffer holds a truncated preview rather than the file, so
-                            // swapping in a fresh truncation would just be a newer lie.
-                            diskNotice = "changed on disk - reopen to refresh"
-                            adoptDiskState(snapshot)
-                            return quietInterval
-                        }
-
-                        val text = withContext(Dispatchers.IO) { readDiskText() }
-                            ?: return DISK_SETTLE_INTERVAL_MILLIS
-
-                        when (reloadAction(text, editorState.document.getText(), editorState.isModified.value)) {
-                            ReloadAction.NONE -> {
-                                originalContent = text
-                                adoptDiskState(snapshot)
-                            }
-                            ReloadAction.RELOAD -> applyReload(text, snapshot)
-                            ReloadAction.PROMPT -> diskConflict = DiskConflict(text, snapshot)
-                        }
-                        return quietInterval
-                    }
-                }
-            }
-
-            while (isActive) {
-                delay(checkDisk())
-            }
         }
 
         // Helper function to perform search and update state
@@ -985,23 +914,50 @@ class EditorTabComponent(
                 }
                 .onKeyEvent { event ->
                     if (event.type == KeyEventType.KeyDown) {
+                        // Cmd+F / Ctrl+F style: the find and go-to-line
+                        // shortcuts follow the host convention on every
+                        // platform. The Mac EDITING shortcuts (line delete,
+                        // line jump) are Cmd-only: on Windows/Linux the
+                        // Ctrl+arrow and Ctrl+Backspace keys keep their
+                        // native word-wise behaviour in the editor.
                         val isMeta = event.isMetaPressed || event.isCtrlPressed
+                        val isCmd = event.isMetaPressed
                         when {
                             // Platform text-editing shortcuts the bundled
                             // editor does not implement. Skipped when there is
                             // a selection, where the editor's own Backspace
-                            // (delete the selection) is already correct.
-                            !isLargeFile && !editorState.hasSelection &&
-                                editingShortcutRange(event, isMeta, editorState) != null -> {
-                                val range = editingShortcutRange(event, isMeta, editorState)!!
-                                editorState.document.replace(range.first, range.last + 1, "")
-                                true
+                            // (delete the selection) is already correct. Each
+                            // helper is evaluated ONCE: both copy the whole
+                            // document, and the old guard-then-!! pattern
+                            // paid that twice per key.
+                            !isLargeFile && !editorState.hasSelection -> {
+                                val range = editingShortcutRange(event, isCmd, editorState)
+                                if (range != null) {
+                                    editorState.document.replace(range.first, range.last + 1, "")
+                                    true
+                                } else {
+                                    val target = caretShortcutTarget(event, isCmd, editorState)
+                                    if (target != null) {
+                                        editorState.moveCaret(editorState.document.offsetToPosition(target))
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
                             }
 
-                            !isLargeFile && caretShortcutTarget(event, isMeta, editorState) != null -> {
-                                val target = caretShortcutTarget(event, isMeta, editorState)!!
-                                editorState.moveCaret(editorState.document.offsetToPosition(target))
-                                true
+                            !isLargeFile -> {
+                                // Selection present: only the caret-movement
+                                // variants apply (the editing shortcuts
+                                // above yield to the editor's selection
+                                // delete).
+                                val target = caretShortcutTarget(event, isCmd, editorState)
+                                if (target != null) {
+                                    editorState.moveCaret(editorState.document.offsetToPosition(target))
+                                    true
+                                } else {
+                                    false
+                                }
                             }
 
                             // Cmd+F or Ctrl+F: Show find
@@ -1109,9 +1065,10 @@ class EditorTabComponent(
                 ExternalChangeBar(
                     buffer = editorBuffer,
                     onReload = {
+                        // Re-baselines the buffer's own signature; the tab keeps no
+                        // copy anymore, so there is nothing else to update.
                         ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
-                        originalContent = editorState.document.getText()
-                        adoptDiskState(snapshotFile())
+                        diskNotice = null
                     },
                     onKeepMine = {
                         ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
@@ -1729,26 +1686,6 @@ class EditorTabComponent(
                 }
             }  // End Row
 
-            // Sits out here rather than inside the editor Box: a Markdown tab in Preview mode
-            // composes no editor at all, and that tab still has a buffer worth protecting.
-            diskConflict?.let { conflict ->
-                FileChangedOnDiskDialog(
-                    fileName = filePath.substringAfterLast('/').ifEmpty { "This file" },
-                    onReload = {
-                        applyReload(conflict.content, conflict.snapshot)
-                        diskConflict = null
-                    },
-                    onKeepMine = {
-                        // Adopt the disk state without adopting the disk content: the buffer
-                        // stays dirty and wins the next save, and we stop asking about a
-                        // change the user has already answered for.
-                        originalContent = conflict.content
-                        adoptDiskState(conflict.snapshot)
-                        diskConflict = null
-                    }
-                )
-            }
-
             // Status bar (matches bundled editor)
             EditorStatusBar(
                 filePath = filePath,
@@ -1858,59 +1795,6 @@ class EditorTabComponent(
 
         /** Lexer for [language], or null for plain text. See [LanguageDetection]. */
         internal fun getLexerForLanguage(language: String): BaseLexer? = LanguageDetection.lexerFor(language)
-    }
-}
-
-/** A settled external change waiting on the user, because taking it would lose their edits. */
-private data class DiskConflict(val content: String, val snapshot: DiskSnapshot)
-
-/**
- * Asked only when both versions are real: unsaved edits in the tab, and a different file on
- * disk. There is no safe default between the two, so there is no dismiss-to-nowhere either -
- * clicking outside means "keep mine", which is the choice that destroys nothing.
- */
-@Composable
-private fun FileChangedOnDiskDialog(
-    fileName: String,
-    onReload: () -> Unit,
-    onKeepMine: () -> Unit
-) {
-    val colors = LocalEditorTheme.current.colors
-
-    Dialog(
-        onDismissRequest = onKeepMine,
-        properties = DialogProperties(dismissOnClickOutside = true, dismissOnBackPress = true)
-    ) {
-        Column(
-            modifier = Modifier
-                .width(420.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(colors.background)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Text(
-                text = "$fileName changed on disk",
-                color = colors.text,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = "Something else wrote to this file while you had unsaved changes here. " +
-                    "Reloading takes the version on disk and discards yours. Keeping yours " +
-                    "leaves the tab as it is, and saving again overwrites the file.",
-                color = colors.lineNumber,
-                fontSize = 13.sp
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                DialogAction(label = "Keep my version", primary = false, onClick = onKeepMine)
-                DialogAction(label = "Reload from disk", primary = true, onClick = onReload)
-            }
-        }
     }
 }
 
@@ -2213,10 +2097,19 @@ object PluginEditorSettings {
 
     private var lastModified: Long = settingsFile.lastModified()
 
-    init {
-        // Start file watcher in background
-        kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            while (true) {
+    private var watcherJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * The 500ms file poll, on a scope the plugin owns.
+     *
+     * It used to run on GlobalScope, where nothing could ever cancel it - the
+     * loop held this plugin's classloader for the life of the JVM after
+     * unload. The plugin starts it in register() and stops it in dispose().
+     */
+    fun start(scope: kotlinx.coroutines.CoroutineScope) {
+        watcherJob?.cancel()
+        watcherJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            while (isActive) {
                 kotlinx.coroutines.delay(500) // Check every 500ms
                 try {
                     val currentModified = settingsFile.lastModified()
@@ -2230,6 +2123,11 @@ object PluginEditorSettings {
                 }
             }
         }
+    }
+
+    fun stop() {
+        watcherJob?.cancel()
+        watcherJob = null
     }
 
     private fun loadFromFile(): PluginEditorSettingsData {
@@ -3109,37 +3007,54 @@ private fun GutterRunIcon(
  * ⌘⌫ / ⌘⌦ act on the line, ⌥⌫ / ⌥⌦ on the word. Returning null for a no-op
  * (caret already at the boundary) matters: an empty edit would still cost an
  * undo step.
+ *
+ * The key/modifier is checked BEFORE copying the document: these run on
+ * every key press, and the copy is the expensive part.
  */
 private fun editingShortcutRange(
     event: androidx.compose.ui.input.key.KeyEvent,
-    isMeta: Boolean,
+    isCmd: Boolean,
     state: EditorState,
 ): IntRange? {
+    val isDeleteKey = event.key == Key.Backspace || event.key == Key.Delete
+    if (!(isCmd && isDeleteKey) && !event.isAltPressed) return null
     val text = state.document.getText()
     val caret = state.caretOffset
     return when {
-        isMeta && event.key == Key.Backspace -> MacEditingShortcuts.deleteToLineStart(text, caret)
-        isMeta && event.key == Key.Delete -> MacEditingShortcuts.deleteToLineEnd(text, caret)
+        isCmd && event.key == Key.Backspace -> MacEditingShortcuts.deleteToLineStart(text, caret)
+        isCmd && event.key == Key.Delete -> MacEditingShortcuts.deleteToLineEnd(text, caret)
         event.isAltPressed && event.key == Key.Backspace -> MacEditingShortcuts.deletePreviousWord(text, caret)
         event.isAltPressed && event.key == Key.Delete -> MacEditingShortcuts.deleteNextWord(text, caret)
         else -> null
     }
 }
 
-/** The offset a caret-movement shortcut targets, or null when not one. */
+/**
+ * The offset a caret-movement shortcut targets, or null when not one.
+ *
+ * Like [editingShortcutRange], the key is checked before the document copy.
+ */
 private fun caretShortcutTarget(
     event: androidx.compose.ui.input.key.KeyEvent,
-    isMeta: Boolean,
+    isCmd: Boolean,
     state: EditorState,
 ): Int? {
     if (event.isShiftPressed) return null // selection variants stay with the editor
+    val isDirection =
+        event.key in setOf(
+            Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown,
+        )
+    val isAltHorizontal =
+        event.isAltPressed &&
+            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight)
+    if (!(isCmd && isDirection) && !isAltHorizontal) return null
     val text = state.document.getText()
     val caret = state.caretOffset
     return when {
-        isMeta && event.key == Key.DirectionLeft -> MacEditingShortcuts.lineStart(text, caret)
-        isMeta && event.key == Key.DirectionRight -> MacEditingShortcuts.lineEnd(text, caret)
-        isMeta && event.key == Key.DirectionUp -> 0
-        isMeta && event.key == Key.DirectionDown -> text.length
+        isCmd && event.key == Key.DirectionLeft -> MacEditingShortcuts.lineStart(text, caret)
+        isCmd && event.key == Key.DirectionRight -> MacEditingShortcuts.lineEnd(text, caret)
+        isCmd && event.key == Key.DirectionUp -> 0
+        isCmd && event.key == Key.DirectionDown -> text.length
         event.isAltPressed && event.key == Key.DirectionLeft -> MacEditingShortcuts.previousWordStart(text, caret)
         event.isAltPressed && event.key == Key.DirectionRight -> MacEditingShortcuts.nextWordEnd(text, caret)
         else -> null

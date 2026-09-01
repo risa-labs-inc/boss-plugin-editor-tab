@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -71,11 +72,19 @@ object AiCompletionSettings {
     val settings: StateFlow<AiCompletionSettingsData> = _settings
 
     private var lastModified: Long = settingsFile.lastModified()
+    private var watcherJob: Job? = null
 
-    init {
-        @Suppress("OPT_IN_USAGE")
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
-            while (true) {
+    /**
+     * The 500ms file poll, on a scope the plugin owns.
+     *
+     * It used to run on GlobalScope, where nothing could ever cancel it - the
+     * loop held this plugin's classloader for the life of the JVM after
+     * unload. The plugin starts it in register() and stops it in dispose().
+     */
+    fun start(scope: CoroutineScope) {
+        watcherJob?.cancel()
+        watcherJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
                 delay(500)
                 try {
                     val currentModified = settingsFile.lastModified()
@@ -88,6 +97,11 @@ object AiCompletionSettings {
                 }
             }
         }
+    }
+
+    fun stop() {
+        watcherJob?.cancel()
+        watcherJob = null
     }
 
     private fun loadFromFile(): AiCompletionSettingsData {

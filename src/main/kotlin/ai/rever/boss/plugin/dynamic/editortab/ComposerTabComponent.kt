@@ -110,6 +110,10 @@ class ComposerTabComponent(
             callbacks = object : Lifecycle.Callbacks {
                 override fun onDestroy() {
                     coroutineScope.cancel()
+                    // Pair for the open() in the session's init. The session
+                    // itself may keep living (a run in flight, or proposals
+                    // still pending) - that is [ComposerSessions] to decide.
+                    sessions?.detach(sessionId)
                 }
             },
         )
@@ -160,20 +164,28 @@ class ComposerTabComponent(
         val api = agent?.editorApi ?: return
         coroutineScope.launch {
             markProposal(proposal, "applying", "")
-            val result =
-                api.applyEdit(
-                    path = proposal.path,
-                    startLine = proposal.startLine,
-                    startCol = proposal.startCol,
-                    endLine = proposal.endLine,
-                    endCol = proposal.endCol,
-                    newText = proposal.newText,
-                    expectedVersion = proposal.expectedVersion,
-                )
-            if (result.applied) {
-                markProposal(proposal, "accepted", "applied (buffer version ${result.newVersion})")
-            } else {
-                markProposal(proposal, "failed", result.reason ?: "not applied")
+            try {
+                val result =
+                    api.applyEdit(
+                        path = proposal.path,
+                        startLine = proposal.startLine,
+                        startCol = proposal.startCol,
+                        endLine = proposal.endLine,
+                        endCol = proposal.endCol,
+                        newText = proposal.newText,
+                        expectedVersion = proposal.expectedVersion,
+                    )
+                if (result.applied) {
+                    markProposal(proposal, "accepted", "applied (buffer version ${result.newVersion})")
+                } else {
+                    markProposal(proposal, "failed", result.reason ?: "not applied")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // The tab closed (or the scope was cancelled) while the apply
+                // was in flight: nothing was marked applied, so the proposal
+                // goes back to retryable instead of stranding in "applying".
+                markProposal(proposal, "pending", "interrupted - try again")
+                throw e
             }
         }
     }

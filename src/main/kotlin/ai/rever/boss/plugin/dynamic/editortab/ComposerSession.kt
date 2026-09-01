@@ -1,6 +1,5 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
-import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -94,6 +93,19 @@ class ComposerSessionStore(
                 json.decodeFromString<ComposerSessionData>(it)
             }
         }.getOrNull()
+            // "applying" is transient - it only exists while acceptProposal's
+            // applyEdit call is in flight. If we are loading it from storage,
+            // that apply did not complete (the app closed, the tab was
+            // disposed mid-flight), so the proposal becomes retryable again
+            // instead of stranding: neither the UI's accept button nor
+            // ai_compose_accept will ever take an "applying" proposal.
+            ?.let { data ->
+                data.copy(
+                    proposals = data.proposals.map { p ->
+                        if (p.status == "applying") p.copy(status = "pending", statusMessage = "") else p
+                    },
+                )
+            }
 
     suspend fun save(session: ComposerSessionData) {
         runCatching {

@@ -30,7 +30,7 @@ import kotlinx.coroutines.cancel
 class EditorTabDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.editortab"
     override val displayName: String = "Code Editor Tab"
-    override val version: String = "1.6.0"
+    override val version: String = readManifestVersion()
     override val description: String = "Code editor tab with syntax highlighting, code folding, and run gutter icons"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-editor-tab"
@@ -147,7 +147,14 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         val watcherScope = pluginScope ?: CoroutineScope(SupervisorJob() + Dispatchers.Main).also {
             pluginScope = it
         }
-        ExternalChangeWatcher.install(watcherScope) { context.gitDataProvider }
+        ExternalChangeWatcher.install(watcherScope, { context.gitDataProvider }) {
+            externalReloadSettingsManager?.enabled?.value ?: true
+        }
+        // The two settings file-polls used to run on GlobalScope, where nothing
+        // could cancel them (they held this classloader alive after unload).
+        // Run them on the plugin scope instead, stopped in dispose().
+        AiCompletionSettings.start(watcherScope)
+        PluginEditorSettings.start(watcherScope)
 
         // Warm up the bundled PSI stack off the UI thread. The host did this at
         // startup while BossEditor was on its classpath; the plugin owns it now.
@@ -168,6 +175,10 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         composerSessions?.flushAll()
         composerSessions = null
         ExternalChangeWatcher.uninstall()
+        // Stop the settings file-polls explicitly; scope cancellation below
+        // is a backstop, not the mechanism.
+        AiCompletionSettings.stop()
+        PluginEditorSettings.stop()
         pluginScope?.cancel()
         pluginScope = null
 
@@ -188,5 +199,28 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         runCatching { ProjectIndexer.shutdownGlobal() }
         runCatching { PSIBootstrap.shutdown() }
         runCatching { PSIThreadBridge.shutdown() }
+    }
+
+    private companion object {
+        const val FALLBACK_VERSION = "0.0.0"
+
+        /**
+         * The version from the packaged plugin.json, so build.gradle.kts
+         * (via processResources) stays the single source of truth. This
+         * string was hand-maintained here and had already drifted once.
+         */
+        private fun readManifestVersion(): String {
+            val stream =
+                EditorTabDynamicPlugin::class.java.classLoader
+                    ?.getResourceAsStream("META-INF/boss-plugin/plugin.json")
+                    ?: return FALLBACK_VERSION
+            return stream.use { input ->
+                Regex(""""version"\s*:\s*"([^"]+)\"""")
+                    .find(input.readBytes().decodeToString())
+                    ?.groupValues
+                    ?.get(1)
+                    ?: FALLBACK_VERSION
+            }
+        }
     }
 }

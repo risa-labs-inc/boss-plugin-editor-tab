@@ -200,8 +200,13 @@ class AiInlineEditService(
                     } catch (e: Exception) {
                         emptyList()
                     }
+                // The session as it is NOW, not the one captured at submit: the prompt
+                // can be edited while the stream runs, and setPrompt keeps
+                // the live value - the submit-time copy would drop those
+                // edits on accept. (Also safe after cancel(): it nulls the
+                // session, and the elvis simply keeps it null.)
                 _session.value =
-                    s.copy(
+                    _session.value?.copy(
                         busy = false,
                         streaming = "",
                         done = true,

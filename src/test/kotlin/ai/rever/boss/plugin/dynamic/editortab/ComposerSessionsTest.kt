@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
@@ -17,6 +18,8 @@ import kotlinx.serialization.json.Json
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -94,6 +97,79 @@ class ComposerSessionsTest {
         try {
             assertNull(sessions.update("nope") { it.copy(status = "running") })
             assertNull(sessions.snapshot("nope"))
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `an idle session with no tab open is forgotten, stored copy included`() = runBlocking {
+        val storage = FakeStorage()
+        val (sessions, scope) = sessions(storage)
+        try {
+            sessions.put(ComposerSessionData("s10", task = "t", title = "t", status = "done"))
+            withTimeout(2_000) { while (!storage.contains("composer-session-s10")) delay(10) }
+
+            // The MCP-only flow: the run finished, no tab ever showed it,
+            // nothing is left to accept.
+            sessions.maybeCloseIfIdle("s10")
+
+            assertNull(sessions.snapshot("s10"))
+            withTimeout(2_000) { while (storage.contains("composer-session-s10")) delay(10) }
+            assertFalse(storage.contains("composer-session-s10"))
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `a running session survives its tab going away`() = runBlocking {
+        val (sessions, scope) = sessions()
+        try {
+            sessions.put(ComposerSessionData("s11", task = "t", title = "t", status = "running"))
+            sessions.open("s11")
+            sessions.detach("s11")
+
+            // The run outlives the view - the design point of this class.
+            assertEquals("running", sessions.snapshot("s11")!!.status)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `a session with a tab open is kept while the tab watches it`() = runBlocking {
+        val (sessions, scope) = sessions()
+        try {
+            sessions.put(ComposerSessionData("s12", task = "t", title = "t", status = "done"))
+            sessions.open("s12")
+            sessions.maybeCloseIfIdle("s12")
+            assertNotNull(sessions.snapshot("s12"))
+
+            sessions.detach("s12")
+            assertNull(sessions.snapshot("s12"))
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `pending proposals keep a finished session alive until they are answered`() = runBlocking {
+        val (sessions, scope) = sessions()
+        try {
+            sessions.put(
+                ComposerSessionData(
+                    "s13", task = "t", title = "t", status = "done", proposals = listOf(proposal("p1")),
+                ),
+            )
+
+            sessions.maybeCloseIfIdle("s13")
+            assertNotNull(sessions.snapshot("s13"))
+
+            // The last proposal is answered: now there is nothing left.
+            sessions.update("s13") { it.copy(proposals = it.proposals.map { p -> p.copy(status = "accepted") }) }
+            sessions.maybeCloseIfIdle("s13")
+            assertNull(sessions.snapshot("s13"))
         } finally {
             scope.cancel()
         }

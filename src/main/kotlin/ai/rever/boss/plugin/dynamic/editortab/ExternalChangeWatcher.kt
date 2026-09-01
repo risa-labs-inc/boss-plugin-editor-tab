@@ -56,6 +56,15 @@ internal class ExternalChangeWatcher(
      * reload lands on the main thread; tests inject an immediate dispatcher.
      */
     private val applyOn: CoroutineContext = Dispatchers.Main,
+    /**
+     * Whether a RELOAD verdict may apply the disk content. Wired to the
+     * "reload externally changed files" setting: with it off, a changed file
+     * must not be swapped under a clean buffer on its own authority. CONFLICT
+     * and DELETED are deliberately NOT gated - surfacing a lost file or a
+     * stale view is worth doing however the tab is configured (persistDocument
+     * gives the same reason for the save path).
+     */
+    private val autoReload: () -> Boolean = { true },
 ) {
     private var job: Job? = null
     private var tick = 0
@@ -112,7 +121,13 @@ internal class ExternalChangeWatcher(
         val version = buffer.version
         if (!refreshHead && version == buffer.gitMarksVersion) return
         buffer.gitMarksVersion = version
-        val marks = LineDiff.of(head.split("\n"), buffer.content.split("\n"))
+        // The split and the LCS band are the expensive part and pure: run
+        // them off the UI thread (this tick lands on Dispatchers.Main), and
+        // hop back only to publish the marks.
+        val bufferText = buffer.content
+        val marks = withContext(Dispatchers.Default) {
+            LineDiff.of(head.split("\n"), bufferText.split("\n"))
+        }
         buffer.setGitMarks(marks)
     }
 
@@ -123,6 +138,13 @@ internal class ExternalChangeWatcher(
      * git for that diff with full context, so its pre-image IS the whole HEAD
      * version, and [GitDataProvider] exposes no way to read a blob directly.
      * No diff means the file on disk already matches HEAD.
+     *
+     * The full-context assumption is checked, not trusted: if the host ever
+     * narrows the context, a truncated pre-image would mark the ENTIRE file
+     * modified in the gutter. The top is proven by the first hunk starting at
+     * line 1; the bottom by the reconstructed post-image's line count
+     * matching the file on disk (they are the same file when the
+     * reconstruction is complete). Either fails closed to no marks.
      */
     private suspend fun headTextFor(git: GitDataProvider, path: String): String? =
         runCatching {
@@ -130,7 +152,15 @@ internal class ExternalChangeWatcher(
             if (diff == null || diff.hunks.isEmpty()) {
                 withContext(Dispatchers.IO) { File(path).takeIf { it.exists() }?.readText() }
             } else {
-                DiffSides.of(diff).oldText
+                if (diff.hunks.first().oldStart != 1) return@runCatching null
+                val sides = DiffSides.of(diff)
+                val disk = withContext(Dispatchers.IO) {
+                    runCatching { File(path).readText() }.getOrNull()
+                }
+                if (disk != null && disk.lines().size != sides.newText.lines().size) {
+                    return@runCatching null
+                }
+                sides.oldText
             }
         }.getOrNull()
 
@@ -175,6 +205,16 @@ internal class ExternalChangeWatcher(
 
             ExternalChangePolicy.Verdict.RELOAD -> {
                 val text = diskText ?: return
+                if (!autoReload()) {
+                    // Auto-reload is off in the settings: apply nothing, and
+                    // adopt no signature - the change stays live news, so the
+                    // very next tick after the setting is switched back on
+                    // re-applies it (the same re-detection the old per-tab
+                    // poll did on re-enable). While it stays off the cost is
+                    // one re-read of the file per tick; large files keep no
+                    // buffer, so this is bounded by a normal file's size.
+                    return
+                }
                 withContext(applyOn) { applyReload(buffer, text) }
                 buffer.knownSignature = current
                 buffer.setExternalState(ExternalState.IN_SYNC)
@@ -245,8 +285,9 @@ internal class ExternalChangeWatcher(
         fun install(
             scope: CoroutineScope,
             gitProvider: () -> GitDataProvider? = { null },
+            autoReload: () -> Boolean = { true },
         ): ExternalChangeWatcher =
-            (instance ?: ExternalChangeWatcher(scope, gitProvider).also { instance = it })
+            (instance ?: ExternalChangeWatcher(scope, gitProvider, autoReload = autoReload).also { instance = it })
                 .also { it.start() }
 
         fun current(): ExternalChangeWatcher? = instance

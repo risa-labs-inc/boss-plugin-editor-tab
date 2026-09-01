@@ -180,9 +180,22 @@ object EditorBufferRegistry {
 
     private var focused: EditorBuffer? = null
 
-    /** Normalized absolute path key (resolves "." and "~", canonicalizes separators). */
-    fun keyFor(path: String): String =
-        runCatching { File(path).absolutePath }.getOrDefault(path)
+    /**
+     * Normalized absolute path key (resolves ".", expands "~", canonicalizes
+     * separators).
+     *
+     * `File.absolutePath` does NOT expand `~` - it yields `<cwd>/~/...` - yet
+     * the plugin API deliberately passes `~/` paths through, so a file reached
+     * via `~` and via its absolute path would otherwise be two buffers for
+     * one file. Expand it explicitly.
+     */
+    fun keyFor(path: String): String {
+        val expanded =
+            if (path == "~") System.getProperty("user.home")
+            else if (path.startsWith("~/")) System.getProperty("user.home") + path.removePrefix("~")
+            else path
+        return runCatching { File(expanded).absolutePath }.getOrDefault(path)
+    }
 
     /**
      * Get (or create, loading [initialContent]) the buffer for [path] and

@@ -41,6 +41,9 @@ class ComposerSessions(
     private val flows = HashMap<String, MutableStateFlow<ComposerSessionData?>>()
     private val loadStarted = HashSet<String>()
     private val persistJobs = HashMap<String, Job>()
+    // How many composer tabs currently hold this session (per tab instance;
+    // open() is called once per tab in its init).
+    private val openTabs = HashMap<String, Int>()
 
     @Synchronized
     private fun flowFor(sessionId: String): MutableStateFlow<ComposerSessionData?> =
@@ -56,6 +59,7 @@ class ComposerSessions(
      */
     fun open(sessionId: String): StateFlow<ComposerSessionData?> {
         val flow = flowFor(sessionId)
+        synchronized(this) { openTabs[sessionId] = (openTabs[sessionId] ?: 0) + 1 }
         if (claimLoad(sessionId)) {
             scope.launch {
                 val restored = withContext(Dispatchers.IO) { store?.load(sessionId) }
@@ -67,6 +71,47 @@ class ComposerSessions(
             }
         }
         return flow.asStateFlow()
+    }
+
+    /** A composer tab went away (its onDestroy). Pairs with [open]. */
+    fun detach(sessionId: String) {
+        synchronized(this) {
+            val n = (openTabs[sessionId] ?: 0) - 1
+            if (n <= 0) openTabs.remove(sessionId) else openTabs[sessionId] = n
+        }
+        maybeCloseIfIdle(sessionId)
+    }
+
+    /**
+     * Forget a session that nothing can still need.
+     *
+     * Safe only when NO tab shows it, it is not running, and no proposal is
+     * still pending or mid-apply - then even a restored tab would have
+     * nothing left to reload. Runs deliberately outlive their tabs (the
+     * design point of this class), so a running session is never closed
+     * here, whatever the tab count; its finish calls back in. Without this,
+     * every session ever run stays in plugin storage - and in [flows] - for
+     * the process lifetime.
+     */
+    fun maybeCloseIfIdle(sessionId: String) {
+        if (synchronized(this) { (openTabs[sessionId] ?: 0) > 0 }) return
+        val data = snapshot(sessionId) ?: return
+        if (data.status == "running") return
+        if (data.proposals.any { it.status == "pending" || it.status == "applying" }) return
+        close(sessionId)
+    }
+
+    /** Forget a session completely: live flow, pending persist, stored copy. */
+    fun close(sessionId: String) {
+        synchronized(this) {
+            persistJobs.remove(sessionId)?.cancel()
+            flows.remove(sessionId)
+            loadStarted.remove(sessionId)
+            openTabs.remove(sessionId)
+        }
+        // No-op if the scope is already gone (plugin dispose runs close-adjacent
+        // work on the way out); the storage entry then dies with the app anyway.
+        scope.launch { withContext(Dispatchers.IO) { store?.delete(sessionId) } }
     }
 
     /** The live value, or null when this session has never been opened here. */

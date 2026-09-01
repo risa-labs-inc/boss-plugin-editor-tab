@@ -399,8 +399,12 @@ class DiffTabComponent(
         onEditableChanged: (Boolean) -> Unit,
     ) {
         val absolutePath = remember(path) { absolutePathOf(path) }
+        // The disk read is synchronous: run it off the UI thread, since this
+        // probe runs on every recomposition key change in read-only mode.
         LaunchedEffect(absolutePath, unpaddedNewText, diffScope.staged, diffScope.fromRef, diffScope.toRef) {
-            onEditableChanged(canEdit(diffScope, absolutePath, unpaddedNewText))
+            onEditableChanged(
+                withContext(Dispatchers.IO) { canEdit(diffScope, absolutePath, unpaddedNewText) },
+            )
         }
     }
 
@@ -434,14 +438,7 @@ class DiffTabComponent(
 
         val buffer =
             remember(absolutePath, reconstructedNewText, diffScope.staged, diffScope.fromRef, diffScope.toRef) {
-                if (!canEdit(diffScope, absolutePath, reconstructedNewText)) return@remember null
-                val onDisk = runCatching { File(absolutePath!!).readText() }.getOrNull()
-                    ?: return@remember null
-                EditorBufferRegistry.acquire(
-                    absolutePath!!,
-                    onDisk,
-                    EditorTabComponent.detectLanguage(absolutePath),
-                )
+                editableBufferOrNull(diffScope, absolutePath, reconstructedNewText)
             }
 
         DisposableEffect(buffer) {
@@ -461,15 +458,30 @@ class DiffTabComponent(
     }
 
     /**
+     * The file on disk, when the diff's post-image still matches it - the
+     * invariant that makes editing safe. A fragmentary diff, a file changed
+     * underneath, or a line-ending quirk all read back unequal, and so does a
+     * file that vanished in the meantime (runCatching -> null).
+     */
+    private fun diskMatchingReconstruction(
+        absolutePath: String,
+        reconstructedNewText: String,
+    ): String? =
+        runCatching { File(absolutePath).readText() }.getOrNull()
+            ?.takeIf { it.lines() == reconstructedNewText.lines() }
+
+    /**
      * Whether the right pane may be edited.
      *
      * Only a working-tree diff: the index and a ref range have no file you can
      * meaningfully write to. And only when the diff's post-image IS the file on
-     * disk - the single invariant that makes editing safe. If it is not (a
-     * fragmentary diff, a file changed underneath, a line-ending quirk) our
-     * marks are indexed against lines the file does not have, so the pane stays
-     * read-only rather than editing something whose line numbering we cannot
-     * vouch for.
+     * disk - see [diskMatchingReconstruction].
+     *
+     * When a buffer for the path already exists (an editor tab has the file
+     * open) the editable pane would edit THAT buffer, not the disk - so its
+     * text must also match the post-image. Unsaved edits in the editor tab
+     * shift the buffer's line numbering against the diff, and editing it would
+     * put marks on the wrong lines.
      */
     private fun canEdit(
         diffScope: DiffTabConfig,
@@ -479,8 +491,54 @@ class DiffTabComponent(
         if (absolutePath == null) return false
         if (diffScope.staged || diffScope.fromRef != null || diffScope.toRef != null) return false
         if (diffScope.filePath.isBlank()) return false
-        val onDisk = runCatching { File(absolutePath).readText() }.getOrNull() ?: return false
-        return onDisk.lines() == reconstructedNewText.lines()
+        if (diskMatchingReconstruction(absolutePath, reconstructedNewText) == null) return false
+        val buffer = EditorBufferRegistry.find(absolutePath) ?: return true
+        return buffer.editorState.document.getText().lines() == reconstructedNewText.lines()
+    }
+
+    /**
+     * The buffer the editable right pane would write into, or null when the
+     * pane must fall back to the read-only reconstruction.
+     *
+     * [canEdit]'s scope gates first, then the buffer gate: [EditorBufferRegistry.acquire]
+     * may hand back a buffer an editor tab already owns, and the pane edits
+     * exactly that document, marks and gutter numbers included. When it has
+     * diverged from the post-image, release our reference and decline.
+     *
+     * The disk is read at most once, and only when no buffer exists yet:
+     * with an editor tab open the live buffer text is the invariant to check
+     * (in memory), and the read exists only to seed a brand-new buffer.
+     */
+    private fun editableBufferOrNull(
+        diffScope: DiffTabConfig,
+        absolutePath: String?,
+        reconstructedNewText: String,
+    ): EditorBuffer? {
+        if (absolutePath == null) return null
+        if (diffScope.staged || diffScope.fromRef != null || diffScope.toRef != null) return null
+        if (diffScope.filePath.isBlank()) return null
+
+        // Fast path: an editor tab already owns this file. That buffer is the
+        // document the pane would edit, so it is the thing to check - and the
+        // check is an in-memory comparison, no disk read at all.
+        EditorBufferRegistry.find(absolutePath)?.let { existing ->
+            return if (existing.editorState.document.getText().lines() == reconstructedNewText.lines()) {
+                EditorBufferRegistry.acquire(existing.path, existing.content, existing.language)
+            } else {
+                null
+            }
+        }
+
+        // No buffer yet: the disk must be the post-image, and that one read
+        // also seeds the new buffer.
+        val onDisk = diskMatchingReconstruction(absolutePath, reconstructedNewText) ?: return null
+        val buffer =
+            EditorBufferRegistry.acquire(absolutePath, onDisk, EditorTabComponent.detectLanguage(absolutePath))
+        if (buffer.editorState.document.getText().lines() != reconstructedNewText.lines()) {
+            EditorBufferRegistry.release(buffer.path)
+            return null
+        }
+        return buffer
     }
 
     /** Cmd/Ctrl+S over the diff pane, writing the shared buffer back to disk. */
@@ -529,7 +587,9 @@ class DiffTabComponent(
 
     private fun absolutePathOf(path: String): String? {
         if (path.isBlank()) return null
-        if (path.startsWith("/")) return path
+        // isAbsolute, not startsWith("/"): on Windows the drive-letter form
+        // (C:\...) is absolute too.
+        if (File(path).isAbsolute) return path
         val project = context.projectPath?.takeIf { it.isNotBlank() } ?: return null
         return "${project.trimEnd('/')}/$path"
     }
