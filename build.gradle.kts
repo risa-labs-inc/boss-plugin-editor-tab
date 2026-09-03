@@ -27,7 +27,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-version = "1.6.0"
+version = "1.6.1"
 
 java {
     toolchain {
