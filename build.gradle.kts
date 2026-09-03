@@ -19,7 +19,15 @@ group = "ai.rever.boss.plugin.dynamic"
 // the bundled BossEditor's own chrome follows it too - which hard-requires
 // bosseditor 1.0.12 for EditorTheme.FOLLOW_HOST_THEME, ChromeColors and
 // EditorChrome.
-version = "1.4.21"
+// 1.5.0: AI tab completion (ghost text) via boss-plugin-api 1.0.74's AiGatewayAPI,
+// rendered as a plugin-side overlay (the bundled BossEditor has no inline-
+// suggestion mechanism). Degrades to nothing when ai-gateway is absent.
+// 1.6.0: IDE-features batch on boss-plugin-api 1.0.87 - live buffer model
+// (readBuffer/applyEdit/observeChanges/focusedDocument/openEditor/openSplit)
+// implemented over one shared buffer per path, "Open Diff" context-menu entry
+// (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
+// (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
+version = "1.6.0"
 
 java {
     toolchain {
@@ -47,7 +55,7 @@ repositories {
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.80.jar")
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.87.jar")
     } else {
         // CI: use downloaded JAR
         files("build/downloaded-deps/boss-plugin-api.jar")
@@ -97,6 +105,10 @@ dependencies {
 
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    // Same pattern as coroutines above: host-provided at runtime, but the
+    // composer session store is @Serializable, so the tests that exercise it
+    // need the runtime on the TEST classpath (it is not bundled in the jar).
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     // The Compose compiler plugin also runs for compileTestKotlin and requires
     // the runtime on that classpath, even when an individual test is pure logic.
     testImplementation(compose.runtime)

@@ -3,9 +3,23 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.editortab",
   "displayName": "Code Editor Tab",
   "version": "1.4.0",
-  "apiVersion": "1.0.73",
-  "minApiVersion": "1.0.73",
-  "minBossVersion": "9.4.2",
+  "apiVersion": "1.0.87",
+  "minApiVersion": "1.0.87",
+  "minBossVersion": "9.5.7",
+  "definedPermissions": [
+    {
+      "name": "editor.write",
+      "description": "Write files and live editor buffers (editor_write_file, editor_apply_edit, editor_inline_edit)"
+    },
+    {
+      "name": "ai.edit",
+      "description": "Spend AI tokens on inline code rewrites (editor_inline_edit)"
+    },
+    {
+      "name": "ai.compose",
+      "description": "Run and control AI composer sessions that accumulate edit proposals (ai_compose, ai_compose_accept, ai_compose_stop)"
+    }
+  ],
   "mainClass": "ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin",
   "type": "tab",
   "systemPlugin": true,

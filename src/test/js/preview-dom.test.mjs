@@ -145,6 +145,16 @@ class Cdp {
   }
 }
 
+/** SIGKILL the browser AND the renderers it forked, so nothing outlives the profile. */
+function killTree(child) {
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    // No process group (or already gone): fall back to the launcher alone.
+    try { child.kill('SIGKILL'); } catch { /* already exited */ }
+  }
+}
+
 async function openBrowser(browserBin, port, userDataDir, fileUrl) {
   const args = [
     `--remote-debugging-port=${port}`,
@@ -161,7 +171,11 @@ async function openBrowser(browserBin, port, userDataDir, fileUrl) {
   // in a throwaway profile.
   if (process.env.CI) args.unshift('--no-sandbox', '--disable-dev-shm-usage');
 
-  const child = spawn(browserBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // detached: the browser forks zygote and renderer processes of its own.
+  // Killing only the launcher leaves those alive, still writing into the
+  // profile directory the teardown is about to delete. Its own process group
+  // gives the teardown one signal that reaches all of them.
+  const child = spawn(browserBin, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d.toString(); });
 
@@ -174,7 +188,7 @@ async function openBrowser(browserBin, port, userDataDir, fileUrl) {
     } catch { /* not listening yet */ }
   }
   if (!target) {
-    child.kill('SIGKILL');
+    killTree(child);
     fatal(`browser never exposed a page target.\n${stderr}`);
   }
   const ws = new WebSocket(target.webSocketDebuggerUrl);
@@ -711,14 +725,23 @@ async function run() {
       failClosed.ran === false && failClosed.text.startsWith('Markdown render error'), failClosed);
     rmSync(withoutSanitizer, { force: true });
   } finally {
-    // Wait for the process to actually be gone before deleting its profile. SIGKILL
-    // does not wait, so a bare rmSync raced Chromium's last writes and failed
-    // ENOTEMPTY on a directory it had just emptied - failing the suite after every
-    // assertion had already passed. Waiting removes the race rather than retrying
-    // through it, so a genuinely stuck directory still surfaces.
-    child.kill('SIGKILL');
+    // Wait for the processes to actually be gone before deleting the profile.
+    // SIGKILL does not wait, so a bare rmSync raced Chromium's last writes and
+    // failed ENOTEMPTY on a directory it had just emptied - failing the suite
+    // after every assertion had already passed. killTree removes most of that
+    // race (the renderers, not just the launcher); the try/catch below covers
+    // what is left, because a leftover temp directory is not a test result.
+    killTree(child);
     await once(child, 'exit').catch(function () {});
-    rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    // Best effort, and deliberately not fatal. Every assertion has already
+    // run by here; a leftover throwaway profile under the OS temp dir is not
+    // a test result, and letting rmSync's ENOTEMPTY escape failed the whole
+    // suite green-to-red on a race with the browser's last writes.
+    try {
+      rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch (error) {
+      console.warn(`could not remove the browser profile ${userDataDir}: ${error.message}`);
+    }
   }
 
   console.log(`\n${checks - failures.length}/${checks} checks passed`);

@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
+import ai.rever.boss.plugin.ui.ContextMenuItemData
 import ai.rever.bosseditor.compose.BossEditor
 import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
@@ -72,6 +73,7 @@ import ai.rever.bosseditor.highlight.lexers.PHPLexer
 import ai.rever.bosseditor.highlight.lexers.PerlLexer
 import ai.rever.bosseditor.highlight.lexers.LuaLexer
 import ai.rever.bosseditor.rendering.EditorToken
+import ai.rever.bosseditor.theme.EditorTheme
 import ai.rever.bosseditor.theme.LocalEditorTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -116,6 +118,7 @@ import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
@@ -250,17 +253,42 @@ class EditorTabComponent(
     private var isLargeFile: Boolean = false
     private var fileSizeBytes: Long = 0L
 
-    // What the tab believes is on disk, as of the last load, save or accepted reload. The
-    // snapshot is what a poll compares against; the content is what separates a real rewrite
-    // from a bare mtime bump (touch, a formatter with nothing to reformat, our own save seen
-    // a moment late), which must not prompt anybody.
-    private var diskBaseline: DiskSnapshot = DiskSnapshot.MISSING
-    private var originalContent: String = ""
+    // The shared buffer this viewport holds a reference on (null: untitled
+    // document, a file that failed to load, or a large-file preview - the
+    // preview is a truncation, not the file, so it must not be registered).
+    // Acquired in init, released in onDestroy: a pair no composable early
+    // return can break. The old version acquired in a `remember` after two
+    // early returns while still releasing unconditionally, so a tab that
+    // failed to load over-released a sibling tab's live buffer.
+    private var buffer: EditorBuffer? = null
+        private set
 
-    // Mutated from the UI thread only: loadFileContent runs in init before anything composes,
-    // and every later accept() happens in the watcher or in persistDocument after their IO
-    // has already come back to Main. Keep it that way - it is a plain, unsynchronized object.
-    private val changeDetector = ExternalChangeDetector(DiskSnapshot.MISSING)
+    // The AI services are built once per COMPONENT, not per composition. They
+    // are handed the component's coroutineScope, so a service rebuilt on
+    // re-entering the composition (a tab switch, a split re-layout) would
+    // leave the PREVIOUS one's in-flight request still streaming on that
+    // scope, into a StateFlow nobody reads, with the tokens already spent.
+    //
+    // runCatching rather than a try/catch on Exception because the failure
+    // being guarded is a LinkageError: AiGatewayAPI is a parent-first api
+    // class that hosts before 9.4.5 do not carry. Belt and braces only - this
+    // plugin's floor (minApiVersion 1.0.87, minBossVersion 9.5.7) is far above
+    // that, so such a host cannot load it at all and this guard cannot fire
+    // today. It is here for a future in which the floor drops, not for any
+    // shipping host.
+    private val aiCompletion: AiTabCompletionService? by lazy {
+        runCatching { AiTabCompletionService(context, coroutineScope) }.getOrNull()
+    }
+
+    private val aiInlineEdit: AiInlineEditService? by lazy {
+        runCatching { AiInlineEditService(context, coroutineScope) }.getOrNull()
+    }
+
+    // The file as this tab last saw it, for the large-file poll alone. Normal
+    // files baseline on the buffer's knownSignature (owned by the
+    // plugin-wide watcher); large files have no buffer, so the poll keeps its
+    // own snapshot.
+    private var largeFileBaseline: DiskSnapshot = DiskSnapshot.MISSING
 
     // Language detection
     private val language: String = detectLanguage(filePath)
@@ -273,6 +301,12 @@ class EditorTabComponent(
             callbacks = object : Lifecycle.Callbacks {
                 override fun onDestroy() {
                     coroutineScope.cancel()
+                    // Drop this viewport's reference on the shared buffer; the
+                    // registry removes the buffer only when the last viewport
+                    // goes. Only when we actually acquired one - a failed load
+                    // or a large-file preview did not, and releasing without
+                    // having acquired would drop a sibling tab's live buffer.
+                    buffer?.let { EditorBufferRegistry.release(it.path) }
                 }
             }
         )
@@ -280,6 +314,15 @@ class EditorTabComponent(
         // Load file content synchronously during init
         if (filePath.isNotEmpty()) {
             loadFileContent()
+            // Acquired here, not in the composable: loadFileContent can leave a
+            // loadError (missing file), and the composable returns early on it -
+            // an acquire after those returns could never pair with the release
+            // above. Large files keep a private EditorState (their buffer would
+            // hold a truncated preview that buffer tools would present as the
+            // live content).
+            if (loadError == null && !isLargeFile) {
+                buffer = EditorBufferRegistry.acquire(filePath, initialContent, language)
+            }
         } else {
             initialContent = "// New file\n// Start typing...\n"
         }
@@ -298,7 +341,11 @@ class EditorTabComponent(
             // otherwise be adopted as our baseline while we hold the pre-write content, and
             // the tab would sit stale forever. This way round the next poll simply sees a
             // difference, re-reads, and finds the content already matches.
-            adoptDiskState(snapshotFile())
+            //
+            // The baseline is the buffer's knownSignature for normal files (the
+            // plugin-wide watcher owns it from here); largeFileBaseline is for
+            // the large-file preview's own poll, since it has no buffer.
+            largeFileBaseline = snapshotFile()
 
             // Check if this is a large file (>10MB)
             if (LargeFileDocument.shouldUseLargeFileAdapter(file)) {
@@ -310,20 +357,18 @@ class EditorTabComponent(
                     file.readText()
                 } else {
                     file.inputStream().bufferedReader().use { reader ->
-                        val buffer = CharArray(previewSize.toInt())
-                        val read = reader.read(buffer)
-                        if (read > 0) String(buffer, 0, read) + "\n\n// ... [File truncated - ${formatSize(fileSizeBytes)} total] ..."
+                        val chars = CharArray(previewSize.toInt())
+                        val read = reader.read(chars)
+                        if (read > 0) String(chars, 0, read) + "\n\n// ... [File truncated - ${formatSize(fileSizeBytes)} total] ..."
                         else ""
                     }
                 }
-                originalContent = initialContent
                 loadError = null
                 return
             }
 
             isLargeFile = false
             initialContent = file.readText()
-            originalContent = initialContent
             loadError = null
         } catch (e: Exception) {
             loadError = "Error loading file: ${e.message}"
@@ -335,8 +380,9 @@ class EditorTabComponent(
      * Writes [content] and returns the snapshot of what is now on disk, or null if the write
      * failed.
      *
-     * The caller re-baselines with that snapshot rather than this doing it, so every mutation
-     * of [changeDetector] happens on the UI thread even though the write itself runs on IO.
+     * Re-baselining the buffer is done here through noteWrittenByUs() rather than by the
+     * caller: every save on this file (editor tab, diff tab, MCP tool) is invisible to the
+     * watcher the same way.
      */
     private fun saveFile(content: String): DiskSnapshot? {
         if (filePath.isEmpty()) return null
@@ -346,6 +392,9 @@ class EditorTabComponent(
             // Create parent directories if they don't exist (matches bundled editor)
             file.parentFile?.mkdirs()
             file.writeText(content)
+            // SHARED bookkeeping, so the watcher does not report our own write -
+            // and so a save made here is seen by every other viewport on this buffer.
+            EditorBufferRegistry.find(filePath)?.noteWrittenByUs()
             snapshotFile()
         } catch (e: Exception) {
             System.err.println("[EditorTabComponent] Failed to save file '$filePath': ${e.message}")
@@ -368,14 +417,8 @@ class EditorTabComponent(
             // A stat that throws (permissions, a filesystem going away) is not evidence the
             // file was deleted, so report no news rather than inventing a deletion.
             System.err.println("[EditorTabComponent] Error checking file '$filePath': ${e.message}")
-            diskBaseline
+            largeFileBaseline
         }
-    }
-
-    /** Records [snapshot] as ours, so the watcher stops treating it as news. */
-    private fun adoptDiskState(snapshot: DiskSnapshot) {
-        diskBaseline = snapshot
-        changeDetector.accept(snapshot)
     }
 
     /** The file's current bytes, or null if it is gone or unreadable. */
@@ -388,23 +431,6 @@ class EditorTabComponent(
         } catch (e: Exception) {
             System.err.println("[EditorTabComponent] Error reading file '$filePath': ${e.message}")
             null
-        }
-    }
-
-    /**
-     * Whether the file's *content* has moved off what we last loaded or wrote.
-     *
-     * Used to stop a save - an auto save debounce especially - from silently overwriting
-     * something another program just wrote. Content-based rather than snapshot-based on
-     * purpose: an mtime that moved while the bytes stayed the same is no reason to block a save.
-     */
-    private suspend fun hasExternalChanges(): Boolean {
-        if (filePath.isEmpty()) return false
-
-        return withContext(Dispatchers.IO) {
-            if (snapshotFile() == diskBaseline) return@withContext false
-            val diskContent = readDiskText() ?: return@withContext false
-            diskContent != originalContent
         }
     }
 
@@ -477,10 +503,28 @@ class EditorTabComponent(
             return
         }
 
-        // Create editor state
-        val editorState = remember(filePath) {
-            EditorState(initialContent, filePath.ifEmpty { null })
-        }
+        // Create editor state. Files with a path share ONE buffer per path across
+        // tabs and splits (decision D3): the registry hands every viewport the
+        // same EditorState, so edits in one are instantly visible in the
+        // others. The reference was taken in init - see [buffer]; this tab
+        // holds it until onDestroy. Untitled documents and large-file
+        // previews have no buffer and keep a private state.
+        val editorBuffer = buffer
+        val editorState =
+            editorBuffer?.editorState ?: remember(filePath) {
+                EditorState(initialContent, null)
+            }
+
+        // AI tab completion (ghost text) and Cmd+K inline edit, from the
+        // component-level services - see their declarations for why they are
+        // not remembered per composition.
+        val aiCompletion = this.aiCompletion
+        val ghostSuggestion = aiCompletion?.suggestion?.collectAsState()?.value
+        val completionSettings by AiCompletionSettings.settings.collectAsState()
+
+        val aiInlineEdit = this.aiInlineEdit
+        aiInlineEdit?.bind(editorBuffer, editorState)
+        val aiEditSession = aiInlineEdit?.session?.collectAsState()?.value
 
         // Get window ID for filtering navigation events (exactly like bundled editor)
         val windowId = context.windowId ?: ""
@@ -742,43 +786,46 @@ class EditorTabComponent(
         }
 
         // --- Following the file on disk -------------------------------------------------
-
-        val externalReloadEnabled by externalReloadSettingsManager.enabled.collectAsState()
-
-        // Set when the file changed under a tab that has unsaved edits: what is on disk now,
-        // held until the user says which version wins.
-        var diskConflict by remember { mutableStateOf<DiskConflict?>(null) }
-
-        // Sticky line for the status bar, for the cases there is nothing to swap in: the file
-        // was deleted, or it is a large file whose buffer is only a truncated preview.
+        //
+        // Normal files have exactly one owner: the plugin-wide
+        // [ExternalChangeWatcher] (installed in EditorTabDynamicPlugin), which
+        // walks the buffer registry - so the diff tab's editable pane is
+        // covered too, and the RELOAD verdict honors the user's "reload
+        // externally changed files" setting. There used to be a per-tab poll
+        // here running alongside the watcher: two decision surfaces for one
+        // event, two baselines (the watcher's reloads never updated this one),
+        // and two stat loops per file.
+        //
+        // Large files are the exception: their document is a truncated
+        // preview, not a registered buffer, so the watcher never sees them.
+        // This poll is their only owner - and since the preview cannot hold
+        // the file, it can only tell the user, never reload.
         var diskNotice by remember { mutableStateOf<String?>(null) }
 
-        // Swaps disk content into the buffer without losing the reader's place. setText resets
-        // the caret to 0,0 and clears undo, so position is captured first and put back after -
-        // a `git checkout` under a file you were reading should not scroll you to the top of it.
-        fun applyReload(text: String, snapshot: DiskSnapshot) {
-            val caret = editorState.caretPosition.value
-            val scroll = editorState.scrollOffset.value
+        val windowFocused = LocalWindowInfo.current.isWindowFocused
+        LaunchedEffect(filePath, windowFocused) {
+            if (!isLargeFile || filePath.isEmpty()) return@LaunchedEffect
 
-            editorState.setText(text)
-            // moveCaret clamps into the new document itself; the scroll offset does not, so a
-            // file that got shorter would otherwise leave the viewport past its last line.
-            editorState.moveCaret(caret)
-            val maxScrollY = ((editorState.document.lineCount - 1) * lineHeightPx)
-                .coerceAtLeast(0f)
-                .toInt()
-            editorState.setScrollOffset(ScrollOffset(scroll.x, scroll.y.coerceIn(0, maxScrollY)))
+            val quietInterval =
+                if (windowFocused) DISK_POLL_INTERVAL_MILLIS else DISK_BACKGROUND_POLL_INTERVAL_MILLIS
+            var baseline = largeFileBaseline
 
-            initialContent = text
-            originalContent = text
-            adoptDiskState(snapshot)
-            contentVersion++
-            diskNotice = null
-
-            if (isMarkdown) markdownText = text
-            // SearchManager holds offsets into the text that just went away.
-            searchMatches = emptyList()
-            currentSearchMatchIndex = -1
+            while (isActive) {
+                delay(quietInterval)
+                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
+                if (snapshot == baseline) continue
+                baseline = snapshot
+                largeFileBaseline = snapshot
+                diskNotice =
+                    if (snapshot.exists) {
+                        "changed on disk - reopen to refresh"
+                    } else {
+                        // Deliberately no emptying of the buffer: the text on screen may be
+                        // the only copy left. saveFile recreates parent directories, so
+                        // Cmd+S puts it back.
+                        "deleted on disk"
+                    }
+            }
         }
 
         // One save path for both Cmd+S and auto save, so they cannot drift on what counts as
@@ -795,23 +842,28 @@ class EditorTabComponent(
             // Not gated on the reload setting. That setting is about whether the tab follows
             // the file; this is about not destroying someone else's work on the way out, which
             // is worth asking about however the tab is configured.
-            if (hasExternalChanges()) {
-                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
-                val text = withContext(Dispatchers.IO) { readDiskText() }
-                if (text != null) {
-                    diskConflict = DiskConflict(text, snapshot)
-                    return
+            //
+            // Asked of the BUFFER's baseline, not a tab-private copy: the watcher owns
+            // external changes and re-baselines it after every verdict, so a save right
+            // after a watcher reload cannot re-report the same change. A real conflict is
+            // surfaced through the same bar the watcher uses - one decision surface, not a
+            // second dialog.
+            buffer?.let { b ->
+                val current = withContext(Dispatchers.IO) { signatureOf(File(filePath)) }
+                if (current != b.knownSignature && current.exists) {
+                    val diskText = withContext(Dispatchers.IO) { readDiskText() }
+                    if (diskText != null && diskText != editorState.document.getText()) {
+                        b.setExternalState(ExternalState.CONFLICT)
+                        return
+                    }
                 }
             }
 
             isSaving = true
             saveError = null
             val content = editorState.document.getText()
-            val snapshot = withContext(Dispatchers.IO) { saveFile(content) }
-            if (snapshot != null) {
+            if (withContext(Dispatchers.IO) { saveFile(content) } != null) {
                 editorState.markAsSaved()
-                originalContent = content
-                adoptDiskState(snapshot)
             } else {
                 saveError = "Failed to save file"
             }
@@ -825,74 +877,6 @@ class EditorTabComponent(
             if (!autoSaveEnabled) return@LaunchedEffect
             delay(AUTO_SAVE_DEBOUNCE_MILLIS)
             persistDocument()
-        }
-
-        // Watch the file for writes from anywhere else: vim, a formatter, git, an AI CLI in a
-        // BossTerm split, or BOSS's own editor_write_file MCP tool.
-        //
-        // Keyed on window focus, which does two jobs. The effect restarts when focus returns,
-        // and its first act is a check - so alt-tabbing back from an external editor shows
-        // fresh content at once. And it backs the poll off to a crawl while BOSS is in the
-        // background, since anything that happens there is caught by that check on the way
-        // back. What is left is one stat per second per open tab while you are looking at BOSS.
-        val windowFocused = LocalWindowInfo.current.isWindowFocused
-        LaunchedEffect(filePath, externalReloadEnabled, windowFocused, editorState) {
-            if (filePath.isEmpty() || !externalReloadEnabled) return@LaunchedEffect
-
-            val quietInterval =
-                if (windowFocused) DISK_POLL_INTERVAL_MILLIS else DISK_BACKGROUND_POLL_INTERVAL_MILLIS
-
-            // Returns how long to wait before looking again: a short beat while something is
-            // still moving, the quiet interval once things have stopped.
-            suspend fun checkDisk(): Long {
-                // A conflict is already on screen and the answer is the user's to give. Do not
-                // observe while it is open, so the baseline is still the pre-change one when
-                // they answer - whichever way they answer re-baselines it.
-                if (diskConflict != null) return quietInterval
-
-                val snapshot = withContext(Dispatchers.IO) { snapshotFile() }
-                when (changeDetector.observe(snapshot)) {
-                    DiskState.UNCHANGED -> return quietInterval
-                    DiskState.SETTLING -> return DISK_SETTLE_INTERVAL_MILLIS
-
-                    DiskState.DELETED -> {
-                        // Deliberately no reload and no emptying of the buffer: the text on
-                        // screen may be the only copy left. saveFile recreates parent
-                        // directories, so Cmd+S puts it back.
-                        diskNotice = "deleted on disk"
-                        return quietInterval
-                    }
-
-                    DiskState.CHANGED -> {
-                        diskNotice = null
-
-                        if (isLargeFile) {
-                            // The buffer holds a truncated preview rather than the file, so
-                            // swapping in a fresh truncation would just be a newer lie.
-                            diskNotice = "changed on disk - reopen to refresh"
-                            adoptDiskState(snapshot)
-                            return quietInterval
-                        }
-
-                        val text = withContext(Dispatchers.IO) { readDiskText() }
-                            ?: return DISK_SETTLE_INTERVAL_MILLIS
-
-                        when (reloadAction(text, editorState.document.getText(), editorState.isModified.value)) {
-                            ReloadAction.NONE -> {
-                                originalContent = text
-                                adoptDiskState(snapshot)
-                            }
-                            ReloadAction.RELOAD -> applyReload(text, snapshot)
-                            ReloadAction.PROMPT -> diskConflict = DiskConflict(text, snapshot)
-                        }
-                        return quietInterval
-                    }
-                }
-            }
-
-            while (isActive) {
-                delay(checkDisk())
-            }
         }
 
         // Helper function to perform search and update state
@@ -925,39 +909,107 @@ class EditorTabComponent(
             modifier = Modifier
                 .fillMaxSize()
                 .focusRequester(editorFocusRequester)
+                .onPreviewKeyEvent { event ->
+                    // Preview (tunneling) phase, so this runs before the editor's
+                    // own handler: with a ghost suggestion showing, Tab must
+                    // accept it instead of inserting an indent, Esc must dismiss
+                    // it instead of closing the search bar.
+                    if (event.type != KeyEventType.KeyDown || ghostSuggestion == null) {
+                        false
+                    } else {
+                        when {
+                            event.key == Key.Tab && !event.isShiftPressed && !event.isMetaPressed &&
+                                !event.isCtrlPressed && !event.isAltPressed ->
+                                aiCompletion.accept(editorState)
+                            event.key == Key.Escape -> aiCompletion.dismiss()
+                            else -> false
+                        }
+                    }
+                }
                 .onKeyEvent { event ->
                     if (event.type == KeyEventType.KeyDown) {
+                        // Cmd+F / Ctrl+F style: the find and go-to-line
+                        // shortcuts follow the host convention on every
+                        // platform. The Mac EDITING shortcuts (line delete,
+                        // line jump) are Cmd-only: on Windows/Linux the
+                        // Ctrl+arrow and Ctrl+Backspace keys keep their
+                        // native word-wise behaviour in the editor.
                         val isMeta = event.isMetaPressed || event.isCtrlPressed
-                        when {
+                        val isCmd = event.isMetaPressed
+                        // Both shortcut helpers are evaluated at most ONCE per
+                        // key (each copies the whole document, and the old
+                        // guard-then-!! pattern paid that twice). The results
+                        // feed [editorShortcutFor], a pure function that
+                        // decides what this key does - tested as a table,
+                        // because a `when` branch whose condition matches is
+                        // the END of dispatch, and conditions on
+                        // isLargeFile/hasSelection alone match almost every
+                        // keydown (that mistake once made Cmd+S/F/K/F3/
+                        // Escape unreachable on every normal file). The
+                        // composable only executes the decision.
+                        val editRange =
+                            if (!isLargeFile && !editorState.hasSelection) {
+                                editingShortcutRange(event, isCmd, editorState)
+                            } else {
+                                null
+                            }
+                        val caretTarget =
+                            if (!isLargeFile) caretShortcutTarget(event, isCmd, editorState) else null
+                        val action =
+                            editorShortcutFor(
+                                key = event.key,
+                                isMeta = isMeta,
+                                isShift = event.isShiftPressed,
+                                isLargeFile = isLargeFile,
+                                showSearchBar = showSearchBar,
+                                editRange = editRange,
+                                caretTarget = caretTarget,
+                            )
+                        when (action) {
+                            is EditorKeyAction.EditRange -> {
+                                editorState.document.replace(action.range.first, action.range.last + 1, "")
+                                true
+                            }
+
+                            is EditorKeyAction.MoveCaret -> {
+                                editorState.moveCaret(editorState.document.offsetToPosition(action.offset))
+                                true
+                            }
+
                             // Cmd+F or Ctrl+F: Show find
-                            isMeta && event.key == Key.F -> {
+                            EditorKeyAction.ShowFind -> {
                                 showSearchBar = true
                                 showReplaceInSearchBar = false
                                 true
                             }
                             // Cmd+H or Ctrl+H: Show find and replace
-                            isMeta && event.key == Key.H -> {
+                            EditorKeyAction.ShowFindReplace -> {
                                 showSearchBar = true
                                 showReplaceInSearchBar = true
                                 true
                             }
                             // Cmd+G or Ctrl+G or Cmd+L: Go to line
-                            isMeta && (event.key == Key.G || event.key == Key.L) -> {
+                            EditorKeyAction.GoToLine -> {
                                 showGoToLineDialog = true
                                 true
                             }
                             // Cmd+Y: Redo (alternative to Cmd+Shift+Z)
-                            isMeta && event.key == Key.Y -> {
+                            EditorKeyAction.Redo -> {
                                 editorState.redo()
                                 true
                             }
+                            // Cmd+K: AI inline edit on the selection (or current line).
+                            // Not consumed when no AI gateway is available.
+                            EditorKeyAction.InlineAiEdit -> {
+                                aiInlineEdit?.start(editorState, language) == true
+                            }
                             // Cmd+S or Ctrl+S: Save file
-                            isMeta && event.key == Key.S && !isLargeFile -> {
+                            EditorKeyAction.Save -> {
                                 scope.launch { persistDocument() }
                                 true
                             }
                             // F3: Find next
-                            event.key == Key.F3 && !event.isShiftPressed -> {
+                            EditorKeyAction.FindNext -> {
                                 if (searchManager.matchCount > 0) {
                                     searchManager.findNext()
                                     navigateToCurrentMatch()
@@ -965,7 +1017,7 @@ class EditorTabComponent(
                                 true
                             }
                             // Shift+F3: Find previous
-                            event.key == Key.F3 && event.isShiftPressed -> {
+                            EditorKeyAction.FindPrevious -> {
                                 if (searchManager.matchCount > 0) {
                                     searchManager.findPrevious()
                                     navigateToCurrentMatch()
@@ -973,7 +1025,7 @@ class EditorTabComponent(
                                 true
                             }
                             // Escape: Close search bar
-                            event.key == Key.Escape && showSearchBar -> {
+                            EditorKeyAction.CloseSearch -> {
                                 showSearchBar = false
                                 searchMatches = emptyList()
                                 currentSearchMatchIndex = -1
@@ -1019,6 +1071,24 @@ class EditorTabComponent(
                         currentSearchMatchIndex = -1
                         searchManager.clearSearch()
                     }
+                )
+            }
+
+            // The file changed underneath us, or went away. Above the editor
+            // rather than in the status bar: a conflict is a decision the user
+            // has to make, not a status to glance at.
+            if (editorBuffer != null) {
+                ExternalChangeBar(
+                    buffer = editorBuffer,
+                    onReload = {
+                        // Re-baselines the buffer's own signature; the tab keeps no
+                        // copy anymore, so there is nothing else to update.
+                        ExternalChangeWatcher.current()?.resolveByReloading(editorBuffer)
+                        diskNotice = null
+                    },
+                    onKeepMine = {
+                        ExternalChangeWatcher.current()?.resolveByKeepingMine(editorBuffer)
+                    },
                 )
             }
 
@@ -1073,7 +1143,29 @@ class EditorTabComponent(
 
                 // Editor content (hidden when a markdown file is in Preview-only mode)
                 if (!(isMarkdown && viewMode == MarkdownViewMode.PREVIEW)) {
-                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    // "Open Diff" on right-click of the editor surface (IDE batch P1.4): the
+                    // host's diff tab shows this file's working-tree diff. The menu only
+                    // appears when a git data provider exists; for untracked files the
+                    // diff tab itself reports "no diff".
+                    val editorSurfaceModifier =
+                        context.contextMenuProvider?.applyContextMenu(
+                            Modifier,
+                            if (filePath.isNotEmpty() && context.gitDataProvider != null) {
+                                listOf(
+                                    ContextMenuItemData(
+                                        label = "Open Diff",
+                                        onClick = { context.gitDataProvider?.openDiff(filePath, context.windowId ?: "", staged = false) },
+                                    ),
+                                )
+                            } else {
+                                emptyList()
+                            },
+                        ) ?: Modifier
+                    // Uncommitted changes for the left gutter. Empty for an untitled
+                    // document, which has no buffer and so no file to compare.
+                    val gitMarks: Map<Int, LineDiff.Mark> =
+                        editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+                    Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
                     state = editorState,
@@ -1093,6 +1185,13 @@ class EditorTabComponent(
                     minimapBackgroundColor = minimapBgColor,
                     minimapForegroundColor = minimapFgColor,
                     tokenProvider = tokenProvider,
+                    // Transparent, purely to make the editor reserve its gutter
+                    // icon strip; GitGutterMarks draws the glyphs into it,
+                    // because drawGutterIconForLine can paint a shape but never
+                    // text.
+                    gutterIcons = remember(gitMarks, editorBuffer) {
+                        reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
+                    },
                     searchMatches = searchMatches,
                     currentSearchMatchIndex = currentSearchMatchIndex,
                     // Don't use custom navigationResolver - let BossEditor use internal NavigationManager
@@ -1112,11 +1211,19 @@ class EditorTabComponent(
                                 semanticVersion++
                             }
                         }
+                        // Debounced ghost-text request at the new caret position
+                        if (!isLargeFile) {
+                            aiCompletion?.schedule(editorState, filePath, language, completionSettings)
+                        }
                     },
                     onCaretPositionChanged = { position ->
                         // Convert to 1-based line/column for compatibility
                         cursorLine = position.line + 1
                         cursorColumn = position.column + 1
+                        aiCompletion?.onCaretMoved(position)
+                        // Caret activity is the "focused document" heuristic
+                        // for focusedDocument(): the user is here.
+                        editorBuffer?.let { EditorBufferRegistry.markFocused(it) }
                     },
                     onSelectionChanged = { _ ->
                         // Selection changed - could integrate with mark occurrences
@@ -1291,6 +1398,25 @@ class EditorTabComponent(
                     }
                 )
 
+                // Uncommitted-change markers in the editor's own gutter strip.
+                // The diff tab draws its own gutter and never reaches this
+                // path, so the two cannot fight.
+                GitGutterMarks(gitMarks, editorState)
+
+                // AI ghost-text overlay. Plugin-side stand-in for a real inline
+                // suggestion mechanism (the bundled BossEditor has none);
+                // anchoring math mirrors the rename dialog and run gutter.
+                if (ghostSuggestion != null && !isLargeFile) {
+                    GhostTextOverlay(
+                        suggestion = ghostSuggestion,
+                        editorState = editorState,
+                        fallbackLineHeight = lineHeightPx,
+                        fontFamily = composeFontFamily,
+                        fontSize = settings.fontSize,
+                        editorTheme = editorTheme
+                    )
+                }
+
                 // Usages popup overlay (exactly like bundled editor)
                 if (usagesPopupState.isVisible && usagesPopupState.definition != null) {
                     UsagesPopup(
@@ -1358,6 +1484,27 @@ class EditorTabComponent(
                                 else -> null
                             }
                         }
+                    )
+                }
+
+                // AI inline edit (Cmd+K): one inline card over the editor,
+                // Cursor-style - prompt, generation and the accept/reject diff
+                // in the same place. It replaced an AlertDialog plus the
+                // library's RefactorPreviewDialog, which took focus off the
+                // editor and covered the code being edited.
+                if (aiEditSession != null) {
+                    val inlineEditService = aiInlineEdit
+                    AiInlineEditBar(
+                        session = aiEditSession,
+                        onPromptChange = { inlineEditService?.setPrompt(it) },
+                        onSubmit = { inlineEditService?.submit() },
+                        onAccept = {
+                            if (inlineEditService != null && !inlineEditService.applyAccepted()) {
+                                inlineEditService.markStale()
+                            }
+                        },
+                        onCancel = { inlineEditService?.cancel() },
+                        modifier = Modifier.align(Alignment.TopCenter),
                     )
                 }
 
@@ -1555,26 +1702,6 @@ class EditorTabComponent(
                 }
             }  // End Row
 
-            // Sits out here rather than inside the editor Box: a Markdown tab in Preview mode
-            // composes no editor at all, and that tab still has a buffer worth protecting.
-            diskConflict?.let { conflict ->
-                FileChangedOnDiskDialog(
-                    fileName = filePath.substringAfterLast('/').ifEmpty { "This file" },
-                    onReload = {
-                        applyReload(conflict.content, conflict.snapshot)
-                        diskConflict = null
-                    },
-                    onKeepMine = {
-                        // Adopt the disk state without adopting the disk content: the buffer
-                        // stays dirty and wins the next save, and we stop asking about a
-                        // change the user has already answered for.
-                        originalContent = conflict.content
-                        adoptDiskState(conflict.snapshot)
-                        diskConflict = null
-                    }
-                )
-            }
-
             // Status bar (matches bundled editor)
             EditorStatusBar(
                 filePath = filePath,
@@ -1625,61 +1752,65 @@ class EditorTabComponent(
          */
         internal fun detectLanguage(filePath: String): String = LanguageDetection.detect(filePath)
 
+        /**
+         * A read-only BossEditor wired exactly as the editor tab wires its own:
+         * same lexer, same [TokenCache] for multi-line state, same theme and
+         * settings, minimap on.
+         *
+         * Shared rather than reimplemented so the diff cannot drift from the
+         * editor - a second highlighter is precisely what moving the diff tab
+         * into this plugin exists to avoid.
+         */
+        @Composable
+        internal fun DiffEditorSurface(
+            state: EditorState,
+            filePath: String,
+            context: PluginContext,
+            showMinimap: Boolean,
+            readOnly: Boolean = true,
+            showLineNumbers: Boolean = true,
+        ) {
+            val settings by PluginEditorSettings.settings.collectAsState()
+            val language = remember(filePath) { detectLanguage(filePath) }
+            val lexer = remember(language) { getLexerForLanguage(language) }
+            val tokenCache = remember(lexer, state.document) {
+                lexer?.let { TokenCache(state.document, it) }
+            }
+            DisposableEffect(tokenCache) { onDispose { tokenCache?.dispose() } }
+
+            val tokenProvider: (Int) -> List<EditorToken> = remember(tokenCache) {
+                { lineNumber -> EditorToken.fromTokens(tokenCache?.getLineTokens(lineNumber) ?: emptyList()) }
+            }
+            val composeFontFamily = FontFamily.Monospace
+            val hostTheme = rememberHostEditorTheme()
+            val editorTheme = remember(settings.followHostTheme, settings.themeName, hostTheme) {
+                resolveEditorTheme(settings.followHostTheme, settings.themeName, hostTheme)
+            }
+
+            BossEditor(
+                state = state,
+                modifier = Modifier.fillMaxSize(),
+                theme = editorTheme,
+                fontFamily = composeFontFamily,
+                fontSize = settings.fontSize,
+                lineSpacing = settings.lineSpacing,
+                showLineNumbers = settings.showLineNumbers && showLineNumbers,
+                highlightCurrentLine = !readOnly,
+                readOnly = readOnly,
+                filePath = filePath,
+                projectPath = context.projectPath,
+                // One minimap for the pair, on the right: two rulers of the
+                // same file is noise, and the right side is the "after" state
+                // a reader is navigating.
+                showMinimap = showMinimap && settings.showMinimap,
+                minimapWidth = settings.minimapWidth,
+                minimapUseEditorColors = settings.minimapUseEditorColors,
+                tokenProvider = tokenProvider,
+            )
+        }
+
         /** Lexer for [language], or null for plain text. See [LanguageDetection]. */
         internal fun getLexerForLanguage(language: String): BaseLexer? = LanguageDetection.lexerFor(language)
-    }
-}
-
-/** A settled external change waiting on the user, because taking it would lose their edits. */
-private data class DiskConflict(val content: String, val snapshot: DiskSnapshot)
-
-/**
- * Asked only when both versions are real: unsaved edits in the tab, and a different file on
- * disk. There is no safe default between the two, so there is no dismiss-to-nowhere either -
- * clicking outside means "keep mine", which is the choice that destroys nothing.
- */
-@Composable
-private fun FileChangedOnDiskDialog(
-    fileName: String,
-    onReload: () -> Unit,
-    onKeepMine: () -> Unit
-) {
-    val colors = LocalEditorTheme.current.colors
-
-    Dialog(
-        onDismissRequest = onKeepMine,
-        properties = DialogProperties(dismissOnClickOutside = true, dismissOnBackPress = true)
-    ) {
-        Column(
-            modifier = Modifier
-                .width(420.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(colors.background)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Text(
-                text = "$fileName changed on disk",
-                color = colors.text,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                text = "Something else wrote to this file while you had unsaved changes here. " +
-                    "Reloading takes the version on disk and discards yours. Keeping yours " +
-                    "leaves the tab as it is, and saving again overwrites the file.",
-                color = colors.lineNumber,
-                fontSize = 13.sp
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                DialogAction(label = "Keep my version", primary = false, onClick = onKeepMine)
-                DialogAction(label = "Reload from disk", primary = true, onClick = onReload)
-            }
-        }
     }
 }
 
@@ -1829,6 +1960,76 @@ private fun EditorStatusBar(
     }
 }
 
+// ========== AI Ghost Text Overlay ==========
+
+/**
+ * Ghost-text overlay for AI tab completion. Continuation lines float over
+ * whatever sits below the caret (on a translucent editor-background card
+ * rather than pushing text down) — the accepted trade-off of the plugin-side
+ * overlay until the BossEditor library grows inline-suggestion support.
+ */
+@Composable
+private fun GhostTextOverlay(
+    suggestion: GhostSuggestion,
+    editorState: EditorState,
+    fallbackLineHeight: Float,
+    fontFamily: FontFamily,
+    fontSize: Float,
+    editorTheme: EditorTheme
+) {
+    val viewport by editorState.visibleViewport.collectAsState()
+    val scrollOffset by editorState.scrollOffset.collectAsState()
+    val visualLineMapper by editorState.visualLineMapper.collectAsState()
+
+    // Caret line hidden inside a collapsed fold: nothing to anchor to
+    val visualLine = visualLineMapper.documentToVisual(suggestion.position.line)
+    if (visualLine < 0) return
+    // Caret line scrolled out of the viewport: the Box doesn't clip, so an
+    // off-screen anchor would paint over the search bar / status bar
+    if (viewport.visibleLineCount > 0 &&
+        (visualLine < viewport.firstVisibleLine ||
+            visualLine >= viewport.firstVisibleLine + viewport.visibleLineCount)
+    ) {
+        return
+    }
+
+    val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
+    val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
+    val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
+
+    val x = (gutterWidth + suggestion.position.column * charWidth - scrollOffset.x).toInt()
+    val y = ((visualLine * lineHeight) - scrollOffset.y).toInt()
+
+    val style = TextStyle(
+        fontFamily = fontFamily,
+        fontSize = fontSize.sp,
+        fontStyle = FontStyle.Italic,
+        color = editorTheme.colors.text.copy(alpha = 0.45f)
+    )
+    val lines = suggestion.text.lines()
+
+    // First line: inline at the caret, transparent background
+    Text(
+        text = lines.first(),
+        style = style,
+        maxLines = 1,
+        softWrap = false,
+        modifier = Modifier.offset { IntOffset(x, y) }
+    )
+    if (lines.size > 1) {
+        Column(
+            modifier = Modifier
+                .offset { IntOffset((gutterWidth - scrollOffset.x).toInt(), (y + lineHeight).toInt()) }
+                .background(editorTheme.colors.background.copy(alpha = 0.92f))
+                .padding(horizontal = 4.dp)
+        ) {
+            lines.drop(1).forEach { line ->
+                Text(text = line, style = style, maxLines = 1, softWrap = false)
+            }
+        }
+    }
+}
+
 // ========== Settings ==========
 
 /**
@@ -1912,10 +2113,19 @@ object PluginEditorSettings {
 
     private var lastModified: Long = settingsFile.lastModified()
 
-    init {
-        // Start file watcher in background
-        kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            while (true) {
+    private var watcherJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * The 500ms file poll, on a scope the plugin owns.
+     *
+     * It used to run on GlobalScope, where nothing could ever cancel it - the
+     * loop held this plugin's classloader for the life of the JVM after
+     * unload. The plugin starts it in register() and stops it in dispose().
+     */
+    fun start(scope: kotlinx.coroutines.CoroutineScope) {
+        watcherJob?.cancel()
+        watcherJob = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            while (isActive) {
                 kotlinx.coroutines.delay(500) // Check every 500ms
                 try {
                     val currentModified = settingsFile.lastModified()
@@ -1929,6 +2139,11 @@ object PluginEditorSettings {
                 }
             }
         }
+    }
+
+    fun stop() {
+        watcherJob?.cancel()
+        watcherJob = null
     }
 
     private fun loadFromFile(): PluginEditorSettingsData {
@@ -2800,4 +3015,127 @@ private fun GutterRunIcon(
             .hoverable(interactionSource)
             .clickable { onRun(detected) }
     )
+}
+
+/**
+ * What a key press on the editor does, decided by [editorShortcutFor].
+ *
+ * Pure data: the composable matches on this and executes, so the ORDERING of
+ * the dispatch (which shortcut wins on which key) lives in one tested
+ * function instead of being spread across a `when` inside the UI - where a
+ * branch condition that matches too broadly silently makes every later
+ * branch dead code.
+ */
+internal sealed interface EditorKeyAction {
+    /** Delete [range] (the Mac line/word deletion shortcuts). */
+    data class EditRange(val range: IntRange) : EditorKeyAction
+
+    /** Move the caret to document offset [offset]. */
+    data class MoveCaret(val offset: Int) : EditorKeyAction
+
+    data object ShowFind : EditorKeyAction
+    data object ShowFindReplace : EditorKeyAction
+    data object GoToLine : EditorKeyAction
+    data object Redo : EditorKeyAction
+    data object InlineAiEdit : EditorKeyAction
+    data object Save : EditorKeyAction
+    data object FindNext : EditorKeyAction
+    data object FindPrevious : EditorKeyAction
+    data object CloseSearch : EditorKeyAction
+}
+
+/**
+ * The editor's key dispatch, pure and testable.
+ *
+ * [editRange] and [caretTarget] are the pre-computed results of the two
+ * document-copying helpers (each evaluated at most once per key by the
+ * caller); the rest is decided from the key and modifiers alone.
+ *
+ * The two editing-shortcut results MUST stay the first branches: they are
+ * the only ones that must win over the platform shortcuts on their keys.
+ * Every later branch is a platform shortcut the bundled editor does not
+ * implement (find, go-to-line, redo, inline AI edit, save, F3, escape).
+ */
+internal fun editorShortcutFor(
+    key: Key,
+    isMeta: Boolean,
+    isShift: Boolean,
+    isLargeFile: Boolean,
+    showSearchBar: Boolean,
+    editRange: IntRange?,
+    caretTarget: Int?,
+): EditorKeyAction? =
+    when {
+        editRange != null -> EditorKeyAction.EditRange(editRange)
+        caretTarget != null -> EditorKeyAction.MoveCaret(caretTarget)
+        isMeta && key == Key.F -> EditorKeyAction.ShowFind
+        isMeta && key == Key.H -> EditorKeyAction.ShowFindReplace
+        isMeta && (key == Key.G || key == Key.L) -> EditorKeyAction.GoToLine
+        isMeta && key == Key.Y -> EditorKeyAction.Redo
+        isMeta && key == Key.K && !isLargeFile -> EditorKeyAction.InlineAiEdit
+        isMeta && key == Key.S && !isLargeFile -> EditorKeyAction.Save
+        key == Key.F3 && !isShift -> EditorKeyAction.FindNext
+        key == Key.F3 && isShift -> EditorKeyAction.FindPrevious
+        key == Key.Escape && showSearchBar -> EditorKeyAction.CloseSearch
+        else -> null
+    }
+
+/**
+ * The range a deletion shortcut removes, or null when this key is not one.
+ *
+ * ⌘⌫ / ⌘⌦ act on the line, ⌥⌫ / ⌥⌦ on the word. Returning null for a no-op
+ * (caret already at the boundary) matters: an empty edit would still cost an
+ * undo step.
+ *
+ * The key/modifier is checked BEFORE copying the document: these run on
+ * every key press, and the copy is the expensive part.
+ */
+private fun editingShortcutRange(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    isCmd: Boolean,
+    state: EditorState,
+): IntRange? {
+    val isDeleteKey = event.key == Key.Backspace || event.key == Key.Delete
+    if (!(isCmd && isDeleteKey) && !event.isAltPressed) return null
+    val text = state.document.getText()
+    val caret = state.caretOffset
+    return when {
+        isCmd && event.key == Key.Backspace -> MacEditingShortcuts.deleteToLineStart(text, caret)
+        isCmd && event.key == Key.Delete -> MacEditingShortcuts.deleteToLineEnd(text, caret)
+        event.isAltPressed && event.key == Key.Backspace -> MacEditingShortcuts.deletePreviousWord(text, caret)
+        event.isAltPressed && event.key == Key.Delete -> MacEditingShortcuts.deleteNextWord(text, caret)
+        else -> null
+    }
+}
+
+/**
+ * The offset a caret-movement shortcut targets, or null when not one.
+ *
+ * Like [editingShortcutRange], the key is checked before the document copy.
+ */
+private fun caretShortcutTarget(
+    event: androidx.compose.ui.input.key.KeyEvent,
+    isCmd: Boolean,
+    state: EditorState,
+): Int? {
+    if (event.isShiftPressed) return null // selection variants stay with the editor
+    // The four arrow keys, checked without allocating a set per key event.
+    val isDirection =
+        event.key == Key.DirectionLeft || event.key == Key.DirectionRight ||
+            event.key == Key.DirectionUp || event.key == Key.DirectionDown
+    val isAltHorizontal =
+        event.isAltPressed &&
+            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight)
+    if (!(isCmd && isDirection) && !isAltHorizontal) return null
+    val text = state.document.getText()
+    val caret = state.caretOffset
+    return when {
+        isCmd && event.key == Key.DirectionLeft -> MacEditingShortcuts.lineStart(text, caret)
+        isCmd && event.key == Key.DirectionRight -> MacEditingShortcuts.lineEnd(text, caret)
+        isCmd && event.key == Key.DirectionUp -> 0
+        isCmd && event.key == Key.DirectionDown -> text.length
+        event.isAltPressed && event.key == Key.DirectionLeft -> MacEditingShortcuts.previousWordStart(text, caret)
+        event.isAltPressed && event.key == Key.DirectionRight -> MacEditingShortcuts.nextWordEnd(text, caret)
+        else -> null
+    }
 }
