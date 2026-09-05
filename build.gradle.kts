@@ -66,7 +66,13 @@ dependencies {
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.12")
+    //
+    // 1.0.13 is required, not merely preferred: LSP navigation cannot work on
+    // 1.0.12. Its ServerDiscovery rejects any command containing a path
+    // separator, so an absolute path to a server reads as "not installed" and
+    // no process is ever spawned; and its InitializeResult decodes union-typed
+    // capabilities strictly, which failed the handshake for every server tried.
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.13")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

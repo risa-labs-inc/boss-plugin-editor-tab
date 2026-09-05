@@ -9,8 +9,12 @@ import ai.rever.bosseditor.lsp.providers.LspNavigationProvider
 import ai.rever.bosseditor.lsp.server.LanguageServerConfig
 import ai.rever.bosseditor.lsp.server.LanguageServerManager
 import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -18,6 +22,7 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.addJsonObject
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.net.URI
 
 /**
@@ -44,27 +49,77 @@ class LspNavigation {
 
     private val manager = LanguageServerManager()
 
-    /** Documents already announced with didOpen, by URI. Guarded by [mutex]. */
-    private val opened = mutableSetOf<String>()
+    /**
+     * Documents announced with didOpen, per language, together with the client
+     * they were announced to. Guarded by [mutex].
+     *
+     * Keyed by the client and not only the URI, because a server that dies is
+     * replaced: `LanguageServerManager.getOrStartServer` hands back a FRESH
+     * process, which has never heard of the document. Sending it a didChange
+     * for a document it never opened leaves that file answering NotFound for
+     * the rest of the session, and nothing is logged. Comparing identity means
+     * a replacement is re-announced instead.
+     */
+    private val opened = mutableMapOf<String, OpenDocuments>()
+
+    /**
+     * Monotonic document version, shared across documents.
+     *
+     * Per-document monotonicity is all the protocol asks for, and one counter
+     * satisfies it for every document at once. It has to be a counter: a clock
+     * truncated to Int wraps, and spends half of each cycle negative - below the
+     * version didOpen sent - so a server that drops non-increasing changes would
+     * quietly keep answering from the snapshot taken when the file was opened.
+     */
+    private val documentVersion = AtomicInteger(0)
 
     /** Serialises start + sync so two fast clicks cannot open the same doc twice. */
     private val mutex = Mutex()
 
+    private class OpenDocuments(val client: LspClient) {
+        val uris = mutableSetOf<String>()
+    }
+
     /**
      * Resolve the definition of the symbol at [offset], or [NavigationResolveResult.NotFound].
      *
-     * Never throws: a click that cannot be answered must fall through to the
-     * editor's "not found" affordance, not tear down the composable's coroutine.
-     * Every failure here is therefore a silent NotFound, so when navigation is
-     * "not working" the only way to see WHY is the LSP file log, which
-     * `LspSettingsManager` ships disabled (`logging.fileLoggingEnabled`).
+     * Runs on [Dispatchers.IO]. The editor calls its resolver from a
+     * `rememberCoroutineScope()`, whose dispatcher is the composition's - the UI
+     * thread - and a cold first call here spawns a login shell, stats every PATH
+     * entry, then spawns and initializes a server. On the UI thread that is a
+     * visible freeze measured in seconds.
+     *
+     * Never throws except to propagate cancellation: a click that cannot be
+     * answered must fall through to the editor's "not found" affordance, not
+     * tear down the composable's coroutine. Every other failure is therefore a
+     * silent NotFound, so when navigation is "not working" the only way to see
+     * WHY is the LSP file log, which `LspSettingsManager` ships disabled
+     * (`logging.fileLoggingEnabled`).
      */
     suspend fun resolveDefinition(
         content: String,
         filePath: String,
         offset: Int,
         projectPath: String?,
-    ): NavigationResolveResult = runCatching {
+    ): NavigationResolveResult = withContext(Dispatchers.IO) {
+        try {
+            resolve(content, filePath, offset, projectPath)
+        } catch (cancellation: CancellationException) {
+            // Closing the tab mid-resolution is not a failed lookup. Swallowing it
+            // would report NotFound to a caller that is already gone, and hide the
+            // cancellation from the scope that raised it.
+            throw cancellation
+        } catch (_: Throwable) {
+            NavigationResolveResult.NotFound
+        }
+    }
+
+    private suspend fun resolve(
+        content: String,
+        filePath: String,
+        offset: Int,
+        projectPath: String?,
+    ): NavigationResolveResult {
         if (!LspSettingsManager.instance.configuration.value.enabled) return NavigationResolveResult.NotFound
         // No registered server for this extension: answer immediately rather
         // than paying a process spawn to find out.
@@ -75,8 +130,6 @@ class LspNavigation {
         // a 60s initialize timeout on every single click.
         //
         // Resolved against the USER's PATH, not this process's - see [launchPath].
-        // The library's own ServerDiscovery reads System.getenv("PATH") and would
-        // find nothing.
         val launchable = launchConfig(config) ?: return NavigationResolveResult.NotFound
 
         // A server rooted at the wrong directory resolves nothing outside the file
@@ -87,8 +140,12 @@ class LspNavigation {
 
         val uri = File(filePath).toURI().toString()
         val client = mutex.withLock {
+            // Whether THIS call is the one that starts the server, asked before
+            // starting it - the settle below is only owed on a cold start.
+            val cold = !manager.isServerRunning(config.languageId)
             val c = manager.getOrStartServer(launchable, root)
             syncDocument(c, uri, config.languageId, content)
+            if (cold) delay(COLD_START_SETTLE_MS)
             c
         }
 
@@ -100,12 +157,12 @@ class LspNavigation {
         val targetPath = uriToPath(location.uri) ?: return NavigationResolveResult.NotFound
         // LSP positions are 0-based; NavigationTarget - and so openFileAtPosition,
         // which both this and the PSI path feed - is 1-based on both axes.
-        NavigationResolveResult.Found(
+        return NavigationResolveResult.Found(
             filePath = targetPath,
             line = location.range.start.line + 1,
             column = location.range.start.character + 1,
         )
-    }.getOrElse { NavigationResolveResult.NotFound }
+    }
 
     /**
      * Give the server the buffer as it stands right now.
@@ -118,31 +175,31 @@ class LspNavigation {
      * Sent directly on [LspClient.notify] instead of through LspDocumentSyncManager,
      * which would drag in a semantic-token provider this path has no use for.
      */
-    private fun syncDocument(client: LspClient, uri: String, languageId: String, content: String) {
-        if (opened.add(uri)) {
+    internal fun syncDocument(client: LspClient, uri: String, languageId: String, content: String) {
+        val known = opened[languageId]?.takeIf { it.client === client }
+            ?: OpenDocuments(client).also { opened[languageId] = it }
+        if (known.uris.add(uri)) {
             client.notify(LspMethods.DID_OPEN, didOpen(uri, languageId, content))
         } else {
             client.notify(LspMethods.DID_CHANGE, didChange(uri, content))
         }
     }
 
-    private fun didOpen(uri: String, languageId: String, content: String): JsonElement =
+    internal fun didOpen(uri: String, languageId: String, content: String): JsonElement =
         buildJsonObject {
             put("textDocument", buildJsonObject {
                 put("uri", uri)
                 put("languageId", languageId)
-                put("version", 1)
+                put("version", documentVersion.incrementAndGet())
                 put("text", content)
             })
         }
 
-    private fun didChange(uri: String, content: String): JsonElement =
+    internal fun didChange(uri: String, content: String): JsonElement =
         buildJsonObject {
             put("textDocument", buildJsonObject {
                 put("uri", uri)
-                // Monotonic per notification is all the protocol asks for, and the
-                // server only compares versions for ordering.
-                put("version", System.currentTimeMillis().toInt())
+                put("version", documentVersion.incrementAndGet())
             })
             putJsonArray("contentChanges") {
                 // No `range` key: this is a whole-document replacement.
@@ -158,29 +215,24 @@ class LspNavigation {
      *
      * 1. BOSS is launched from the Dock, so it inherits launchd's PATH -
      *    `/usr/bin:/bin:/usr/sbin:/sbin`. Homebrew, npm-global, pyenv shims and
-     *    ~/.local/bin are all absent, and `ServerDiscovery` resolves names against
-     *    `System.getenv("PATH")`. A perfectly installed server reads as "not found".
-     * 2. `DesktopLspClient` spawns with `ProcessBuilder(command)`, so the CHILD
-     *    inherits that same stunted PATH. An absolute path fixes the exec, but most
-     *    of these servers are node scripts whose `#!/usr/bin/env node` line then
-     *    fails to find node - which is not on the app's PATH either.
-     *
-     * Both are handled by launching through `/usr/bin/env PATH=<real> <abs-server>`:
-     * the absolute path settles the exec, and the injected PATH settles everything
-     * the server itself shells out to. `LanguageServerConfig` carries no environment
-     * field, so this is the seam available.
+     *    ~/.local/bin are all absent, and the registry's command is a bare name.
+     *    A perfectly installed server reads as "not found", so the command has to
+     *    become an absolute path.
+     * 2. The server process inherits that same stunted PATH. An absolute path
+     *    settles the exec, but most of these servers are node scripts whose
+     *    `#!/usr/bin/env node` line then fails to find node - which is not on the
+     *    app's PATH either. The environment carries the real PATH for that.
      */
-    private fun launchConfig(config: LanguageServerConfig): LanguageServerConfig? {
+    internal fun launchConfig(
+        config: LanguageServerConfig,
+        path: String = launchPath,
+    ): LanguageServerConfig? {
         val name = config.command.firstOrNull() ?: return null
-        val exe = findOnPath(name, launchPath) ?: return null
-        val args = config.command.drop(1)
-        val env = File("/usr/bin/env")
-        // Without `env` there is no way to set the child's PATH; the absolute path
-        // alone still beats the name, so degrade to that rather than refusing.
-        val command =
-            if (env.canExecute()) listOf(env.path, "PATH=$launchPath", exe) + args
-            else listOf(exe) + args
-        return config.copy(command = command)
+        val exe = findOnPath(name, path) ?: return null
+        return config.copy(
+            command = listOf(exe) + config.command.drop(1),
+            environment = config.environment + mapOf("PATH" to path),
+        )
     }
 
     /** Free every server process. Called when the plugin is disposed. */
@@ -189,6 +241,25 @@ class LspNavigation {
     }
 
     companion object {
+        /**
+         * How long a freshly started server gets before the first question.
+         *
+         * Servers answer as soon as they are initialized, but several keep
+         * loading the project behind that - and tsserver in particular answers a
+         * definition request made in the gap from the open file alone. The answer
+         * is not an error and does not look like one: clicking a call resolves to
+         * the local `import` binding instead of the exported declaration, which is
+         * a real location in a real file, just the wrong one.
+         *
+         * Because servers start lazily on the click, the FIRST navigation in a
+         * language always lands in that gap without this. Measured against
+         * typescript-language-server, the shallow answer persists for under a
+         * second; the margin is for a colder machine or a larger project. Paid
+         * once per language per session, and only when this call is the one that
+         * started the server.
+         */
+        private const val COLD_START_SETTLE_MS = 1_500L
+
         /**
          * One instance for the whole plugin.
          *
