@@ -196,6 +196,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         composerSessions?.flushAll()
         composerSessions = null
         ExternalChangeWatcher.uninstall()
+        // Language servers are child processes, and nothing else reaps them:
+        // without this an unload leaves one per language running until BOSS exits.
+        LspNavigation.disposeShared()
         // Stop the settings file-polls explicitly; scope cancellation below
         // is a backstop, not the mechanism.
         AiCompletionSettings.stop()
