@@ -136,6 +136,21 @@ tasks.named<Jar>("jar") {
 }
 
 // Task to build plugin JAR with compiled classes only
+// Which checkout produced this jar. Worktrees of this repo can declare the same
+// `version` while holding different work, and a jar carries no other record of where
+// it came from - `unzip -p <jar> META-INF/MANIFEST.MF` is then the fastest way to
+// tell an installed build apart from the branch you are reading.
+fun gitDescribe(vararg args: String): String =
+    runCatching {
+        providers.exec {
+            commandLine("git", *args)
+            workingDir = rootDir
+        }.standardOutput.asText.get().trim()
+    }.getOrNull().orEmpty().ifEmpty { "unknown" }
+
+val buildBranch: String = gitDescribe("rev-parse", "--abbrev-ref", "HEAD")
+val buildCommit: String = gitDescribe("rev-parse", "--short", "HEAD")
+
 tasks.register<Jar>("buildPluginJar") {
     archiveFileName.set("boss-plugin-editor-tab-${version}.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -153,6 +168,8 @@ tasks.register<Jar>("buildPluginJar") {
         attributes(
             "Implementation-Title" to "BOSS Code Editor Tab Plugin",
             "Implementation-Version" to version,
+            "Implementation-Branch" to buildBranch,
+            "Implementation-Commit" to buildCommit,
             "Main-Class" to "ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin"
         )
     }

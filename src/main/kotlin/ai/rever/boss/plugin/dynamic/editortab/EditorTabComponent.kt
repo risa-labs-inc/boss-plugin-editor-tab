@@ -1194,9 +1194,20 @@ class EditorTabComponent(
                     },
                     searchMatches = searchMatches,
                     currentSearchMatchIndex = currentSearchMatchIndex,
-                    // Don't use custom navigationResolver - let BossEditor use internal NavigationManager
-                    // which has ShowUsages support for clicking on definitions
-                    navigationResolver = null,
+                    // Per FILE, not per editor. `navigationResolver` REPLACES the
+                    // internal PSI NavigationManager rather than layering over it, so
+                    // this is the only way to keep both: Kotlin stays on PSI, which is
+                    // the sole path that can answer ShowUsages (the resolver contract
+                    // is Found/NotFound and has no variant for it), and every other
+                    // language - where PSI returns Unavailable and Cmd+Click therefore
+                    // did nothing at all - goes to LSP.
+                    navigationResolver = if (LspNavigation.usesPsi(filePath)) {
+                        null
+                    } else {
+                        { content, path, offset ->
+                            LspNavigation.shared.resolveDefinition(content, path, offset, projectPath)
+                        }
+                    },
                     onTextChanged = {
                         // Restarts the auto save debounce
                         editVersion++
