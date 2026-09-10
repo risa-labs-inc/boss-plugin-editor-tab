@@ -596,21 +596,14 @@ class DiffTabComponent(
                     if (event.type == KeyEventType.KeyDown && meta && event.key == Key.S) {
                         if (state.isModified.value) {
                             scope.launch {
-                                val text = state.document.getText()
-                                val ok = withContext(Dispatchers.IO) {
-                                    runCatching { File(absolutePath).writeText(text) }.isSuccess
-                                }
-                                if (ok) {
-                                    state.markAsSaved()
-                                    // Shared bookkeeping: without this a save
-                                    // made from the diff tab looks to the
-                                    // watcher - and to any editor tab on the
-                                    // same file - like an external change.
-                                    EditorBufferRegistry.find(absolutePath)?.noteWrittenByUs()
-                                    onNote("Saved")
-                                } else {
-                                    onNote("Failed to save")
-                                }
+                                val result =
+                                    EditorBufferRegistry.find(absolutePath)?.let {
+                                        saveEditorDocument(
+                                            it,
+                                            context.editorContentProvider?.let { provider -> provider::writeFileContent },
+                                        )
+                                    } ?: DocumentSaveResult.UNAVAILABLE
+                                onNote(if (result == DocumentSaveResult.SAVED) "Saved" else result.message)
                             }
                         }
                         true
