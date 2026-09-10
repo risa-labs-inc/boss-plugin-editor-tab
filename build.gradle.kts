@@ -29,7 +29,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
 // 1.6.3: auto-bumped bundled BossEditor to 1.0.13
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.13).
-version = "1.6.3"
+version = "1.6.4"
 
 java {
     toolchain {
