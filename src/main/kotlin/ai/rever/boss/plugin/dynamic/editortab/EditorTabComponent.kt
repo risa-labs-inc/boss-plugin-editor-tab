@@ -17,6 +17,7 @@ import ai.rever.bosseditor.features.NavigationFeedbackState
 import ai.rever.bosseditor.features.NavigationFailureReason
 import ai.rever.bosseditor.features.SearchManager
 import ai.rever.bosseditor.features.SearchOptions
+import ai.rever.bosseditor.features.EditorLineDecoration
 import ai.rever.bosseditor.ui.SearchBar
 import ai.rever.bosseditor.ui.GoToLineDialog
 import ai.rever.bosseditor.largefile.LargeFileDocument
@@ -630,6 +631,51 @@ class EditorTabComponent(
         var editVersion by remember { mutableStateOf(0) }
         val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
 
+        // Review uses a private, read-only EditorState. The shared live document remains byte-for-
+        // byte unchanged until Accept, so other splits, LSP, autosave and undo never observe a
+        // proposal. The shadow contains the old block followed by the proposed block as a unified
+        // red/green hunk.
+        val reviewIsStale = aiEditSession?.done == true &&
+            editorState.document.documentVersion != aiEditSession.bufferVersion
+        LaunchedEffect(reviewIsStale, aiEditSession?.replacement) {
+            if (reviewIsStale) aiInlineEdit?.markStale()
+        }
+        val aiReviewDocument = remember(
+            aiEditSession?.done,
+            aiEditSession?.replacement,
+            aiEditSession?.bufferVersion,
+            editorState.document.documentVersion,
+        ) {
+            aiEditSession?.takeIf { it.done && it.replacement.isNotEmpty() && !reviewIsStale }?.let { session ->
+                val start = editorState.document.positionToOffset(session.startLine, session.startCol)
+                val end = editorState.document.positionToOffset(session.endLine, session.endCol)
+                buildAiInlineReviewDocument(editorState.document.getText(), start, end, session.replacement)
+            }
+        }
+        val reviewEditorState = remember(aiReviewDocument?.text, filePath) {
+            aiReviewDocument?.let { review ->
+                EditorState(review.text, filePath).also { shadow ->
+                    shadow.moveCaret(EditorPosition(review.controlAnchorLine, 0))
+                    shadow.setScrollOffset(editorState.scrollOffset.value)
+                }
+            }
+        }
+        val displayedEditorState = reviewEditorState ?: editorState
+        val reviewRemovedColor = BossThemeColors.ErrorColor.copy(alpha = 0.20f)
+        val reviewAddedColor = BossThemeColors.SuccessColor.copy(alpha = 0.20f)
+        val reviewLineDecorations = remember(aiReviewDocument, reviewRemovedColor, reviewAddedColor) {
+            aiReviewDocument?.let { review ->
+                buildList {
+                    repeat(review.removedLineCount) { offset ->
+                        add(EditorLineDecoration(review.removedLineStart + offset, reviewRemovedColor))
+                    }
+                    repeat(review.addedLineCount) { offset ->
+                        add(EditorLineDecoration(review.addedLineStart + offset, reviewAddedColor))
+                    }
+                }
+            }.orEmpty()
+        }
+
         // Search state
         var showSearchBar by remember { mutableStateOf(false) }
         var showReplaceInSearchBar by remember { mutableStateOf(false) }
@@ -663,6 +709,22 @@ class EditorTabComponent(
         // Incrementing this causes `remember(tokenCache, filePath, semanticVersion)` to
         // recreate the lambda, which triggers the editor to re-render with semantic colors.
         var semanticVersion by remember { mutableStateOf(0) }
+
+        fun noteLiveTextChanged() {
+            editVersion++
+            if (isMarkdown) {
+                markdownText = editorState.document.getText()
+            }
+            if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
+                coroutineScope.launch {
+                    semanticTokens.analyzeFile(filePath, editorState.document.getText())
+                    semanticVersion++
+                }
+            }
+            if (!isLargeFile) {
+                aiCompletion?.schedule(editorState, filePath, language, completionSettings)
+            }
+        }
 
         // Bumped by every reload from disk. `initialContent` is a plain field rather than
         // snapshot state, so the two effects below would otherwise never re-run and the tab
@@ -1182,6 +1244,13 @@ class EditorTabComponent(
                     // document, which has no buffer and so no file to compare.
                     val gitMarks: Map<Int, LineDiff.Mark> =
                         editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+                    val displayedGutterIcons = remember(gitMarks, editorBuffer, aiReviewDocument != null) {
+                        if (aiReviewDocument == null) {
+                            reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
+                        } else {
+                            emptyList()
+                        }
+                    }
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1191,7 +1260,7 @@ class EditorTabComponent(
                     ) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
-                    state = editorState,
+                    state = displayedEditorState,
                     modifier = Modifier.fillMaxSize(),
                     theme = editorTheme,
                     fontFamily = composeFontFamily,
@@ -1199,7 +1268,7 @@ class EditorTabComponent(
                     lineSpacing = settings.lineSpacing,
                     showLineNumbers = settings.showLineNumbers,
                     highlightCurrentLine = settings.highlightCurrentLine,
-                    readOnly = isLargeFile, // Large files are read-only
+                    readOnly = isLargeFile || aiReviewDocument != null,
                     filePath = filePath,
                     projectPath = projectPath,
                     showMinimap = settings.showMinimap,
@@ -1207,16 +1276,15 @@ class EditorTabComponent(
                     minimapUseEditorColors = settings.minimapUseEditorColors,
                     minimapBackgroundColor = minimapBgColor,
                     minimapForegroundColor = minimapFgColor,
-                    tokenProvider = tokenProvider,
+                    tokenProvider = if (aiReviewDocument == null) tokenProvider else ({ _: Int -> emptyList() }),
                     // Transparent, purely to make the editor reserve its gutter
                     // icon strip; GitGutterMarks draws the glyphs into it,
                     // because drawGutterIconForLine can paint a shape but never
                     // text.
-                    gutterIcons = remember(gitMarks, editorBuffer) {
-                        reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
-                    },
-                    searchMatches = searchMatches,
-                    currentSearchMatchIndex = currentSearchMatchIndex,
+                    gutterIcons = displayedGutterIcons,
+                    searchMatches = if (aiReviewDocument == null) searchMatches else emptyList(),
+                    currentSearchMatchIndex = if (aiReviewDocument == null) currentSearchMatchIndex else -1,
+                    lineDecorations = reviewLineDecorations,
                     // Per FILE, not per editor. `navigationResolver` REPLACES the
                     // internal PSI NavigationManager rather than layering over it, so
                     // this is the only way to keep both: Kotlin stays on PSI, which is
@@ -1237,23 +1305,7 @@ class EditorTabComponent(
                         }
                     },
                     onTextChanged = {
-                        // Restarts the auto save debounce
-                        editVersion++
-                        // Feed the live markdown preview (debounced inside the pane)
-                        if (isMarkdown) {
-                            markdownText = editorState.document.getText()
-                        }
-                        // Re-trigger PSI semantic analysis after edits
-                        if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
-                            coroutineScope.launch {
-                                semanticTokens.analyzeFile(filePath, editorState.document.getText())
-                                semanticVersion++
-                            }
-                        }
-                        // Debounced ghost-text request at the new caret position
-                        if (!isLargeFile) {
-                            aiCompletion?.schedule(editorState, filePath, language, completionSettings)
-                        }
+                        noteLiveTextChanged()
                     },
                     onCaretPositionChanged = { position ->
                         // Convert to 1-based line/column for compatibility
@@ -1440,12 +1492,14 @@ class EditorTabComponent(
                 // Uncommitted-change markers in the editor's own gutter strip.
                 // The diff tab draws its own gutter and never reaches this
                 // path, so the two cannot fight.
-                GitGutterMarks(gitMarks, editorState)
+                if (aiReviewDocument == null) {
+                    GitGutterMarks(gitMarks, editorState)
+                }
 
                 // AI ghost-text overlay. Plugin-side stand-in for a real inline
                 // suggestion mechanism (the bundled BossEditor has none);
                 // anchoring math mirrors the rename dialog and run gutter.
-                if (ghostSuggestion != null && !isLargeFile) {
+                if (ghostSuggestion != null && !isLargeFile && aiReviewDocument == null) {
                     GhostTextOverlay(
                         suggestion = ghostSuggestion,
                         editorState = editorState,
@@ -1527,22 +1581,28 @@ class EditorTabComponent(
                 }
 
                 // AI inline edit (Cmd/Ctrl+I/K): one inline card over the editor,
-                // Cursor-style - prompt, generation and the accept/reject diff
-                // in the same place. It replaced an AlertDialog plus the
-                // library's RefactorPreviewDialog, which took focus off the
-                // editor and covered the code being edited.
+                // Cursor-style prompt and compact accept/reject controls. Review code is the
+                // red/green shadow EditorState rendered in the main editor surface above.
                 if (aiEditSession != null) {
                     val inlineEditService = aiInlineEdit
                     AnchoredAiInlineEditBar(
                         session = aiEditSession,
-                        editorState = editorState,
+                        editorState = displayedEditorState,
                         editorSurfaceSize = editorSurfaceSize,
                         fallbackLineHeight = lineHeightPx,
+                        anchorLine = aiReviewDocument?.controlAnchorLine,
+                        anchorCol = if (aiReviewDocument != null) 0 else null,
                         onPromptChange = { inlineEditService?.setPrompt(it) },
                         onSubmit = { inlineEditService?.submit() },
                         onAccept = {
-                            if (inlineEditService != null && !inlineEditService.applyAccepted()) {
-                                inlineEditService.markStale()
+                            if (inlineEditService != null) {
+                                if (inlineEditService.applyAccepted()) {
+                                    // While reviewing, BossEditor observes the shadow state. Notify
+                                    // the live-buffer side effects explicitly for this one edit.
+                                    noteLiveTextChanged()
+                                } else {
+                                    inlineEditService.markStale()
+                                }
                             }
                         },
                         onCancel = { inlineEditService?.cancel() },
@@ -2011,6 +2071,8 @@ private fun AnchoredAiInlineEditBar(
     editorState: EditorState,
     editorSurfaceSize: IntSize,
     fallbackLineHeight: Float,
+    anchorLine: Int? = null,
+    anchorCol: Int? = null,
     onPromptChange: (String) -> Unit,
     onSubmit: () -> Unit,
     onAccept: () -> Unit,
@@ -2019,7 +2081,9 @@ private fun AnchoredAiInlineEditBar(
     val viewport by editorState.visibleViewport.collectAsState()
     val scrollOffset by editorState.scrollOffset.collectAsState()
     val visualLineMapper by editorState.visualLineMapper.collectAsState()
-    var popupSize by remember(session.anchorLine, session.anchorCol) { mutableStateOf(IntSize.Zero) }
+    val resolvedAnchorLine = anchorLine ?: session.anchorLine
+    val resolvedAnchorCol = anchorCol ?: session.anchorCol
+    var popupSize by remember(resolvedAnchorLine, resolvedAnchorCol) { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current
     val marginPx = with(density) { AI_INLINE_MARGIN.roundToPx() }
     val gapPx = with(density) { AI_INLINE_GAP.roundToPx() }
@@ -2027,8 +2091,8 @@ private fun AnchoredAiInlineEditBar(
     val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
     val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
     val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
-    val visualLine = visualLineMapper.documentToVisual(session.anchorLine)
-    val anchorX = gutterWidth + session.anchorCol * charWidth - scrollOffset.x
+    val visualLine = visualLineMapper.documentToVisual(resolvedAnchorLine)
+    val anchorX = gutterWidth + resolvedAnchorCol * charWidth - scrollOffset.x
     val anchorY = if (visualLine >= 0) visualLine * lineHeight - scrollOffset.y else marginPx.toFloat()
     val placement = placeAiInlineEdit(
         containerWidth = editorSurfaceSize.width,

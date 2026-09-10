@@ -43,10 +43,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Cmd/Ctrl+I or Cmd/Ctrl+K inline AI edit (IDE batch P4.2).
  *
  * The selection (or the caret's line when nothing is selected) is sent to the
- * active AI provider with a "rewrite only this code" prompt; the reply is
- * shown in the library's RefactorPreviewDialog and applied through the
- * shared buffer's document - one undo step, and refused with a stale error
- * when the buffer moved since the request started.
+ * active AI provider with a "rewrite only this code" prompt. Review is rendered from a shadow
+ * EditorState, so the live buffer, LSP, autosave and other splits do not observe a proposed edit.
  *
  * Opens even when AI is unavailable so the prompt can explain whether the
  * shared provider or gateway needs configuration.
@@ -190,8 +188,9 @@ class AiInlineEditService(
                     _session.value = _session.value?.copy(busy = false, error = "The model returned no replacement")
                     return@launch
                 }
-                // Build the library's preview (windowed before/after) on the
-                // buffer's content at response time.
+                // Build preview metadata on the buffer's content at response time. The UI also
+                // builds a read-only shadow EditorState; the live document stays untouched until
+                // Accept.
                 val uri = buffer?.path ?: ""
                 val edit =
                     TextEdit(
@@ -272,7 +271,12 @@ class AiInlineEditService(
         val start = doc.positionToOffset(s.startLine, s.startCol)
         val end = doc.positionToOffset(s.endLine, s.endCol)
         if (start !in 0..doc.length || end !in 0..doc.length || start > end) return false
-        doc.replace(start, end, s.replacement)
+        applyAcceptedAiInlineEdit(
+            state = state,
+            start = EditorPosition(s.startLine, s.startCol),
+            end = EditorPosition(s.endLine, s.endCol),
+            replacement = s.replacement,
+        )
         _session.value = null
         return true
     }
@@ -346,4 +350,17 @@ class AiInlineEditService(
             return t.trimEnd()
         }
     }
+}
+
+/** Applies an accepted proposal as one undo step, isolated from the preceding typing group. */
+internal fun applyAcceptedAiInlineEdit(
+    state: EditorState,
+    start: EditorPosition,
+    end: EditorPosition,
+    replacement: String,
+) {
+    state.undoManager.breakUndoGroup()
+    state.setSelection(ai.rever.bosseditor.core.EditorRange(start, end))
+    state.insertText(replacement)
+    state.undoManager.breakUndoGroup()
 }
