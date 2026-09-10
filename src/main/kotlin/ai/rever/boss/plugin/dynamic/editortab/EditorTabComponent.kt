@@ -23,6 +23,7 @@ import ai.rever.bosseditor.ui.SearchBar
 import ai.rever.bosseditor.ui.GoToLineDialog
 import ai.rever.bosseditor.largefile.LargeFileDocument
 import ai.rever.bosseditor.largefile.LargeFileLimitationsDialog
+import ai.rever.bosseditor.lsp.config.LspSettingsManager
 import ai.rever.bosseditor.psi.ReferenceLocation
 import ai.rever.bosseditor.psi.DefinitionInfo
 import ai.rever.bosseditor.refactoring.RefactorContext
@@ -1260,6 +1261,9 @@ class EditorTabComponent(
                             emptyList()
                         }
                     }
+                    // A settings change must replace the resolver in already-open tabs. It also
+                    // forces LspSettingsManager's synchronous load before consulting the registry.
+                    val lspConfig by LspSettingsManager.instance.configuration.collectAsState()
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1300,13 +1304,14 @@ class EditorTabComponent(
                     // this is the only way to keep both: Kotlin stays on PSI, which is
                     // the sole path that can answer ShowUsages (the resolver contract
                     // is Found/NotFound and has no variant for it), and every other
-                    // language - where PSI returns Unavailable and Cmd+Click therefore
-                    // did nothing at all - goes to LSP.
+                    // language with a registered server goes to LSP. Unsupported files
+                    // keep the built-in Unavailable result instead of claiming a lookup failed.
                     navigationResolver = remember<(suspend (String, String, Int) -> NavigationResolveResult)?>(
                         filePath,
                         projectPath,
+                        lspConfig,
                     ) {
-                        if (LspNavigation.usesPsi(filePath)) {
+                        if (!lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
                             null
                         } else {
                             { content, path, offset ->

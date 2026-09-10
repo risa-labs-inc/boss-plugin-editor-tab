@@ -12,8 +12,7 @@ import kotlin.test.assertTrue
  * feature's correctness rests on, and the PSI-vs-LSP routing decision.
  *
  * `resolveDefinition` itself is not covered - it spawns a real language-server
- * process, and there is no seam to fake `LanguageServerManager` through (its
- * constructor takes a config and a scope, not a transport). What CAN go wrong
+ * process, and this class has no injectable manager/client factory. What CAN go wrong
  * silently is the arithmetic, so that is what is pinned here.
  */
 class LspNavigationTest {
@@ -95,6 +94,30 @@ class LspNavigationTest {
     }
 
     @Test
+    fun `file path becomes a canonical three slash uri`() {
+        val path = "/tmp/a b.ts"
+        val uri = LspNavigation.fileUri(path)
+        assertTrue(uri.startsWith("file:///"))
+        assertEquals(File(path).canonicalPath, LspNavigation.uriToPath(uri))
+    }
+
+    @Test
+    fun `canonical server target is mapped back through the requested root alias`() {
+        assertEquals(
+            "/workspace-link/src/main.ts",
+            LspNavigation.restoreRootAlias(
+                targetPath = "/canonical/workspace/src/main.ts",
+                canonicalRoot = "/canonical/workspace",
+                requestedRoot = "/workspace-link",
+            ),
+        )
+        assertEquals(
+            "/other/main.ts",
+            LspNavigation.restoreRootAlias("/other/main.ts", "/canonical/workspace", "/workspace-link"),
+        )
+    }
+
+    @Test
     fun `a non-file uri resolves to null rather than a bogus path`() {
         assertNull(LspNavigation.uriToPath("untitled:Untitled-1"))
     }
@@ -165,13 +188,17 @@ class LspNavigationTest {
     @Test
     fun `explicit relative executable path is resolved directly`() {
         val dir = File("build/tmp/lspnav-relative-${System.nanoTime()}").apply { mkdirs() }
-        val exe = File(dir, "server").apply {
-            writeText("#!/bin/sh\n")
-            setExecutable(true)
+        try {
+            val exe = File(dir, "server").apply {
+                writeText("#!/bin/sh\n")
+                setExecutable(true)
+            }
+            val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
+            val found = LspNavigation.findOnPath(relative, "/missing")
+            assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
+        } finally {
+            dir.deleteRecursively()
         }
-        val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
-        val found = LspNavigation.findOnPath(relative, "/missing")
-        assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
     }
 
     @Test
@@ -207,7 +234,16 @@ class LspNavigationTest {
         assertFalse(LspNavigation.usesPsi("/x/main.py"))
         assertFalse(LspNavigation.usesPsi("/x/main.rs"))
         assertFalse(LspNavigation.usesPsi("/x/Main.java"))
+        // Match BossEditor's and this plugin's other case-sensitive Kotlin gates.
+        assertFalse(LspNavigation.usesPsi("/x/Main.KT"))
         // No extension at all must not be mistaken for Kotlin.
         assertFalse(LspNavigation.usesPsi("/x/Makefile"))
+    }
+
+    @Test
+    fun `replacing resolver is installed only for a registered non-Kotlin server`() {
+        assertTrue(LspNavigation.shouldUseLsp("/x/main.ts", serverRegistered = true))
+        assertFalse(LspNavigation.shouldUseLsp("/x/Main.kt", serverRegistered = true))
+        assertFalse(LspNavigation.shouldUseLsp("/x/README.md", serverRegistered = false))
     }
 }

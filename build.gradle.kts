@@ -27,7 +27,8 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-version = "1.6.7"
+// 1.6.3: LSP-backed Cmd+Click navigation for non-Kotlin files.
+version = "1.6.3"
 
 java {
     toolchain {
@@ -154,16 +155,12 @@ fun gitDescribeNow(vararg args: String): String =
         }.standardOutput.asText.get().trim()
     }.getOrNull().orEmpty().ifEmpty { "unknown" }
 
-val buildBranch = providers.provider {
-    sequenceOf(System.getenv("GITHUB_HEAD_REF"), System.getenv("GITHUB_REF_NAME"))
-        .filterNotNull()
-        .firstOrNull { it.isNotBlank() }
-        ?: gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD")
-}
-val buildCommit = providers.provider {
-    System.getenv("GITHUB_SHA")?.takeIf { it.isNotBlank() }
-        ?: gitDescribeNow("rev-parse", "--short", "HEAD")
-}
+val buildBranch = providers.environmentVariable("GITHUB_HEAD_REF")
+    .orElse(providers.environmentVariable("GITHUB_REF_NAME"))
+    .orElse(providers.provider { gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD") })
+// On pull_request this deliberately identifies Actions' tested merge commit; local builds use HEAD.
+val buildCommit = providers.environmentVariable("GITHUB_SHA")
+    .orElse(providers.provider { gitDescribeNow("rev-parse", "--short", "HEAD") })
 
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {

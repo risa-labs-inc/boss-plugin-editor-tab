@@ -13,10 +13,17 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotSame
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -110,13 +117,17 @@ class LspNavigationLaunchTest {
     }
 
     @Test
-    fun `an existing environment survives, PATH wins on conflict`() {
+    fun `an existing environment survives and its PATH keeps first precedence`() {
         val dir = tempDir()
         serverOn(dir, "srv")
-        val base = config("srv").copy(environment = mapOf("NODE_ENV" to "test", "PATH" to "/ignored"))
+        val configured = tempDir()
+        val base = config("srv").copy(environment = mapOf("NODE_ENV" to "test", "PATH" to configured.absolutePath))
         val launched = LspNavigation().launchConfig(base, dir.absolutePath)
         assertEquals("test", launched?.environment?.get("NODE_ENV"))
-        assertEquals(dir.absolutePath, launched?.environment?.get("PATH"))
+        assertEquals(
+            listOf(configured.absolutePath, dir.absolutePath).joinToString(File.pathSeparator),
+            launched?.environment?.get("PATH"),
+        )
     }
 
     @Test
@@ -140,11 +151,12 @@ class LspNavigationLaunchTest {
 
     @Test
     fun `windows PATHEXT resolves and wraps a command script`() {
+        val missing = tempDir()
         val dir = tempDir()
         val script = File(dir, "typescript-language-server.cmd").apply { writeText("@echo off\n") }
         val launched = LspNavigation().launchConfig(
             config("typescript-language-server", "--stdio"),
-            path = dir.absolutePath,
+            path = "${missing.absolutePath};${dir.absolutePath}",
             isWindows = true,
             pathExtensions = ".EXE;.CMD",
             commandInterpreter = "C:\\Windows\\System32\\cmd.exe",
@@ -159,6 +171,23 @@ class LspNavigationLaunchTest {
                 "call \"${script.absolutePath}\" \"--stdio\"",
             ),
             launched?.command,
+        )
+    }
+
+    @Test
+    fun `windows lookup checks every semicolon separated path entry`() {
+        val first = tempDir()
+        val second = tempDir()
+        val script = File(second, "server.cmd").apply { writeText("@echo off\n") }
+
+        assertEquals(
+            script.absolutePath,
+            LspNavigation.findOnPath(
+                command = "server",
+                path = "${first.absolutePath};${second.absolutePath}",
+                isWindows = true,
+                pathExtensions = ".CMD",
+            ),
         )
     }
 
@@ -180,6 +209,27 @@ class LspNavigationLaunchTest {
     }
 
     @Test
+    fun `cmd file is launched directly off Windows`() {
+        val script = serverOn(tempDir(), "server.cmd")
+        val launched = LspNavigation().launchConfig(
+            config(script.absolutePath, "--stdio"),
+            path = "",
+            isWindows = false,
+        )
+
+        assertEquals(listOf(script.absolutePath, "--stdio"), launched?.command)
+    }
+
+    @Test
+    fun `a failed shell PATH still merges process and fallback paths`() {
+        val separator = File.pathSeparator
+        assertEquals(
+            listOf("/process/bin", "/fallback/bin").joinToString(separator),
+            LspNavigation.mergePaths(null, "/process/bin", listOf("/fallback/bin")),
+        )
+    }
+
+    @Test
     fun `disposed navigation cannot start more work`() = runBlocking {
         val navigation = LspNavigation()
         navigation.dispose()
@@ -187,6 +237,56 @@ class LspNavigationLaunchTest {
             NavigationResolveResult.NotFound,
             navigation.resolveDefinition("const x = 1", "/tmp/a.ts", 0, "/tmp"),
         )
+    }
+
+    @Test
+    fun `fresh registration re-arms a disposed shared navigation`() {
+        val before = LspNavigation.shared
+        try {
+            LspNavigation.disposeShared()
+            assertSame(before, LspNavigation.shared)
+
+            LspNavigation.resetShared()
+            assertNotSame(before, LspNavigation.shared)
+        } finally {
+            LspNavigation.resetShared()
+        }
+    }
+
+    @Test
+    fun `startup failure cooldown expires and a settings change retries immediately`() {
+        var now = 1_000L
+        val failures = LspNavigation.FailureCooldown<String, String>(cooldownMs = 5) { now }
+
+        failures.record("typescript@root", "settings-a")
+        assertTrue(failures.isCoolingDown("typescript@root", "settings-a"))
+        assertFalse(failures.isCoolingDown("typescript@root", "settings-b"))
+
+        failures.record("typescript@root", "settings-b")
+        now += 5_000_000L
+        assertFalse(failures.isCoolingDown("typescript@root", "settings-b"))
+
+        failures.record("typescript@root", "settings-c", cooldownMs = 1)
+        now += 1_000_000L
+        assertFalse(failures.isCoolingDown("typescript@root", "settings-c"))
+    }
+
+    @Test
+    fun `an ancestor timeout is propagated rather than reported as the inner timeout`() {
+        val navigation = LspNavigation()
+        var innerReturned = false
+
+        assertFailsWith<TimeoutCancellationException> {
+            runBlocking {
+                withTimeout(20) {
+                    navigation.ownTimeout(1_000) {
+                        delay(10_000)
+                    }
+                    innerReturned = true
+                }
+            }
+        }
+        assertFalse(innerReturned)
     }
 
     // ---- document versions ----------------------------------------------
@@ -224,6 +324,15 @@ class LspNavigationLaunchTest {
     }
 
     @Test
+    fun `an unchanged document is not shipped again`() {
+        val nav = LspNavigation()
+        val client = RecordingClient()
+        nav.syncDocument(client, "file:///a.ts", "typescript", "same")
+        nav.syncDocument(client, "file:///a.ts", "typescript", "same")
+        assertEquals(listOf(LspMethods.DID_OPEN), client.methods)
+    }
+
+    @Test
     fun `a replaced server is told about the document again`() {
         // LanguageServerManager hands back a FRESH process when a server has
         // died, and that process has never heard of the document. Sending it a
@@ -231,14 +340,20 @@ class LspNavigationLaunchTest {
         // session, with nothing logged anywhere.
         val nav = LspNavigation()
         val first = RecordingClient()
+        assertTrue(nav.trackClient("typescript", "/root", first))
+        assertFalse(nav.trackClient("typescript", "/root", first))
         nav.syncDocument(first, "file:///a.ts", "typescript", "one")
         nav.syncDocument(first, "file:///a.ts", "typescript", "two")
 
         val restarted = RecordingClient()
+        assertTrue(nav.trackClient("typescript", "/root", restarted))
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "three")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "four")
 
-        assertEquals(listOf(LspMethods.DID_OPEN, LspMethods.DID_CHANGE), first.methods)
+        // Reaching the old client again is synthetic, but proves its strong-key entry was evicted.
+        nav.syncDocument(first, "file:///a.ts", "typescript", "five")
+
+        assertEquals(listOf(LspMethods.DID_OPEN, LspMethods.DID_CHANGE, LspMethods.DID_OPEN), first.methods)
         assertEquals(listOf(LspMethods.DID_OPEN, LspMethods.DID_CHANGE), restarted.methods)
     }
 

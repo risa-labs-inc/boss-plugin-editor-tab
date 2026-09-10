@@ -44,6 +44,9 @@ class EditorTabDynamicPlugin : DynamicPlugin {
     private var pluginScope: CoroutineScope? = null
 
     override fun register(context: PluginContext) {
+        // disposeShared deliberately leaves a dead singleton installed during unload so a stale
+        // tab cannot resurrect a process. A fresh registration is the only point that re-arms it.
+        LspNavigation.resetShared()
         pluginContext = context
 
         markdownSettingsManager?.dispose()
