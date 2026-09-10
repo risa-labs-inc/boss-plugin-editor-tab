@@ -107,10 +107,9 @@ class LspNavigation {
      * entry, then spawns and initializes a server. On the UI thread that is a
      * visible freeze measured in seconds.
      *
-     * Never throws except to propagate cancellation: a click that cannot be
-     * answered must fall through to the editor's "not found" affordance, not
-     * tear down the composable's coroutine. Other failures are logged to stderr
-     * before returning NotFound so a missing or failed server is diagnosable.
+     * Operational failures return NotFound, while cancellation and process-fatal
+     * [Error]s deliberately propagate. A missing or failed server is logged to
+     * stderr instead of being silently indistinguishable from an absent result.
      */
     suspend fun resolveDefinition(
         content: String,
@@ -203,6 +202,7 @@ class LspNavigation {
                 }
             }
             if (!c.isInitialized) {
+                startupFailures.record(key, fingerprint, START_TIMEOUT_COOLDOWN_MS)
                 stopFailedServer(manager, config.languageId)
                 throw IllegalStateException("${config.displayName} stopped before document sync")
             }
@@ -230,14 +230,20 @@ class LspNavigation {
         } catch (cancellation: CancellationException) {
             throw cancellation
         } catch (error: Exception) {
-            // A failed request should not leave a dead or wedged client cached forever.
-            stopFailedServer(manager, config.languageId)
+            // A transport failure marks the client dead; a decode/provider error on a still-live
+            // shared server must not tear it out from under every other tab in this workspace.
+            if (!client.isInitialized) stopFailedServer(manager, config.languageId)
             throw error
         }
         val location = when (requested) {
             is TimedResult.Value -> requested.value ?: return NavigationResolveResult.NotFound
             TimedResult.TimedOut -> {
-                stopFailedServer(manager, config.languageId)
+                // A slow project is not a dead process. Keep an initialized shared server warm so
+                // the next click can benefit from the work it has already done.
+                System.err.println(
+                    "[LspNavigation] definition timed out after ${settings.defaultRequestTimeoutMs}ms for '$filePath'",
+                )
+                if (!client.isInitialized) stopFailedServer(manager, config.languageId)
                 return NavigationResolveResult.NotFound
             }
         }
@@ -412,6 +418,7 @@ class LspNavigation {
         private const val COLD_START_SETTLE_MS = 1_500L
         private const val STOP_FAILED_SERVER_TIMEOUT_MS = 2_000L
         private const val START_TIMEOUT_COOLDOWN_MS = 10_000L
+        private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
 
         /**
          * One instance for the whole plugin.
@@ -620,7 +627,6 @@ class LspNavigation {
         internal fun fileUri(path: String): String =
             "file://${runCatching { File(path).canonicalFile }.getOrElse { File(path).absoluteFile }.toURI().rawPath}"
 
-        private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
     }
 
     /** Small, testable negative cache whose fingerprint makes every settings change a retry. */
