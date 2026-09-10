@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.editortab
 import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.lsp.client.LspClient
 import ai.rever.bosseditor.lsp.client.LspMethods
+import ai.rever.bosseditor.lsp.config.LspConfiguration
 import ai.rever.bosseditor.lsp.config.LspSettingsManager
 import ai.rever.bosseditor.lsp.protocol.Position
 import ai.rever.bosseditor.lsp.providers.LspNavigationProvider
@@ -11,10 +12,14 @@ import ai.rever.bosseditor.lsp.server.LanguageServerManager
 import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -55,7 +60,7 @@ class LspNavigation {
 
     /**
      * Documents announced with didOpen, keyed by the client they were announced to.
-     * Each set is concurrent because different language/root locks may reach the same client.
+     * Each map is concurrent because different language/root locks may reach the same client.
      *
      * Keyed by the client and not only the URI, because a server that dies is
      * replaced: `LanguageServerManager.getOrStartServer` hands back a FRESH
@@ -64,7 +69,10 @@ class LspNavigation {
      * the rest of the session, and nothing is logged. Comparing identity means
      * a replacement is re-announced instead.
      */
-    private val opened = ConcurrentHashMap<LspClient, MutableSet<String>>()
+    private val opened = ConcurrentHashMap<LspClient, ConcurrentHashMap<String, String>>()
+
+    /** The current client for each server; replacing it evicts the dead client's document state. */
+    private val clients = ConcurrentHashMap<ServerKey, LspClient>()
 
     /**
      * Monotonic document version, shared across documents.
@@ -80,7 +88,15 @@ class LspNavigation {
     /** Serialises start + sync per language/root without blocking unrelated servers. */
     private val mutexes = ConcurrentHashMap<ServerKey, Mutex>()
 
+    /** A broken installed server gets one expensive start attempt per cooldown, not one per click. */
+    private val startupFailures = FailureCooldown<ServerKey, StartupFingerprint>(START_FAILURE_COOLDOWN_MS)
+
     private data class ServerKey(val languageId: String, val root: String)
+
+    private data class StartupFingerprint(
+        val config: LanguageServerConfig,
+        val settings: LspConfiguration,
+    )
 
     /**
      * Resolve the definition of the symbol at [offset], or [NavigationResolveResult.NotFound].
@@ -104,7 +120,13 @@ class LspNavigation {
     ): NavigationResolveResult = withContext(Dispatchers.IO) {
         if (disposed) return@withContext NavigationResolveResult.NotFound
         try {
-            resolve(content, filePath, offset, projectPath)
+            // One user-configurable ceiling covers discovery, initialize, the cold-start settle,
+            // and the request. A server must never retain one navigation coroutine indefinitely.
+            withTimeoutOrNull(
+                LspSettingsManager.instance.configuration.value.defaultRequestTimeoutMs.coerceAtLeast(1L),
+            ) {
+                resolve(content, filePath, offset, projectPath)
+            } ?: NavigationResolveResult.NotFound
         } catch (cancellation: CancellationException) {
             // Closing the tab mid-resolution is not a failed lookup. Swallowing it
             // would report NotFound to a caller that is already gone, and hide the
@@ -124,7 +146,8 @@ class LspNavigation {
         offset: Int,
         projectPath: String?,
     ): NavigationResolveResult {
-        if (!LspSettingsManager.instance.configuration.value.enabled) return NavigationResolveResult.NotFound
+        val settings = LspSettingsManager.instance.configuration.value
+        if (!settings.enabled) return NavigationResolveResult.NotFound
         // LspSettingsManager applies both built-in enablement and enabled custom servers to
         // the registry. Trust the selected, enabled config here; a separate disabled-language
         // check would incorrectly reject a custom replacement for a disabled built-in server.
@@ -142,30 +165,70 @@ class LspNavigation {
             ?: File(filePath).parentFile?.absolutePath
             ?: return NavigationResolveResult.NotFound
 
-        val uri = File(filePath).toURI().toString()
+        val uri = File(filePath).absoluteFile.toURI().toString()
         val key = ServerKey(config.languageId, canonicalRoot(root))
+        val fingerprint = StartupFingerprint(launchable, settings)
+        if (startupFailures.isCoolingDown(key, fingerprint)) return NavigationResolveResult.NotFound
+
         val manager = managers.computeIfAbsent(key.root) { LanguageServerManager() }
         val client = mutexes.computeIfAbsent(key) { Mutex() }.withLock {
-            if (disposed) return@withLock null
-            // Whether THIS call is the one that starts the server, asked before
-            // starting it - the settle below is only owed on a cold start.
-            val cold = !manager.isServerRunning(config.languageId)
-            val c = manager.getOrStartServer(launchable, root)
-            // dispose() may have raced the suspend above after clearing the manager map.
-            // Dispose this retained manager too so a late start cannot orphan a process.
             if (disposed) {
+                managers.remove(key.root, manager)
                 runCatching { manager.dispose() }
                 return@withLock null
             }
+            // Calls that arrived during the original attempt passed the fast check above before
+            // it failed; re-check after taking the lock so they do not each retry in sequence.
+            if (startupFailures.isCoolingDown(key, fingerprint)) return@withLock null
+            // Whether THIS call is the one that starts the server, asked before
+            // starting it - the settle below is only owed on a cold start.
+            val cold = !manager.isServerRunning(config.languageId)
+            val initializeTimeout = minOf(
+                settings.initializeTimeoutMs,
+                settings.defaultRequestTimeoutMs,
+            ).coerceAtLeast(1L)
+            val c = try {
+                withTimeout(initializeTimeout) {
+                    manager.getOrStartServer(launchable, key.root)
+                }
+            } catch (timeout: TimeoutCancellationException) {
+                startupFailures.record(key, fingerprint)
+                stopFailedServer(manager, config.languageId)
+                throw IllegalStateException(
+                    "${config.displayName} did not initialize within ${initializeTimeout}ms",
+                    timeout,
+                )
+            } catch (cancellation: CancellationException) {
+                // External cancellation is not a server failure. BossEditor converts its own
+                // initialize timeout to LanguageServerException before it reaches this boundary.
+                throw cancellation
+            } catch (error: Exception) {
+                startupFailures.record(key, fingerprint)
+                // LanguageServerManager installs the client in its map before initialize. Remove
+                // that half-started process now; otherwise every cooldown retains one orphan.
+                stopFailedServer(manager, config.languageId)
+                throw error
+            }
+            // dispose() may have raced the suspend above after clearing the manager map.
+            // Dispose this retained manager too so a late start cannot orphan a process.
+            if (disposed) {
+                managers.remove(key.root, manager)
+                runCatching { manager.dispose() }
+                return@withLock null
+            }
+            startupFailures.remove(key)
+            trackClient(key, c)
             syncDocument(c, uri, config.languageId, content)
             if (cold) delay(COLD_START_SETTLE_MS)
             c
         } ?: return NavigationResolveResult.NotFound
 
         val position = offsetToPosition(content, offset)
-        val location = LspNavigationProvider(client)
-            .goToDefinition(uri, position)
-            .firstOrNull() ?: return NavigationResolveResult.NotFound
+        val location = withTimeoutOrNull(settings.defaultRequestTimeoutMs.coerceAtLeast(1L)) {
+            LspNavigationProvider(client)
+                .goToDefinition(uri, position)
+                .firstOrNull()
+        } ?: return NavigationResolveResult.NotFound
 
         val targetPath = uriToPath(location.uri) ?: return NavigationResolveResult.NotFound
         // LSP positions are 0-based; NavigationTarget - and so openFileAtPosition,
@@ -177,13 +240,22 @@ class LspNavigation {
         )
     }
 
+    private suspend fun stopFailedServer(manager: LanguageServerManager, languageId: String) {
+        // The caller may be handling our timeout, whose coroutine is already cancelled. Cleanup
+        // still has to reach the manager so the half-initialized child process is not retained.
+        withContext(NonCancellable) {
+            runCatching { manager.stopServer(languageId) }
+        }
+    }
+
     /**
      * Give the server the buffer as it stands right now.
      *
-     * Full-text sync on every navigation rather than incremental didChange: this
-     * is one message on a user gesture, not a keystroke path, and sending the whole
-     * buffer is what makes the answer reflect UNSAVED edits. Resolving against
-     * whatever is on disk is the failure mode worth paying a few KB to avoid.
+     * Full-text sync when the buffer changes rather than incremental didChange:
+     * this is a user-gesture path, not a keystroke path, and sending the whole
+     * buffer is what makes the answer reflect UNSAVED edits. Byte-identical repeat
+     * clicks send nothing. Resolving against whatever is on disk is the failure
+     * mode worth paying a few KB to avoid.
      *
      * Sent directly on [LspClient.notify] instead of through LspDocumentSyncManager,
      * which would drag in a semantic-token provider this path has no use for.
@@ -192,12 +264,26 @@ class LspNavigation {
         // Keep the document open for the lifetime of this shared client. Editor-tab does not
         // own a global document reference count, so didClose from one tab could invalidate the
         // same URI while another split/tab is still using it.
-        val known = opened.computeIfAbsent(client) { ConcurrentHashMap.newKeySet() }
-        if (known.add(uri)) {
+        val known = opened.computeIfAbsent(client) { ConcurrentHashMap() }
+        val previous = known[uri]
+        if (previous == null) {
             client.notify(LspMethods.DID_OPEN, didOpen(uri, languageId, content))
-        } else {
+            known[uri] = content
+        } else if (previous != content) {
             client.notify(LspMethods.DID_CHANGE, didChange(uri, content))
+            known[uri] = content
         }
+    }
+
+    private fun trackClient(key: ServerKey, client: LspClient) {
+        clients.put(key, client)
+            ?.takeIf { previous -> previous !== client }
+            ?.let(opened::remove)
+    }
+
+    /** Test seam for the restart eviction invariant without constructing a real manager. */
+    internal fun trackClient(languageId: String, root: String, client: LspClient) {
+        trackClient(ServerKey(languageId, root), client)
     }
 
     internal fun didOpen(uri: String, languageId: String, content: String): JsonElement =
@@ -246,7 +332,8 @@ class LspNavigation {
         commandInterpreter: String = windowsCommandInterpreter(),
     ): LanguageServerConfig? {
         val name = config.command.firstOrNull() ?: return null
-        val exe = findOnPath(name, path, isWindows, pathExtensions) ?: return null
+        val effectivePath = mergePaths(config.environment["PATH"], path, emptyList())
+        val exe = findOnPath(name, effectivePath, isWindows, pathExtensions) ?: return null
         val arguments = config.command.drop(1)
         val command =
             if (isWindows && (exe.endsWith(".cmd", ignoreCase = true) || exe.endsWith(".bat", ignoreCase = true))) {
@@ -256,7 +343,7 @@ class LspNavigation {
             }
         return config.copy(
             command = command,
-            environment = config.environment + mapOf("PATH" to path),
+            environment = config.environment + mapOf("PATH" to effectivePath),
         )
     }
 
@@ -267,6 +354,8 @@ class LspNavigation {
         managers.clear()
         mutexes.clear()
         opened.clear()
+        clients.clear()
+        startupFailures.clear()
     }
 
     companion object {
@@ -315,6 +404,14 @@ class LspNavigation {
             }
         }
 
+        /** Re-arm the singleton when the host registers this plugin again on the same classloader. */
+        fun resetShared() {
+            synchronized(this) {
+                sharedInstance?.dispose()
+                sharedInstance = null
+            }
+        }
+
         /**
          * PATH as the user's shell sees it.
          *
@@ -325,7 +422,7 @@ class LspNavigation {
         private val launchPath: String by lazy { buildLaunchPath() }
 
         private fun buildLaunchPath(): String {
-            val fromShell = runCatching {
+            val fromShell = if (isWindowsPlatform()) null else runCatching {
                 val shell = System.getenv("SHELL")?.takeIf { File(it).canExecute() } ?: "/bin/sh"
                 val output = kotlin.io.path.createTempFile("boss-lsp-path", ".txt").toFile()
                 try {
@@ -372,6 +469,7 @@ class LspNavigation {
             isWindows: Boolean = isWindowsPlatform(),
             pathExtensions: String = System.getenv("PATHEXT").orEmpty(),
         ): String? {
+            val direct = command.contains('/') || command.contains('\\')
             val extensions =
                 if (isWindows && File(command).extension.isEmpty()) {
                     pathExtensions.ifBlank { ".COM;.EXE;.BAT;.CMD" }
@@ -383,15 +481,15 @@ class LspNavigation {
                     emptyList()
                 }
             val names = sequenceOf(command) + extensions.asSequence().map { command + it }
-            val direct = command.contains('/') || command.contains('\\')
-            val directories =
-                if (direct) sequenceOf<String?>(null)
-                else path.split(if (isWindows) ';' else File.pathSeparatorChar).asSequence()
-                    .filter { it.isNotBlank() }
-                    .map { it }
+            if (direct) {
+                return names.map(::File)
+                    .firstOrNull { it.isFile && (isWindows || it.canExecute()) }
+                    ?.absolutePath
+            }
 
-            return directories
-                .flatMap { directory -> names.map { name -> if (directory == null) File(name) else File(directory, name) } }
+            return path.split(if (isWindows) ';' else File.pathSeparatorChar).asSequence()
+                .filter { it.isNotBlank() }
+                .flatMap { directory -> names.map { name -> File(directory, name) } }
                 .firstOrNull { it.isFile && (isWindows || it.canExecute()) }
                 ?.absolutePath
         }
@@ -426,7 +524,8 @@ class LspNavigation {
          * find-usages popup for a definition jump. Deciding per file keeps both.
          */
         fun usesPsi(filePath: String): Boolean =
-            filePath.isBlank() || filePath.endsWith(".kt") || filePath.endsWith(".kts")
+            filePath.isBlank() || filePath.endsWith(".kt", ignoreCase = true) ||
+                filePath.endsWith(".kts", ignoreCase = true)
 
         /**
          * Offset -> zero-based line/character.
@@ -453,5 +552,37 @@ class LspNavigation {
         /** `file:///a/b.ts` -> `/a/b.ts`, with percent-escapes resolved. */
         internal fun uriToPath(uri: String): String? =
             runCatching { File(URI(uri)).absolutePath }.getOrNull()
+
+        private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
+    }
+
+    /** Small, testable negative cache whose fingerprint makes every settings change a retry. */
+    internal class FailureCooldown<K : Any, F : Any>(
+        cooldownMs: Long,
+        private val nowNanos: () -> Long = System::nanoTime,
+    ) {
+        private data class Entry<F>(val fingerprint: F, val retryAtNanos: Long)
+
+        private val cooldownNanos = cooldownMs * 1_000_000L
+        private val entries = ConcurrentHashMap<K, Entry<F>>()
+
+        fun isCoolingDown(key: K, fingerprint: F): Boolean {
+            val entry = entries[key] ?: return false
+            if (entry.fingerprint == fingerprint && nowNanos() < entry.retryAtNanos) return true
+            entries.remove(key, entry)
+            return false
+        }
+
+        fun record(key: K, fingerprint: F) {
+            entries[key] = Entry(fingerprint, nowNanos() + cooldownNanos)
+        }
+
+        fun remove(key: K) {
+            entries.remove(key)
+        }
+
+        fun clear() {
+            entries.clear()
+        }
     }
 }

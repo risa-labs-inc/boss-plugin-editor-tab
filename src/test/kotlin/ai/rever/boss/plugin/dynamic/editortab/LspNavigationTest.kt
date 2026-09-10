@@ -196,6 +196,7 @@ class LspNavigationTest {
     fun `kotlin files stay on psi so ShowUsages survives`() {
         assertTrue(LspNavigation.usesPsi(""))
         assertTrue(LspNavigation.usesPsi("/x/Main.kt"))
+        assertTrue(LspNavigation.usesPsi("/x/Main.KT"))
         assertTrue(LspNavigation.usesPsi("/x/build.gradle.kts"))
     }
 
