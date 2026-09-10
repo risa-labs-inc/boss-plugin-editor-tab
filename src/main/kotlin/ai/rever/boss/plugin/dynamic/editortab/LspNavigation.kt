@@ -176,9 +176,6 @@ class LspNavigation {
             // Calls that arrived during the original attempt passed the fast check above before
             // it failed; re-check after taking the lock so they do not each retry in sequence.
             if (startupFailures.isCoolingDown(key, fingerprint)) return@withLock null
-            // Whether THIS call is the one that starts the server, asked before
-            // starting it - the settle below is only owed on a cold start.
-            val cold = !manager.isServerRunning(config.languageId)
             val initializeTimeout = settings.initializeTimeoutMs.coerceAtLeast(1L)
             val started = try {
                 ownTimeout(initializeTimeout) {
@@ -198,7 +195,7 @@ class LspNavigation {
             val c = when (started) {
                 is TimedResult.Value -> started.value
                 TimedResult.TimedOut -> {
-                    startupFailures.record(key, fingerprint)
+                    startupFailures.record(key, fingerprint, START_TIMEOUT_COOLDOWN_MS)
                     stopFailedServer(manager, config.languageId)
                     throw IllegalStateException(
                         "${config.displayName} did not initialize within ${initializeTimeout}ms",
@@ -213,9 +210,9 @@ class LspNavigation {
                 return@withLock null
             }
             startupFailures.remove(key)
-            trackClient(key, c)
+            val fresh = trackClient(key, c)
             syncDocument(c, uri, config.languageId, content)
-            if (cold) delay(COLD_START_SETTLE_MS)
+            if (fresh) delay(COLD_START_SETTLE_MS)
             c
         } ?: return NavigationResolveResult.NotFound
 
@@ -240,7 +237,11 @@ class LspNavigation {
         // The caller may be handling our timeout, whose coroutine is already cancelled. Cleanup
         // still has to reach the manager so the half-initialized child process is not retained.
         withContext(NonCancellable) {
-            runCatching { manager.stopServer(languageId) }
+            runCatching {
+                withTimeoutOrNull(STOP_FAILED_SERVER_TIMEOUT_MS) {
+                    manager.stopServer(languageId)
+                }
+            }
         }
     }
 
@@ -285,16 +286,15 @@ class LspNavigation {
         }
     }
 
-    private fun trackClient(key: ServerKey, client: LspClient) {
-        clients.put(key, client)
-            ?.takeIf { previous -> previous !== client }
-            ?.let(opened::remove)
+    private fun trackClient(key: ServerKey, client: LspClient): Boolean {
+        val previous = clients.put(key, client)
+        previous?.takeIf { it !== client }?.let(opened::remove)
+        return previous !== client
     }
 
     /** Test seam for the restart eviction invariant without constructing a real manager. */
-    internal fun trackClient(languageId: String, root: String, client: LspClient) {
+    internal fun trackClient(languageId: String, root: String, client: LspClient): Boolean =
         trackClient(ServerKey(languageId, root), client)
-    }
 
     internal fun didOpen(uri: String, languageId: String, content: String): JsonElement =
         buildJsonObject {
@@ -342,7 +342,8 @@ class LspNavigation {
         commandInterpreter: String = windowsCommandInterpreter(),
     ): LanguageServerConfig? {
         val name = config.command.firstOrNull() ?: return null
-        val effectivePath = mergePaths(config.environment["PATH"], path, emptyList())
+        val pathSeparator = if (isWindows) ';' else File.pathSeparatorChar
+        val effectivePath = mergePaths(config.environment["PATH"], path, emptyList(), pathSeparator)
         val exe = findOnPath(name, effectivePath, isWindows, pathExtensions) ?: return null
         val arguments = config.command.drop(1)
         val command =
@@ -387,6 +388,8 @@ class LspNavigation {
          * started the server.
          */
         private const val COLD_START_SETTLE_MS = 1_500L
+        private const val STOP_FAILED_SERVER_TIMEOUT_MS = 2_000L
+        private const val START_TIMEOUT_COOLDOWN_MS = 10_000L
 
         /**
          * One instance for the whole plugin.
@@ -465,12 +468,17 @@ class LspNavigation {
             return mergePaths(fromShell, current, fallbacks)
         }
 
-        internal fun mergePaths(fromShell: String?, current: String, fallbacks: List<String>): String =
+        internal fun mergePaths(
+            fromShell: String?,
+            current: String,
+            fallbacks: List<String>,
+            separator: Char = File.pathSeparatorChar,
+        ): String =
             (listOfNotNull(fromShell, current) + fallbacks)
-                .flatMap { it.split(File.pathSeparator) }
+                .flatMap { it.split(separator) }
                 .filter { it.isNotBlank() }
                 .distinct()
-                .joinToString(File.pathSeparator)
+                .joinToString(separator.toString())
 
         /** First executable named [command] across [path], including PATHEXT launchers on Windows. */
         internal fun findOnPath(
@@ -536,6 +544,13 @@ class LspNavigation {
         fun usesPsi(filePath: String): Boolean =
             filePath.isBlank() || filePath.endsWith(".kt") || filePath.endsWith(".kts")
 
+        /** Install the replacing resolver only where a server can actually answer. */
+        fun usesLsp(filePath: String): Boolean =
+            shouldUseLsp(filePath, LanguageServerRegistry.getConfigForFile(filePath) != null)
+
+        internal fun shouldUseLsp(filePath: String, serverRegistered: Boolean): Boolean =
+            !usesPsi(filePath) && serverRegistered
+
         /**
          * Offset -> zero-based line/character.
          *
@@ -576,7 +591,7 @@ class LspNavigation {
     ) {
         private data class Entry<F>(val fingerprint: F, val retryAtNanos: Long)
 
-        private val cooldownNanos = cooldownMs * 1_000_000L
+        private val defaultCooldownMs = cooldownMs
         private val entries = ConcurrentHashMap<K, Entry<F>>()
 
         fun isCoolingDown(key: K, fingerprint: F): Boolean {
@@ -586,8 +601,8 @@ class LspNavigation {
             return false
         }
 
-        fun record(key: K, fingerprint: F) {
-            entries[key] = Entry(fingerprint, nowNanos() + cooldownNanos)
+        fun record(key: K, fingerprint: F, cooldownMs: Long = defaultCooldownMs) {
+            entries[key] = Entry(fingerprint, nowNanos() + cooldownMs * 1_000_000L)
         }
 
         fun remove(key: K) {

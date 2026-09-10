@@ -1200,13 +1200,13 @@ class EditorTabComponent(
                     // this is the only way to keep both: Kotlin stays on PSI, which is
                     // the sole path that can answer ShowUsages (the resolver contract
                     // is Found/NotFound and has no variant for it), and every other
-                    // language - where PSI returns Unavailable and Cmd+Click therefore
-                    // did nothing at all - goes to LSP.
+                    // language with a registered server goes to LSP. Unsupported files
+                    // keep the built-in Unavailable result instead of claiming a lookup failed.
                     navigationResolver = remember<(suspend (String, String, Int) -> NavigationResolveResult)?>(
                         filePath,
                         projectPath,
                     ) {
-                        if (LspNavigation.usesPsi(filePath)) {
+                        if (!LspNavigation.usesLsp(filePath)) {
                             null
                         } else {
                             { content, path, offset ->

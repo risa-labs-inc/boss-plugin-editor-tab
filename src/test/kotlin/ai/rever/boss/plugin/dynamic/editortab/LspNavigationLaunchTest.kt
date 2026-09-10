@@ -111,11 +111,12 @@ class LspNavigationLaunchTest {
 
     @Test
     fun `windows PATHEXT resolves and wraps a command script`() {
+        val missing = tempDir()
         val dir = tempDir()
         val script = File(dir, "typescript-language-server.cmd").apply { writeText("@echo off\n") }
         val launched = LspNavigation().launchConfig(
             config("typescript-language-server", "--stdio"),
-            path = dir.absolutePath,
+            path = "${missing.absolutePath};${dir.absolutePath}",
             isWindows = true,
             pathExtensions = ".EXE;.CMD",
             commandInterpreter = "C:\\Windows\\System32\\cmd.exe",
@@ -201,12 +202,15 @@ class LspNavigationLaunchTest {
     @Test
     fun `fresh registration re-arms a disposed shared navigation`() {
         val before = LspNavigation.shared
-        LspNavigation.disposeShared()
-        assertSame(before, LspNavigation.shared)
+        try {
+            LspNavigation.disposeShared()
+            assertSame(before, LspNavigation.shared)
 
-        LspNavigation.resetShared()
-        assertNotSame(before, LspNavigation.shared)
-        LspNavigation.disposeShared()
+            LspNavigation.resetShared()
+            assertNotSame(before, LspNavigation.shared)
+        } finally {
+            LspNavigation.resetShared()
+        }
     }
 
     @Test
@@ -221,6 +225,10 @@ class LspNavigationLaunchTest {
         failures.record("typescript@root", "settings-b")
         now += 5_000_000L
         assertFalse(failures.isCoolingDown("typescript@root", "settings-b"))
+
+        failures.record("typescript@root", "settings-c", cooldownMs = 1)
+        now += 1_000_000L
+        assertFalse(failures.isCoolingDown("typescript@root", "settings-c"))
     }
 
     @Test
@@ -292,12 +300,13 @@ class LspNavigationLaunchTest {
         // session, with nothing logged anywhere.
         val nav = LspNavigation()
         val first = RecordingClient()
-        nav.trackClient("typescript", "/root", first)
+        assertTrue(nav.trackClient("typescript", "/root", first))
+        assertFalse(nav.trackClient("typescript", "/root", first))
         nav.syncDocument(first, "file:///a.ts", "typescript", "one")
         nav.syncDocument(first, "file:///a.ts", "typescript", "two")
 
         val restarted = RecordingClient()
-        nav.trackClient("typescript", "/root", restarted)
+        assertTrue(nav.trackClient("typescript", "/root", restarted))
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "three")
         nav.syncDocument(restarted, "file:///a.ts", "typescript", "four")
 

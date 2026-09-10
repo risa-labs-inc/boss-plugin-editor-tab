@@ -216,4 +216,11 @@ class LspNavigationTest {
         // No extension at all must not be mistaken for Kotlin.
         assertFalse(LspNavigation.usesPsi("/x/Makefile"))
     }
+
+    @Test
+    fun `replacing resolver is installed only for a registered non-Kotlin server`() {
+        assertTrue(LspNavigation.shouldUseLsp("/x/main.ts", serverRegistered = true))
+        assertFalse(LspNavigation.shouldUseLsp("/x/Main.kt", serverRegistered = true))
+        assertFalse(LspNavigation.shouldUseLsp("/x/README.md", serverRegistered = false))
+    }
 }
