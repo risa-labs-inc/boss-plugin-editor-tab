@@ -107,9 +107,9 @@ class LspNavigation {
      * entry, then spawns and initializes a server. On the UI thread that is a
      * visible freeze measured in seconds.
      *
-     * Operational failures return NotFound, while cancellation and process-fatal
-     * [Error]s deliberately propagate. A missing or failed server is logged to
-     * stderr instead of being silently indistinguishable from an absent result.
+     * Operational and linkage failures return NotFound, while cancellation and
+     * VM-fatal errors deliberately propagate. A missing or failed server is logged
+     * to stderr instead of being silently indistinguishable from an absent result.
      */
     suspend fun resolveDefinition(
         content: String,
@@ -125,6 +125,13 @@ class LspNavigation {
             // would report NotFound to a caller that is already gone, and hide the
             // cancellation from the scope that raised it.
             throw cancellation
+        } catch (error: LinkageError) {
+            // BossEditor is bundled, but a parent-first host copy can still expose an older API.
+            // Treat that compatibility failure like an unavailable resolver; fatal VM Errors pass.
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} resolving '$filePath': ${error.message}",
+            )
+            NavigationResolveResult.NotFound
         } catch (error: Exception) {
             System.err.println(
                 "[LspNavigation] ${error::class.simpleName} resolving '$filePath': ${error.message}",
@@ -232,7 +239,7 @@ class LspNavigation {
         } catch (error: Exception) {
             // A transport failure marks the client dead; a decode/provider error on a still-live
             // shared server must not tear it out from under every other tab in this workspace.
-            if (!client.isInitialized) stopFailedServer(manager, config.languageId)
+            if (!client.isInitialized) stopClientIfCurrent(key, client, manager, config.languageId)
             throw error
         }
         val location = when (requested) {
@@ -243,7 +250,7 @@ class LspNavigation {
                 System.err.println(
                     "[LspNavigation] definition timed out after ${settings.defaultRequestTimeoutMs}ms for '$filePath'",
                 )
-                if (!client.isInitialized) stopFailedServer(manager, config.languageId)
+                if (!client.isInitialized) stopClientIfCurrent(key, client, manager, config.languageId)
                 return NavigationResolveResult.NotFound
             }
         }
@@ -269,6 +276,21 @@ class LspNavigation {
                     manager.stopServer(languageId)
                 }
             }
+        }
+    }
+
+    /** Stop only the dead client observed by this request, never a replacement another tab started. */
+    private suspend fun stopClientIfCurrent(
+        key: ServerKey,
+        client: LspClient,
+        manager: LanguageServerManager,
+        languageId: String,
+    ) {
+        mutexes.computeIfAbsent(key) { Mutex() }.withLock {
+            if (clients[key] !== client) return@withLock
+            stopFailedServer(manager, languageId)
+            clients.remove(key, client)
+            opened.remove(client)
         }
     }
 
