@@ -13,10 +13,14 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotSame
 import kotlin.test.assertNull
 import kotlin.test.assertSame
@@ -130,6 +134,23 @@ class LspNavigationLaunchTest {
     }
 
     @Test
+    fun `windows lookup checks every semicolon separated path entry`() {
+        val first = tempDir()
+        val second = tempDir()
+        val script = File(second, "server.cmd").apply { writeText("@echo off\n") }
+
+        assertEquals(
+            script.absolutePath,
+            LspNavigation.findOnPath(
+                command = "server",
+                path = "${first.absolutePath};${second.absolutePath}",
+                isWindows = true,
+                pathExtensions = ".CMD",
+            ),
+        )
+    }
+
+    @Test
     fun `windows batch quoting preserves spaces in executable and arguments`() {
         val dir = File(tempDir(), "server folder").apply { mkdirs() }
         val script = File(dir, "server.cmd").apply { writeText("@echo off\n") }
@@ -200,6 +221,24 @@ class LspNavigationLaunchTest {
         failures.record("typescript@root", "settings-b")
         now += 5_000_000L
         assertFalse(failures.isCoolingDown("typescript@root", "settings-b"))
+    }
+
+    @Test
+    fun `an ancestor timeout is propagated rather than reported as the inner timeout`() {
+        val navigation = LspNavigation()
+        var innerReturned = false
+
+        assertFailsWith<TimeoutCancellationException> {
+            runBlocking {
+                withTimeout(20) {
+                    navigation.ownTimeout(1_000) {
+                        delay(10_000)
+                    }
+                    innerReturned = true
+                }
+            }
+        }
+        assertFalse(innerReturned)
     }
 
     // ---- document versions ----------------------------------------------

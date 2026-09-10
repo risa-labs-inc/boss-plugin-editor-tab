@@ -13,12 +13,10 @@ import ai.rever.bosseditor.lsp.server.LanguageServerRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
@@ -69,7 +67,7 @@ class LspNavigation {
      * the rest of the session, and nothing is logged. Comparing identity means
      * a replacement is re-announced instead.
      */
-    private val opened = ConcurrentHashMap<LspClient, ConcurrentHashMap<String, String>>()
+    private val opened = ConcurrentHashMap<LspClient, ConcurrentHashMap<String, ContentFingerprint>>()
 
     /** The current client for each server; replacing it evicts the dead client's document state. */
     private val clients = ConcurrentHashMap<ServerKey, LspClient>()
@@ -98,6 +96,8 @@ class LspNavigation {
         val settings: LspConfiguration,
     )
 
+    private data class ContentFingerprint(val length: Int, val hash: Int)
+
     /**
      * Resolve the definition of the symbol at [offset], or [NavigationResolveResult.NotFound].
      *
@@ -120,13 +120,7 @@ class LspNavigation {
     ): NavigationResolveResult = withContext(Dispatchers.IO) {
         if (disposed) return@withContext NavigationResolveResult.NotFound
         try {
-            // One user-configurable ceiling covers discovery, initialize, the cold-start settle,
-            // and the request. A server must never retain one navigation coroutine indefinitely.
-            withTimeoutOrNull(
-                LspSettingsManager.instance.configuration.value.defaultRequestTimeoutMs.coerceAtLeast(1L),
-            ) {
-                resolve(content, filePath, offset, projectPath)
-            } ?: NavigationResolveResult.NotFound
+            resolve(content, filePath, offset, projectPath)
         } catch (cancellation: CancellationException) {
             // Closing the tab mid-resolution is not a failed lookup. Swallowing it
             // would report NotFound to a caller that is already gone, and hide the
@@ -165,12 +159,14 @@ class LspNavigation {
             ?: File(filePath).parentFile?.absolutePath
             ?: return NavigationResolveResult.NotFound
 
-        val uri = File(filePath).absoluteFile.toURI().toString()
+        val uri = fileUri(filePath)
         val key = ServerKey(config.languageId, canonicalRoot(root))
         val fingerprint = StartupFingerprint(launchable, settings)
         if (startupFailures.isCoolingDown(key, fingerprint)) return NavigationResolveResult.NotFound
 
         val manager = managers.computeIfAbsent(key.root) { LanguageServerManager() }
+        // BossEditor 1.0.13 protects this root-shared manager's server map with its own Mutex.
+        // This outer lock stays per language/root so unrelated cold starts can proceed together.
         val client = mutexes.computeIfAbsent(key) { Mutex() }.withLock {
             if (disposed) {
                 managers.remove(key.root, manager)
@@ -183,24 +179,14 @@ class LspNavigation {
             // Whether THIS call is the one that starts the server, asked before
             // starting it - the settle below is only owed on a cold start.
             val cold = !manager.isServerRunning(config.languageId)
-            val initializeTimeout = minOf(
-                settings.initializeTimeoutMs,
-                settings.defaultRequestTimeoutMs,
-            ).coerceAtLeast(1L)
-            val c = try {
-                withTimeout(initializeTimeout) {
+            val initializeTimeout = settings.initializeTimeoutMs.coerceAtLeast(1L)
+            val started = try {
+                ownTimeout(initializeTimeout) {
                     manager.getOrStartServer(launchable, key.root)
                 }
-            } catch (timeout: TimeoutCancellationException) {
-                startupFailures.record(key, fingerprint)
-                stopFailedServer(manager, config.languageId)
-                throw IllegalStateException(
-                    "${config.displayName} did not initialize within ${initializeTimeout}ms",
-                    timeout,
-                )
             } catch (cancellation: CancellationException) {
-                // External cancellation is not a server failure. BossEditor converts its own
-                // initialize timeout to LanguageServerException before it reaches this boundary.
+                // withTimeoutOrNull consumes only its OWN timeout. Cancellation from a tab close
+                // reaches this branch and must not blacklist a healthy server.
                 throw cancellation
             } catch (error: Exception) {
                 startupFailures.record(key, fingerprint)
@@ -208,6 +194,16 @@ class LspNavigation {
                 // that half-started process now; otherwise every cooldown retains one orphan.
                 stopFailedServer(manager, config.languageId)
                 throw error
+            }
+            val c = when (started) {
+                is TimedResult.Value -> started.value
+                TimedResult.TimedOut -> {
+                    startupFailures.record(key, fingerprint)
+                    stopFailedServer(manager, config.languageId)
+                    throw IllegalStateException(
+                        "${config.displayName} did not initialize within ${initializeTimeout}ms",
+                    )
+                }
             }
             // dispose() may have raced the suspend above after clearing the manager map.
             // Dispose this retained manager too so a late start cannot orphan a process.
@@ -248,6 +244,17 @@ class LspNavigation {
         }
     }
 
+    internal sealed interface TimedResult<out T> {
+        data class Value<T>(val value: T) : TimedResult<T>
+        data object TimedOut : TimedResult<Nothing>
+    }
+
+    /** Distinguishes this operation's timeout from cancellation by an ancestor scope. */
+    internal suspend fun <T> ownTimeout(timeoutMs: Long, block: suspend () -> T): TimedResult<T> =
+        withTimeoutOrNull(timeoutMs.coerceAtLeast(1L)) {
+            TimedResult.Value(block())
+        } ?: TimedResult.TimedOut
+
     /**
      * Give the server the buffer as it stands right now.
      *
@@ -265,13 +272,16 @@ class LspNavigation {
         // own a global document reference count, so didClose from one tab could invalidate the
         // same URI while another split/tab is still using it.
         val known = opened.computeIfAbsent(client) { ConcurrentHashMap() }
+        // Keep constant-size state rather than retaining every full editor buffer. Length plus
+        // String's content hash makes an accidental collision vanishingly unlikely here.
+        val current = ContentFingerprint(content.length, content.hashCode())
         val previous = known[uri]
         if (previous == null) {
             client.notify(LspMethods.DID_OPEN, didOpen(uri, languageId, content))
-            known[uri] = content
-        } else if (previous != content) {
+            known[uri] = current
+        } else if (previous != current) {
             client.notify(LspMethods.DID_CHANGE, didChange(uri, content))
-            known[uri] = content
+            known[uri] = current
         }
     }
 
@@ -524,8 +534,7 @@ class LspNavigation {
          * find-usages popup for a definition jump. Deciding per file keeps both.
          */
         fun usesPsi(filePath: String): Boolean =
-            filePath.isBlank() || filePath.endsWith(".kt", ignoreCase = true) ||
-                filePath.endsWith(".kts", ignoreCase = true)
+            filePath.isBlank() || filePath.endsWith(".kt") || filePath.endsWith(".kts")
 
         /**
          * Offset -> zero-based line/character.
@@ -552,6 +561,10 @@ class LspNavigation {
         /** `file:///a/b.ts` -> `/a/b.ts`, with percent-escapes resolved. */
         internal fun uriToPath(uri: String): String? =
             runCatching { File(URI(uri)).absolutePath }.getOrNull()
+
+        /** Absolute, escaped file URI with the empty authority LSP clients conventionally use. */
+        internal fun fileUri(path: String): String =
+            "file://${File(path).absoluteFile.toURI().rawPath}"
 
         private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
     }

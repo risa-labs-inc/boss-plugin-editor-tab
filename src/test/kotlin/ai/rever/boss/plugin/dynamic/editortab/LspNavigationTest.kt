@@ -12,8 +12,7 @@ import kotlin.test.assertTrue
  * feature's correctness rests on, and the PSI-vs-LSP routing decision.
  *
  * `resolveDefinition` itself is not covered - it spawns a real language-server
- * process, and there is no seam to fake `LanguageServerManager` through (its
- * constructor takes a config and a scope, not a transport). What CAN go wrong
+ * process, and this class has no injectable manager/client factory. What CAN go wrong
  * silently is the arithmetic, so that is what is pinned here.
  */
 class LspNavigationTest {
@@ -92,6 +91,11 @@ class LspNavigationTest {
     @Test
     fun `percent escapes are decoded`() {
         assertEquals("/tmp/a b.ts", LspNavigation.uriToPath("file:///tmp/a%20b.ts"))
+    }
+
+    @Test
+    fun `file path becomes a canonical three slash uri`() {
+        assertEquals("file:///tmp/a%20b.ts", LspNavigation.fileUri("/tmp/a b.ts"))
     }
 
     @Test
@@ -196,7 +200,6 @@ class LspNavigationTest {
     fun `kotlin files stay on psi so ShowUsages survives`() {
         assertTrue(LspNavigation.usesPsi(""))
         assertTrue(LspNavigation.usesPsi("/x/Main.kt"))
-        assertTrue(LspNavigation.usesPsi("/x/Main.KT"))
         assertTrue(LspNavigation.usesPsi("/x/build.gradle.kts"))
     }
 
@@ -208,6 +211,8 @@ class LspNavigationTest {
         assertFalse(LspNavigation.usesPsi("/x/main.py"))
         assertFalse(LspNavigation.usesPsi("/x/main.rs"))
         assertFalse(LspNavigation.usesPsi("/x/Main.java"))
+        // Match BossEditor's and this plugin's other case-sensitive Kotlin gates.
+        assertFalse(LspNavigation.usesPsi("/x/Main.KT"))
         // No extension at all must not be mistaken for Kotlin.
         assertFalse(LspNavigation.usesPsi("/x/Makefile"))
     }
