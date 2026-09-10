@@ -159,8 +159,8 @@ class LspNavigation {
             ?: File(filePath).parentFile?.absolutePath
             ?: return NavigationResolveResult.NotFound
 
-        val uri = fileUri(filePath)
         val key = ServerKey(config.languageId, canonicalRoot(root))
+        val uri = fileUri(filePath)
         val fingerprint = StartupFingerprint(launchable, settings)
         if (startupFailures.isCoolingDown(key, fingerprint)) return NavigationResolveResult.NotFound
 
@@ -202,6 +202,10 @@ class LspNavigation {
                     )
                 }
             }
+            if (!c.isInitialized) {
+                stopFailedServer(manager, config.languageId)
+                throw IllegalStateException("${config.displayName} stopped before document sync")
+            }
             // dispose() may have raced the suspend above after clearing the manager map.
             // Dispose this retained manager too so a late start cannot orphan a process.
             if (disposed) {
@@ -217,13 +221,30 @@ class LspNavigation {
         } ?: return NavigationResolveResult.NotFound
 
         val position = offsetToPosition(content, offset)
-        val location = withTimeoutOrNull(settings.defaultRequestTimeoutMs.coerceAtLeast(1L)) {
-            LspNavigationProvider(client)
-                .goToDefinition(uri, position)
-                .firstOrNull()
-        } ?: return NavigationResolveResult.NotFound
+        val requested = try {
+            ownTimeout(settings.defaultRequestTimeoutMs) {
+                LspNavigationProvider(client)
+                    .goToDefinition(uri, position)
+                    .firstOrNull()
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            // A failed request should not leave a dead or wedged client cached forever.
+            stopFailedServer(manager, config.languageId)
+            throw error
+        }
+        val location = when (requested) {
+            is TimedResult.Value -> requested.value ?: return NavigationResolveResult.NotFound
+            TimedResult.TimedOut -> {
+                stopFailedServer(manager, config.languageId)
+                return NavigationResolveResult.NotFound
+            }
+        }
 
-        val targetPath = uriToPath(location.uri) ?: return NavigationResolveResult.NotFound
+        val targetPath = uriToPath(location.uri)
+            ?.let { restoreRootAlias(it, key.root, root) }
+            ?: return NavigationResolveResult.NotFound
         // LSP positions are 0-based; NavigationTarget - and so openFileAtPosition,
         // which both this and the PSI path feed - is 1-based on both axes.
         return NavigationResolveResult.Found(
@@ -361,6 +382,7 @@ class LspNavigation {
     /** Free every server process. Called when the plugin is disposed. */
     fun dispose() {
         disposed = true
+        // BossEditor's dispose is non-blocking: it cancels its scope and launches stopAll on IO.
         managers.values.forEach { manager -> runCatching { manager.dispose() } }
         managers.clear()
         mutexes.clear()
@@ -432,6 +454,8 @@ class LspNavigation {
          * profiles while avoiding prompts and terminal setup from `.zshrc`; common tool folders
          * are appended as a floor for tools configured only by interactive profiles.
          */
+        // Process-wide by design. Installing into a brand-new PATH directory takes a BOSS restart;
+        // settings can still point directly at an executable and take effect on recomposition.
         private val launchPath: String by lazy { buildLaunchPath() }
 
         private fun buildLaunchPath(): String {
@@ -457,13 +481,17 @@ class LspNavigation {
                 }
             }.getOrNull()
 
-            val fallbacks = listOf(
-                "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
-                System.getProperty("user.home") + "/.local/bin",
-                System.getProperty("user.home") + "/.bun/bin",
-                System.getProperty("user.home") + "/.cargo/bin",
-                System.getProperty("user.home") + "/go/bin",
-            )
+            val fallbacks = if (isWindowsPlatform()) {
+                emptyList()
+            } else {
+                listOf(
+                    "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
+                    System.getProperty("user.home") + "/.local/bin",
+                    System.getProperty("user.home") + "/.bun/bin",
+                    System.getProperty("user.home") + "/.cargo/bin",
+                    System.getProperty("user.home") + "/go/bin",
+                )
+            }
             val current = System.getenv("PATH").orEmpty()
             return mergePaths(fromShell, current, fallbacks)
         }
@@ -531,6 +559,17 @@ class LspNavigation {
         private fun canonicalRoot(root: String): String =
             runCatching { File(root).canonicalPath }.getOrElse { File(root).absolutePath }
 
+        /** Preserve the user's symlinked project spelling when opening a server-returned target. */
+        internal fun restoreRootAlias(targetPath: String, canonicalRoot: String, requestedRoot: String): String {
+            val target = File(targetPath).toPath().normalize()
+            val canonical = File(canonicalRoot).toPath().normalize()
+            if (!target.startsWith(canonical)) return targetPath
+            return File(requestedRoot).absoluteFile.toPath()
+                .resolve(canonical.relativize(target))
+                .normalize()
+                .toString()
+        }
+
         private const val PATH_SENTINEL = "__BOSS_PATH__"
 
         /**
@@ -577,9 +616,9 @@ class LspNavigation {
         internal fun uriToPath(uri: String): String? =
             runCatching { File(URI(uri)).absolutePath }.getOrNull()
 
-        /** Absolute, escaped file URI with the empty authority LSP clients conventionally use. */
+        /** Canonical, escaped file URI with the empty authority LSP clients conventionally use. */
         internal fun fileUri(path: String): String =
-            "file://${File(path).absoluteFile.toURI().rawPath}"
+            "file://${runCatching { File(path).canonicalFile }.getOrElse { File(path).absoluteFile }.toURI().rawPath}"
 
         private const val START_FAILURE_COOLDOWN_MS = 5 * 60 * 1_000L
     }
@@ -596,7 +635,7 @@ class LspNavigation {
 
         fun isCoolingDown(key: K, fingerprint: F): Boolean {
             val entry = entries[key] ?: return false
-            if (entry.fingerprint == fingerprint && nowNanos() < entry.retryAtNanos) return true
+            if (entry.fingerprint == fingerprint && nowNanos() - entry.retryAtNanos < 0L) return true
             entries.remove(key, entry)
             return false
         }

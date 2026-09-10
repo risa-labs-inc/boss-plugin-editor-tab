@@ -154,16 +154,12 @@ fun gitDescribeNow(vararg args: String): String =
         }.standardOutput.asText.get().trim()
     }.getOrNull().orEmpty().ifEmpty { "unknown" }
 
-val buildBranch = providers.provider {
-    sequenceOf(System.getenv("GITHUB_HEAD_REF"), System.getenv("GITHUB_REF_NAME"))
-        .filterNotNull()
-        .firstOrNull { it.isNotBlank() }
-        ?: gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD")
-}
-val buildCommit = providers.provider {
-    System.getenv("GITHUB_SHA")?.takeIf { it.isNotBlank() }
-        ?: gitDescribeNow("rev-parse", "--short", "HEAD")
-}
+val buildBranch = providers.environmentVariable("GITHUB_HEAD_REF")
+    .orElse(providers.environmentVariable("GITHUB_REF_NAME"))
+    .orElse(providers.provider { gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD") })
+// On pull_request this deliberately identifies Actions' tested merge commit; local builds use HEAD.
+val buildCommit = providers.environmentVariable("GITHUB_SHA")
+    .orElse(providers.provider { gitDescribeNow("rev-parse", "--short", "HEAD") })
 
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {

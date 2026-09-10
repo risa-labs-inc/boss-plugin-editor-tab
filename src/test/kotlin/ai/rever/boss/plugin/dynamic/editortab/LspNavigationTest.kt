@@ -95,7 +95,26 @@ class LspNavigationTest {
 
     @Test
     fun `file path becomes a canonical three slash uri`() {
-        assertEquals("file:///tmp/a%20b.ts", LspNavigation.fileUri("/tmp/a b.ts"))
+        val path = "/tmp/a b.ts"
+        val uri = LspNavigation.fileUri(path)
+        assertTrue(uri.startsWith("file:///"))
+        assertEquals(File(path).canonicalPath, LspNavigation.uriToPath(uri))
+    }
+
+    @Test
+    fun `canonical server target is mapped back through the requested root alias`() {
+        assertEquals(
+            "/workspace-link/src/main.ts",
+            LspNavigation.restoreRootAlias(
+                targetPath = "/canonical/workspace/src/main.ts",
+                canonicalRoot = "/canonical/workspace",
+                requestedRoot = "/workspace-link",
+            ),
+        )
+        assertEquals(
+            "/other/main.ts",
+            LspNavigation.restoreRootAlias("/other/main.ts", "/canonical/workspace", "/workspace-link"),
+        )
     }
 
     @Test
@@ -169,13 +188,17 @@ class LspNavigationTest {
     @Test
     fun `explicit relative executable path is resolved directly`() {
         val dir = File("build/tmp/lspnav-relative-${System.nanoTime()}").apply { mkdirs() }
-        val exe = File(dir, "server").apply {
-            writeText("#!/bin/sh\n")
-            setExecutable(true)
+        try {
+            val exe = File(dir, "server").apply {
+                writeText("#!/bin/sh\n")
+                setExecutable(true)
+            }
+            val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
+            val found = LspNavigation.findOnPath(relative, "/missing")
+            assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
+        } finally {
+            dir.deleteRecursively()
         }
-        val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
-        val found = LspNavigation.findOnPath(relative, "/missing")
-        assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
     }
 
     @Test

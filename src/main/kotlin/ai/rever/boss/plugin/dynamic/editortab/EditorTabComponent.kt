@@ -21,6 +21,7 @@ import ai.rever.bosseditor.ui.SearchBar
 import ai.rever.bosseditor.ui.GoToLineDialog
 import ai.rever.bosseditor.largefile.LargeFileDocument
 import ai.rever.bosseditor.largefile.LargeFileLimitationsDialog
+import ai.rever.bosseditor.lsp.config.LspSettingsManager
 import ai.rever.bosseditor.psi.ReferenceLocation
 import ai.rever.bosseditor.psi.DefinitionInfo
 import ai.rever.bosseditor.refactoring.RefactorContext
@@ -1166,6 +1167,9 @@ class EditorTabComponent(
                     // document, which has no buffer and so no file to compare.
                     val gitMarks: Map<Int, LineDiff.Mark> =
                         editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+                    // A settings change must replace the resolver in already-open tabs. It also
+                    // forces LspSettingsManager's synchronous load before consulting the registry.
+                    val lspConfig by LspSettingsManager.instance.configuration.collectAsState()
                     Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
@@ -1205,8 +1209,9 @@ class EditorTabComponent(
                     navigationResolver = remember<(suspend (String, String, Int) -> NavigationResolveResult)?>(
                         filePath,
                         projectPath,
+                        lspConfig,
                     ) {
-                        if (!LspNavigation.usesLsp(filePath)) {
+                        if (!lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
                             null
                         } else {
                             { content, path, offset ->
