@@ -51,8 +51,8 @@ import java.net.URI
  */
 class LspNavigation {
 
-    /** One manager per workspace root; each manager already reuses servers by language. */
-    private val managers = ConcurrentHashMap<String, LanguageServerManager>()
+    /** One manager per language/root keeps one server's initialize budget from blocking another. */
+    private val managers = ConcurrentHashMap<ServerKey, LanguageServerManager>()
     @Volatile
     private var disposed = false
 
@@ -152,17 +152,19 @@ class LspNavigation {
         // the registry. Trust the selected, enabled config here; a separate disabled-language
         // check would incorrectly reject a custom replacement for a disabled built-in server.
         val config = LanguageServerRegistry.getConfigForFile(filePath) ?: return NavigationResolveResult.NotFound
-        // The server binary has to exist before we try to run it. Without this a
-        // missing `pylsp`/`typescript-language-server` costs a failed spawn and
-        // a 60s initialize timeout on every single click.
-        //
-        // Resolved against the USER's PATH, not this process's - see [launchPath].
-        val launchable = launchConfig(config) ?: return NavigationResolveResult.NotFound
-
         // A server rooted at the wrong directory resolves nothing outside the file
         // itself, so prefer the project and fall back to the file's own folder.
         val root = projectPath?.takeIf { it.isNotBlank() }
             ?: File(filePath).parentFile?.absolutePath
+            ?: return NavigationResolveResult.NotFound
+
+        // The server binary has to exist before we try to run it. Without this a
+        // missing `pylsp`/`typescript-language-server` costs a failed spawn and
+        // a 60s initialize timeout on every single click. Relative configured paths
+        // resolve from the project root rather than the Dock-launched JVM's CWD.
+        //
+        // Resolved against the USER's PATH, not this process's - see [launchPath].
+        val launchable = launchConfig(config, workingDirectory = root)
             ?: return NavigationResolveResult.NotFound
 
         val key = ServerKey(config.languageId, canonicalRoot(root))
@@ -170,12 +172,12 @@ class LspNavigation {
         val fingerprint = StartupFingerprint(launchable, settings)
         if (startupFailures.isCoolingDown(key, fingerprint)) return NavigationResolveResult.NotFound
 
-        val manager = managers.computeIfAbsent(key.root) { LanguageServerManager() }
-        // BossEditor 1.0.13 protects this root-shared manager's server map with its own Mutex.
-        // This outer lock stays per language/root so unrelated cold starts can proceed together.
+        val manager = managers.computeIfAbsent(key) { LanguageServerManager() }
+        // Both the manager and this outer lock are per language/root, so a hanging Python
+        // initialize cannot consume TypeScript's budget or make it stop the wrong server.
         val client = mutexes.computeIfAbsent(key) { Mutex() }.withLock {
             if (disposed) {
-                managers.remove(key.root, manager)
+                managers.remove(key, manager)
                 runCatching { manager.dispose() }
                 return@withLock null
             }
@@ -216,13 +218,15 @@ class LspNavigation {
             // dispose() may have raced the suspend above after clearing the manager map.
             // Dispose this retained manager too so a late start cannot orphan a process.
             if (disposed) {
-                managers.remove(key.root, manager)
+                managers.remove(key, manager)
                 runCatching { manager.dispose() }
                 return@withLock null
             }
             startupFailures.remove(key)
             val fresh = trackClient(key, c)
             syncDocument(c, uri, config.languageId, content)
+            // Keep the cold-start settle inside the per-server lock. Otherwise a queued click
+            // can observe `fresh = false` and send its request before the server is actually ready.
             if (fresh) delay(COLD_START_SETTLE_MS)
             c
         } ?: return NavigationResolveResult.NotFound
@@ -389,11 +393,12 @@ class LspNavigation {
         isWindows: Boolean = isWindowsPlatform(),
         pathExtensions: String = System.getenv("PATHEXT").orEmpty(),
         commandInterpreter: String = windowsCommandInterpreter(),
+        workingDirectory: String? = null,
     ): LanguageServerConfig? {
         val name = config.command.firstOrNull() ?: return null
         val pathSeparator = if (isWindows) ';' else File.pathSeparatorChar
         val effectivePath = mergePaths(config.environment["PATH"], path, emptyList(), pathSeparator)
-        val exe = findOnPath(name, effectivePath, isWindows, pathExtensions) ?: return null
+        val exe = findOnPath(name, effectivePath, isWindows, pathExtensions, workingDirectory) ?: return null
         val arguments = config.command.drop(1)
         val command =
             if (isWindows && (exe.endsWith(".cmd", ignoreCase = true) || exe.endsWith(".bat", ignoreCase = true))) {
@@ -543,6 +548,7 @@ class LspNavigation {
             path: String,
             isWindows: Boolean = isWindowsPlatform(),
             pathExtensions: String = System.getenv("PATHEXT").orEmpty(),
+            workingDirectory: String? = null,
         ): String? {
             val direct = command.contains('/') || command.contains('\\')
             val extensions =
@@ -555,13 +561,19 @@ class LspNavigation {
                 } else {
                     emptyList()
                 }
-            val names = sequenceOf(command) + extensions.asSequence().map { command + it }
             if (direct) {
-                return names.map(::File)
+                val commandFile = File(command).let { file ->
+                    if (file.isAbsolute || workingDirectory == null) file else File(workingDirectory, command)
+                }
+                return (sequenceOf(commandFile) + extensions.asSequence().map { File(commandFile.path + it) })
                     .firstOrNull { it.isFile && (isWindows || it.canExecute()) }
+                    ?.toPath()
+                    ?.normalize()
+                    ?.toFile()
                     ?.absolutePath
             }
 
+            val names = sequenceOf(command) + extensions.asSequence().map { command + it }
             return path.split(if (isWindows) ';' else File.pathSeparatorChar).asSequence()
                 .filter { it.isNotBlank() }
                 .flatMap { directory -> names.map { name -> File(directory, name) } }

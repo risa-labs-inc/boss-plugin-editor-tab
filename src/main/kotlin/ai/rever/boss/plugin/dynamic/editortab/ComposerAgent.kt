@@ -4,7 +4,6 @@ import ai.rever.boss.plugin.api.AiBudget
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
-import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiStopReason
 import ai.rever.boss.plugin.api.AiToolCall
 import ai.rever.boss.plugin.api.AiToolOutcome
@@ -47,13 +46,8 @@ class ComposerAgent(
     // removes its own entry from the run's IO coroutine.
     private val runs = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
-    /** @return null unless the shared, secret-backed default provider and gateway are ready. */
-    fun gateway(): AiGatewayAPI? =
-        if (editorAiReadiness(context) == AiReadiness.READY) {
-            context.getPluginAPI(AiGatewayAPI::class.java)
-        } else {
-            null
-        }
+    /** @return the current ready gateway, including a selected Claude/Codex CLI engine. */
+    fun gateway(): AiGatewayAPI? = resolveReadyEditorAiGateway(context)
 
     /**
      * The focused editor's selection, or null when nothing is selected.

@@ -2,8 +2,6 @@ package ai.rever.boss.plugin.dynamic.editortab
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 
 class AiInlineEditPlacementTest {
     @Test
@@ -22,7 +20,6 @@ class AiInlineEditPlacementTest {
 
         assertEquals(180, result.x)
         assertEquals(226, result.y)
-        assertFalse(result.opensAbove)
     }
 
     @Test
@@ -40,7 +37,6 @@ class AiInlineEditPlacementTest {
         )
 
         assertEquals(304, result.y)
-        assertTrue(result.opensAbove)
     }
 
     @Test
@@ -67,7 +63,6 @@ class AiInlineEditPlacementTest {
         )
 
         assertEquals(42, result.y)
-        assertFalse(result.opensAbove)
     }
 
     @Test

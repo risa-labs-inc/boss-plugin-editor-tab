@@ -150,6 +150,20 @@ class LspNavigationLaunchTest {
     }
 
     @Test
+    fun `a relative configured executable resolves from the workspace`() {
+        val root = tempDir()
+        val exe = serverOn(File(root, "tools").apply { mkdirs() }, "custom-server")
+
+        val launched = LspNavigation().launchConfig(
+            config("./tools/custom-server", "--stdio"),
+            path = "/missing",
+            workingDirectory = root.path,
+        )
+
+        assertEquals(listOf(exe.absolutePath, "--stdio"), launched?.command)
+    }
+
+    @Test
     fun `windows PATHEXT resolves and wraps a command script`() {
         val missing = tempDir()
         val dir = tempDir()

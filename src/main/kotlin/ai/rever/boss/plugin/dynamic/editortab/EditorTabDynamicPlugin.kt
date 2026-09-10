@@ -47,6 +47,7 @@ class EditorTabDynamicPlugin : DynamicPlugin {
         // disposeShared deliberately leaves a dead singleton installed during unload so a stale
         // tab cannot resurrect a process. A fresh registration is the only point that re-arms it.
         LspNavigation.resetShared()
+        EditorAiGatewayCache.reset()
         pluginContext = context
 
         markdownSettingsManager?.dispose()

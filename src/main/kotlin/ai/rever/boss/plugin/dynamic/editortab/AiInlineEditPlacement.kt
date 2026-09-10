@@ -6,7 +6,6 @@ import kotlin.math.roundToInt
 internal data class AiInlineEditPlacement(
     val x: Int,
     val y: Int,
-    val opensAbove: Boolean,
 )
 
 /**
@@ -41,6 +40,5 @@ internal fun placeAiInlineEdit(
     return AiInlineEditPlacement(
         x = anchorX.roundToInt().coerceIn(safeMarginX, maxX),
         y = preferredY.roundToInt().coerceIn(safeMarginY, maxY),
-        opensAbove = opensAbove,
     )
 }

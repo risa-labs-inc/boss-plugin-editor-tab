@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.TabRegistry
 import ai.rever.bosseditor.core.EditorState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertEquals
@@ -84,6 +85,29 @@ class AiInlineEditStalenessTest {
             assertFalse(service.applyAccepted())
         } finally {
             EditorBufferRegistry.release(path)
+        }
+    }
+
+    @Test
+    fun `pressing the shortcut again preserves the active session and captured offsets`() {
+        val state = EditorState("first()\nsecond()\n", null)
+        val scope = CoroutineScope(Job())
+        val service = AiInlineEditService(BareContext(), scope)
+        service.bind(null, state)
+        try {
+            state.moveCaretToOffset(0)
+            assertTrue(service.start(state, "kotlin"))
+            service.setPrompt("rewrite first")
+            val original = service.session.value
+
+            state.moveCaretToOffset("first()\n".length)
+            assertTrue(service.start(state, "kotlin"))
+
+            assertEquals(original, service.session.value)
+            assertEquals("rewrite first", service.session.value?.prompt)
+            assertEquals(0, service.session.value?.startLine)
+        } finally {
+            scope.cancel()
         }
     }
 }

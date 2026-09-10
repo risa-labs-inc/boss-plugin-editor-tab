@@ -186,15 +186,15 @@ class LspNavigationTest {
     }
 
     @Test
-    fun `explicit relative executable path is resolved directly`() {
-        val dir = File("build/tmp/lspnav-relative-${System.nanoTime()}").apply { mkdirs() }
+    fun `explicit relative executable path is resolved from the workspace`() {
+        val dir = createTempDir()
         try {
-            val exe = File(dir, "server").apply {
+            val exe = File(dir, "bin/server").apply {
+                parentFile.mkdirs()
                 writeText("#!/bin/sh\n")
                 setExecutable(true)
             }
-            val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
-            val found = LspNavigation.findOnPath(relative, "/missing")
+            val found = LspNavigation.findOnPath("./bin/server", "/missing", workingDirectory = dir.path)
             assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
         } finally {
             dir.deleteRecursively()

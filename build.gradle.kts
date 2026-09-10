@@ -27,8 +27,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-// 1.6.3: LSP-backed Cmd+Click navigation for non-Kotlin files.
-version = "1.6.3"
+version = "1.6.2"
 
 java {
     toolchain {
@@ -56,7 +55,7 @@ repositories {
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.88.jar")
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.87.jar")
     } else {
         // CI: use downloaded JAR
         files("build/downloaded-deps/boss-plugin-api.jar")
@@ -68,13 +67,13 @@ dependencies {
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
     //
-    // 1.0.15 is required for EditorInlineSuggestion, used to render multiline ghost text as
-    // real virtual editor lines. 1.0.14 added EditorLineDecoration for the AI review hunk.
-    // 1.0.13 also fixed LSP navigation: ServerDiscovery previously rejected any command
+    // The public 1.0.13 release was built after the native AI surfaces landed: it includes
+    // EditorInlineSuggestion for multiline ghost text and EditorLineDecoration for review
+    // hunks. It also fixed LSP navigation: ServerDiscovery previously rejected any command
     // containing a path separator, so an absolute path to a server read as "not installed"
     // and no process was ever spawned; and InitializeResult decoded union-typed
     // capabilities strictly, which failed the handshake for every server tried.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.15")
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.13")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.bosseditor.core.EditorPosition
+import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
 import ai.rever.bosseditor.lsp.protocol.Position
 import ai.rever.bosseditor.lsp.protocol.Range
@@ -30,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -94,21 +96,19 @@ class AiInlineEditService(
 
     /** @return true when a session was started (so the key event is consumed). */
     fun start(editorState: EditorState, language: String): Boolean {
+        // The shortcut tunnels through the whole tab, including the prompt itself. Refuse
+        // re-entry so a second press cannot replace the captured offsets while the first
+        // generation is still streaming and later graft its replacement onto a new selection.
+        if (_session.value != null) return true
         // A missing gateway used to return false here, so the compose shortcut did nothing at
         // all - indistinguishable from a broken keybinding. Open the widget
         // either way and let it say which of the two things is actually wrong.
         val state = this.editorState ?: editorState
         val doc = state.document
-        val selection = state.selection.value
-        val hasSelection = state.hasSelection && selection != null
+        val selection = state.selection.value?.takeIf { state.hasSelection }
         val caret = state.caretPosition.value
-        val start = if (hasSelection) selection!!.start else state.caretPosition.value
-        val end =
-            if (hasSelection) {
-                selection!!.end
-            } else {
-                EditorPosition(start.line, doc.getLineLength(start.line))
-            }
+        val start = selection?.start ?: caret
+        val end = selection?.end ?: EditorPosition(start.line, doc.getLineLength(start.line))
         val startOffset = doc.positionToOffset(start)
         val endOffset = doc.positionToOffset(end)
         if (startOffset == endOffset) return true // caret on an empty line: consume, nothing to edit
@@ -179,6 +179,10 @@ class AiInlineEditService(
                             }
                         }
                     } ?: throw java.util.concurrent.TimeoutException("AI request timed out")
+                } catch (cancellation: CancellationException) {
+                    // cancel() may be followed immediately by a new session. Do not let the old
+                    // generation stamp its cancellation error onto that replacement session.
+                    throw cancellation
                 } catch (e: Exception) {
                     _session.value = _session.value?.copy(busy = false, error = e.message ?: "AI request failed")
                     return@launch
@@ -340,6 +344,7 @@ class AiInlineEditService(
                     ),
                 maxTokens = 4096,
                 timeoutMs = 45_000,
+                temperature = 0f,
             )
 
         internal fun stripFences(text: String): String {
@@ -360,7 +365,7 @@ internal fun applyAcceptedAiInlineEdit(
     replacement: String,
 ) {
     state.undoManager.breakUndoGroup()
-    state.setSelection(ai.rever.bosseditor.core.EditorRange(start, end))
+    state.setSelection(EditorRange(start, end))
     state.insertText(replacement)
     state.undoManager.breakUndoGroup()
 }

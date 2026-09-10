@@ -7,7 +7,9 @@ import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.bosseditor.core.EditorPosition
+import ai.rever.bosseditor.core.EditorDocument
 import ai.rever.bosseditor.core.EditorState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -15,6 +17,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -25,8 +28,12 @@ import java.io.File
 // ========== Settings ==========
 
 /**
- * AI tab-completion settings, own file: ~/.boss/editor-settings.json is the
+ * AI tab-completion settings live in their own file; ~/.boss/editor-settings.json is the
  * BossEditor library's format and adding keys to it is not ours to do.
+ *
+ * Older files may still contain `model`; `Json.ignoreUnknownKeys` deliberately ignores it.
+ * Model selection is now owned by AI Gateway, so completion follows the same active model as
+ * every other editor AI surface instead of carrying a second, silently divergent override.
  */
 @Serializable
 data class AiCompletionSettingsData(
@@ -34,7 +41,7 @@ data class AiCompletionSettingsData(
     /**
      * How long the typing has to stop before a request goes out.
      *
-     * 300ms keeps the editor responsive without issuing a request for every
+     * 1200ms keeps the editor responsive without issuing a request for every
      * keystroke. The CLI route
      * measured 11.7-15.9s on a realistic 4KB completion prompt, and a request
      * abandoned by the next keystroke still runs to completion - cancelling the
@@ -42,7 +49,7 @@ data class AiCompletionSettingsData(
      * that would otherwise have killed the process. So the debounce, not the
      * timeout, is what bounds how many CLI processes a typing burst spawns.
      */
-    val debounceMs: Long = 300,
+    val debounceMs: Long = 1_200,
     /**
      * Per-request budget, passed as [AiRequest.timeoutMs] - which the gateway
      * hands to the CLI session as its IDLE timeout.
@@ -201,42 +208,32 @@ class AiTabCompletionService(
             val caret = editorState.caretPosition.value
             val completionContext =
                 buildContext(document.getText(), editorState.caretOffset, language, filePath, settings)
-            var terminalFailure: Throwable? = null
-            var completed = false
-            val streamed = StringBuilder()
-            val finishedInTime = withContext(Dispatchers.IO) {
+            val outcome = withContext(Dispatchers.IO) {
                 // Streaming lets useful text appear as soon as the model emits
                 // it instead of hiding the whole completion until generation
                 // finishes. Providers without native streaming are handled by
                 // the gateway's documented Text + Completed fallback.
-                withTimeoutOrNull(settings.timeoutMs + 500) {
-                    gateway.stream(buildRequest(completionContext, settings)).collect { chunk ->
-                        when (chunk) {
-                            is AiChunk.Text -> {
-                                streamed.append(chunk.text)
-                                publishIfFresh(editorState, document, version, caret, completionContext, streamed.toString())
-                            }
-                            is AiChunk.Completed -> {
-                                completed = true
-                                val finalText = chunk.reply.text.ifBlank { streamed.toString() }
-                                publishIfFresh(editorState, document, version, caret, completionContext, finalText)
-                            }
-                            is AiChunk.Failed -> terminalFailure = chunk.error
-                        }
-                    }
-                    true
+                collectCompletionStream(gateway, buildRequest(completionContext, settings), settings.timeoutMs + 500) {
+                    publishIfFresh(editorState, document, version, caret, completionContext, it)
                 }
             }
-            if (finishedInTime == null) {
-                // Out of budget. Count it: enough of these in a row and the
-                // provider is simply too slow for this feature, which is worth
-                // saying rather than retrying in silence forever.
-                timeouts++
-                _unavailable.value = slowProviderNotice(timeouts)
-                return@launch
+            when (outcome) {
+                CompletionStreamOutcome.Completed -> timeouts = 0
+                CompletionStreamOutcome.TimedOut -> {
+                    // A partial stream is not a completion: leaving it visible lets Tab insert
+                    // truncated code. Clear it before reporting a repeatedly slow provider.
+                    _suggestion.value = null
+                    timeouts++
+                    _unavailable.value = slowProviderNotice(timeouts)
+                }
+                CompletionStreamOutcome.Incomplete -> _suggestion.value = null
+                is CompletionStreamOutcome.Failed -> {
+                    _suggestion.value = null
+                    System.err.println(
+                        "[AiTabCompletion] ${outcome.error::class.simpleName}: ${outcome.error.message}",
+                    )
+                }
             }
-            if (terminalFailure != null || !completed) return@launch
-            timeouts = 0
         }
     }
 
@@ -274,7 +271,7 @@ class AiTabCompletionService(
 
     private fun publishIfFresh(
         editorState: EditorState,
-        document: ai.rever.bosseditor.core.EditorDocument,
+        document: EditorDocument,
         version: Long,
         caret: EditorPosition,
         completionContext: CompletionContext,
@@ -351,6 +348,7 @@ class AiTabCompletionService(
                 ),
                 maxTokens = settings.maxTokens,
                 timeoutMs = settings.timeoutMs,
+                temperature = 0f,
                 // The absent override makes the gateway use the shared provider's
                 // active/default model and its secret-manager-backed credential.
                 extras = emptyMap(),
@@ -384,4 +382,51 @@ class AiTabCompletionService(
             return if (lines.size > MAX_LINES) lines.take(MAX_LINES).joinToString("\n") else text
         }
     }
+}
+
+/** Terminal state of one completion stream. Only [Completed] may remain accept-able. */
+internal sealed interface CompletionStreamOutcome {
+    data object Completed : CompletionStreamOutcome
+    data object TimedOut : CompletionStreamOutcome
+    data object Incomplete : CompletionStreamOutcome
+    data class Failed(val error: Throwable) : CompletionStreamOutcome
+}
+
+/** Collect one gateway stream, publishing partial text while requiring an explicit completion. */
+internal suspend fun collectCompletionStream(
+    gateway: AiGatewayAPI,
+    request: AiRequest,
+    timeoutMs: Long,
+    publish: (String) -> Unit,
+): CompletionStreamOutcome {
+    val streamed = StringBuilder()
+    return withTimeoutOrNull(timeoutMs) {
+        var outcome: CompletionStreamOutcome = CompletionStreamOutcome.Incomplete
+        try {
+            gateway.stream(request).takeWhile { chunk ->
+                when (chunk) {
+                    is AiChunk.Text -> {
+                        streamed.append(chunk.text)
+                        publish(streamed.toString())
+                        true
+                    }
+                    is AiChunk.Completed -> {
+                        publish(chunk.reply.text.ifBlank { streamed.toString() })
+                        outcome = CompletionStreamOutcome.Completed
+                        false
+                    }
+                    is AiChunk.Failed -> {
+                        outcome = CompletionStreamOutcome.Failed(chunk.error)
+                        false
+                    }
+                    else -> true
+                }
+            }.collect {}
+            outcome
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            CompletionStreamOutcome.Failed(error)
+        }
+    } ?: CompletionStreamOutcome.TimedOut
 }

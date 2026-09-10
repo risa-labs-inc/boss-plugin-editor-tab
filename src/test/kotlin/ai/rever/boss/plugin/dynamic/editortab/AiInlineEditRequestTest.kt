@@ -11,6 +11,6 @@ class AiInlineEditRequestTest {
 
         assertEquals(emptyMap(), request.extras)
         assertNull(request.modelOverride)
-        assertNull(request.temperature)
+        assertEquals(0f, request.temperature)
     }
 }

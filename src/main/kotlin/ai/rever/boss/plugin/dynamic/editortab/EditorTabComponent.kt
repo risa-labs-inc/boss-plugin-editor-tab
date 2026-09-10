@@ -639,7 +639,7 @@ class EditorTabComponent(
         val reviewIsStale = aiEditSession?.done == true &&
             editorState.document.documentVersion != aiEditSession.bufferVersion
         LaunchedEffect(reviewIsStale, aiEditSession?.replacement) {
-            if (reviewIsStale) aiInlineEdit?.markStale()
+            if (reviewIsStale) aiInlineEdit.markStale()
         }
         val aiReviewDocument = remember(
             aiEditSession?.done,
@@ -648,9 +648,13 @@ class EditorTabComponent(
             editorState.document.documentVersion,
         ) {
             aiEditSession?.takeIf { it.done && it.replacement.isNotEmpty() && !reviewIsStale }?.let { session ->
-                val start = editorState.document.positionToOffset(session.startLine, session.startCol)
-                val end = editorState.document.positionToOffset(session.endLine, session.endCol)
-                buildAiInlineReviewDocument(editorState.document.getText(), start, end, session.replacement)
+                // This runs during composition. A corrupt/out-of-range captured position must
+                // suppress the review, never let buildAiInlineReviewDocument's require crash UI.
+                runCatching {
+                    val start = editorState.document.positionToOffset(session.startLine, session.startCol)
+                    val end = editorState.document.positionToOffset(session.endLine, session.endCol)
+                    buildAiInlineReviewDocument(editorState.document.getText(), start, end, session.replacement)
+                }.getOrNull()
             }
         }
         val reviewEditorState = remember(aiReviewDocument?.text, filePath) {
@@ -839,6 +843,7 @@ class EditorTabComponent(
                 EditorToken.fromTokens(mergedTokens)
             }
         }
+        val emptyTokenProvider: (Int) -> List<EditorToken> = remember { { _: Int -> emptyList() } }
 
         // Resolved in Content() (host theme unless a fixed theme was chosen) and
         // provided to this subtree, so the canvas and the popups around it cannot
@@ -990,9 +995,11 @@ class EditorTabComponent(
                     // The focused EditorCanvas has its own key handler. AI
                     // shortcuts must run in the tunnelling phase so they cannot
                     // be consumed before this component's bubbling handler.
+                    val inlineAiModifier =
+                        if (isMacPlatform()) event.isMetaPressed else event.isCtrlPressed
                     val composeShortcut =
                         event.type == KeyEventType.KeyDown &&
-                            (event.isMetaPressed || event.isCtrlPressed) &&
+                            inlineAiModifier &&
                             !event.isShiftPressed && !event.isAltPressed &&
                             (event.key == Key.I || event.key == Key.K) &&
                             !isLargeFile
@@ -1025,6 +1032,8 @@ class EditorTabComponent(
                         // native word-wise behaviour in the editor.
                         val isMeta = event.isMetaPressed || event.isCtrlPressed
                         val isCmd = event.isMetaPressed
+                        val inlineAiModifier =
+                            if (isMacPlatform()) event.isMetaPressed else event.isCtrlPressed
                         // Both shortcut helpers are evaluated at most ONCE per
                         // key (each copies the whole document, and the old
                         // guard-then-!! pattern paid that twice). The results
@@ -1048,6 +1057,7 @@ class EditorTabComponent(
                             editorShortcutFor(
                                 key = event.key,
                                 isMeta = isMeta,
+                                isInlineAiModifier = inlineAiModifier,
                                 isShift = event.isShiftPressed,
                                 isLargeFile = isLargeFile,
                                 showSearchBar = showSearchBar,
@@ -1289,7 +1299,10 @@ class EditorTabComponent(
                     minimapUseEditorColors = settings.minimapUseEditorColors,
                     minimapBackgroundColor = minimapBgColor,
                     minimapForegroundColor = minimapFgColor,
-                    tokenProvider = if (aiReviewDocument == null) tokenProvider else ({ _: Int -> emptyList() }),
+                    // The live TokenCache is bound to the live document, so its offsets are not
+                    // valid for the red/green shadow document. Keep review text deliberately
+                    // unhighlighted rather than applying plausible colors at wrong positions.
+                    tokenProvider = if (aiReviewDocument == null) tokenProvider else emptyTokenProvider,
                     // Transparent, purely to make the editor reserve its gutter
                     // icon strip; GitGutterMarks draws the glyphs into it,
                     // because drawGutterIconForLine can paint a shape but never
@@ -1310,8 +1323,9 @@ class EditorTabComponent(
                         filePath,
                         projectPath,
                         lspConfig,
+                        isLargeFile,
                     ) {
-                        if (!lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
+                        if (isLargeFile || !lspConfig.enabled || !LspNavigation.usesLsp(filePath)) {
                             null
                         } else {
                             { content, path, offset ->
@@ -1593,20 +1607,22 @@ class EditorTabComponent(
                         fallbackLineHeight = lineHeightPx,
                         anchorLine = aiReviewDocument?.controlAnchorLine,
                         anchorCol = if (aiReviewDocument != null) 0 else null,
-                        onPromptChange = { inlineEditService?.setPrompt(it) },
-                        onSubmit = { inlineEditService?.submit() },
+                        onPromptChange = inlineEditService::setPrompt,
+                        onSubmit = inlineEditService::submit,
                         onAccept = {
-                            if (inlineEditService != null) {
-                                if (inlineEditService.applyAccepted()) {
-                                    // While reviewing, BossEditor observes the shadow state. Notify
-                                    // the live-buffer side effects explicitly for this one edit.
-                                    noteLiveTextChanged()
-                                } else {
-                                    inlineEditService.markStale()
-                                }
+                            reviewEditorState?.scrollOffset?.value?.let(editorState::setScrollOffset)
+                            if (inlineEditService.applyAccepted()) {
+                                // While reviewing, BossEditor observes the shadow state. Notify
+                                // the live-buffer side effects explicitly for this one edit.
+                                noteLiveTextChanged()
+                            } else {
+                                inlineEditService.markStale()
                             }
                         },
-                        onCancel = { inlineEditService?.cancel() },
+                        onCancel = {
+                            reviewEditorState?.scrollOffset?.value?.let(editorState::setScrollOffset)
+                            inlineEditService.cancel()
+                        },
                     )
                 }
 
@@ -3151,6 +3167,7 @@ internal sealed interface EditorKeyAction {
 internal fun editorShortcutFor(
     key: Key,
     isMeta: Boolean,
+    isInlineAiModifier: Boolean = isMeta,
     isShift: Boolean,
     isLargeFile: Boolean,
     showSearchBar: Boolean,
@@ -3164,13 +3181,17 @@ internal fun editorShortcutFor(
         isMeta && key == Key.H -> EditorKeyAction.ShowFindReplace
         isMeta && (key == Key.G || key == Key.L) -> EditorKeyAction.GoToLine
         isMeta && key == Key.Y -> EditorKeyAction.Redo
-        isMeta && (key == Key.I || key == Key.K) && !isLargeFile -> EditorKeyAction.InlineAiEdit
+        isInlineAiModifier && (key == Key.I || key == Key.K) && !isLargeFile -> EditorKeyAction.InlineAiEdit
         isMeta && key == Key.S && !isLargeFile -> EditorKeyAction.Save
         key == Key.F3 && !isShift -> EditorKeyAction.FindNext
         key == Key.F3 && isShift -> EditorKeyAction.FindPrevious
         key == Key.Escape && showSearchBar -> EditorKeyAction.CloseSearch
         else -> null
     }
+
+/** macOS reserves Ctrl+I/K for Emacs-style editing; inline AI is Cmd there, Ctrl elsewhere. */
+internal fun isMacPlatform(): Boolean =
+    System.getProperty("os.name").contains("mac", ignoreCase = true)
 
 /**
  * The range a deletion shortcut removes, or null when this key is not one.
