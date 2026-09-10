@@ -46,6 +46,11 @@ The editor supports syntax highlighting for many languages including:
 - SQL
 - And many more...
 
+## Saving files
+
+See [protected saves](docs/protected-saves.md) for failure behavior, filesystem
+limits, and the required host/plugin release ordering.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
