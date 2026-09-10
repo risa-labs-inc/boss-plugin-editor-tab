@@ -90,6 +90,7 @@ class AiTabCompletionSanitizeTest {
         assertEquals(77, request.maxTokens)
         assertNull(request.temperature)
         assertEquals(emptyMap(), request.extras)
+        assertNull(request.modelOverride)
 
     }
 }

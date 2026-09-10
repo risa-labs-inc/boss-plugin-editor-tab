@@ -27,7 +27,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-version = "1.6.6"
+version = "1.6.7"
 
 java {
     toolchain {
@@ -67,12 +67,13 @@ dependencies {
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
     //
-    // 1.0.14 is required for EditorLineDecoration, used to paint the inline AI review hunk.
+    // 1.0.15 is required for EditorInlineSuggestion, used to render multiline ghost text as
+    // real virtual editor lines. 1.0.14 added EditorLineDecoration for the AI review hunk.
     // 1.0.13 also fixed LSP navigation: ServerDiscovery previously rejected any command
     // containing a path separator, so an absolute path to a server read as "not installed"
     // and no process was ever spawned; and InitializeResult decoded union-typed
     // capabilities strictly, which failed the handshake for every server tried.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.14")
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.15")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

@@ -18,6 +18,7 @@ import ai.rever.bosseditor.features.NavigationFailureReason
 import ai.rever.bosseditor.features.SearchManager
 import ai.rever.bosseditor.features.SearchOptions
 import ai.rever.bosseditor.features.EditorLineDecoration
+import ai.rever.bosseditor.features.EditorInlineSuggestion
 import ai.rever.bosseditor.ui.SearchBar
 import ai.rever.bosseditor.ui.GoToLineDialog
 import ai.rever.bosseditor.largefile.LargeFileDocument
@@ -123,7 +124,6 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
@@ -843,6 +843,15 @@ class EditorTabComponent(
         // provided to this subtree, so the canvas and the popups around it cannot
         // disagree about which theme is active.
         val editorTheme = LocalEditorTheme.current
+        val editorInlineSuggestion = remember(ghostSuggestion, aiReviewDocument, editorTheme.colors.text) {
+            ghostSuggestion?.takeIf { aiReviewDocument == null }?.let { suggestion ->
+                EditorInlineSuggestion(
+                    position = suggestion.position,
+                    text = suggestion.text,
+                    color = editorTheme.colors.text.copy(alpha = 0.45f),
+                )
+            }
+        }
 
         // Parse minimap custom colors from settings (matches bundled editor exactly)
         val minimapBgColor = remember(settings.minimapBackgroundColor) {
@@ -1285,6 +1294,7 @@ class EditorTabComponent(
                     searchMatches = if (aiReviewDocument == null) searchMatches else emptyList(),
                     currentSearchMatchIndex = if (aiReviewDocument == null) currentSearchMatchIndex else -1,
                     lineDecorations = reviewLineDecorations,
+                    inlineSuggestion = editorInlineSuggestion,
                     // Per FILE, not per editor. `navigationResolver` REPLACES the
                     // internal PSI NavigationManager rather than layering over it, so
                     // this is the only way to keep both: Kotlin stays on PSI, which is
@@ -1494,20 +1504,6 @@ class EditorTabComponent(
                 // path, so the two cannot fight.
                 if (aiReviewDocument == null) {
                     GitGutterMarks(gitMarks, editorState)
-                }
-
-                // AI ghost-text overlay. Plugin-side stand-in for a real inline
-                // suggestion mechanism (the bundled BossEditor has none);
-                // anchoring math mirrors the rename dialog and run gutter.
-                if (ghostSuggestion != null && !isLargeFile && aiReviewDocument == null) {
-                    GhostTextOverlay(
-                        suggestion = ghostSuggestion,
-                        editorState = editorState,
-                        fallbackLineHeight = lineHeightPx,
-                        fontFamily = composeFontFamily,
-                        fontSize = settings.fontSize,
-                        editorTheme = editorTheme
-                    )
                 }
 
                 // Usages popup overlay (exactly like bundled editor)
@@ -2120,76 +2116,6 @@ private fun AnchoredAiInlineEditBar(
 
 private val AI_INLINE_MARGIN = 8.dp
 private val AI_INLINE_GAP = 4.dp
-
-// ========== AI Ghost Text Overlay ==========
-
-/**
- * Ghost-text overlay for AI tab completion. Continuation lines float over
- * whatever sits below the caret (on a translucent editor-background card
- * rather than pushing text down) — the accepted trade-off of the plugin-side
- * overlay until the BossEditor library grows inline-suggestion support.
- */
-@Composable
-private fun GhostTextOverlay(
-    suggestion: GhostSuggestion,
-    editorState: EditorState,
-    fallbackLineHeight: Float,
-    fontFamily: FontFamily,
-    fontSize: Float,
-    editorTheme: EditorTheme
-) {
-    val viewport by editorState.visibleViewport.collectAsState()
-    val scrollOffset by editorState.scrollOffset.collectAsState()
-    val visualLineMapper by editorState.visualLineMapper.collectAsState()
-
-    // Caret line hidden inside a collapsed fold: nothing to anchor to
-    val visualLine = visualLineMapper.documentToVisual(suggestion.position.line)
-    if (visualLine < 0) return
-    // Caret line scrolled out of the viewport: the Box doesn't clip, so an
-    // off-screen anchor would paint over the search bar / status bar
-    if (viewport.visibleLineCount > 0 &&
-        (visualLine < viewport.firstVisibleLine ||
-            visualLine >= viewport.firstVisibleLine + viewport.visibleLineCount)
-    ) {
-        return
-    }
-
-    val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
-    val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
-    val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
-
-    val x = (gutterWidth + suggestion.position.column * charWidth - scrollOffset.x).toInt()
-    val y = ((visualLine * lineHeight) - scrollOffset.y).toInt()
-
-    val style = TextStyle(
-        fontFamily = fontFamily,
-        fontSize = fontSize.sp,
-        fontStyle = FontStyle.Italic,
-        color = editorTheme.colors.text.copy(alpha = 0.45f)
-    )
-    val lines = suggestion.text.lines()
-
-    // First line: inline at the caret, transparent background
-    Text(
-        text = lines.first(),
-        style = style,
-        maxLines = 1,
-        softWrap = false,
-        modifier = Modifier.offset { IntOffset(x, y) }
-    )
-    if (lines.size > 1) {
-        Column(
-            modifier = Modifier
-                .offset { IntOffset((gutterWidth - scrollOffset.x).toInt(), (y + lineHeight).toInt()) }
-                .background(editorTheme.colors.background.copy(alpha = 0.92f))
-                .padding(horizontal = 4.dp)
-        ) {
-            lines.drop(1).forEach { line ->
-                Text(text = line, style = style, maxLines = 1, softWrap = false)
-            }
-        }
-    }
-}
 
 // ========== Settings ==========
 

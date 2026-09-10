@@ -136,10 +136,9 @@ data class CompletionContext(
 /**
  * AI tab completion (ghost text), plugin-side.
  *
- * The bundled BossEditor has no inline-suggestion mechanism, so the suggestion
- * renders as an overlay in [EditorTabComponent] and Tab/Esc are intercepted
- * before the editor sees them (preview phase — the editor consumes Tab for
- * indent). The AI comes from the ai-gateway plugin's [AiGatewayAPI], resolved
+ * BossEditor renders the suggestion at the caret and reserves virtual lines for multiline
+ * continuations. Tab/Esc are intercepted before the editor sees them (preview phase — the editor
+ * consumes Tab for indent). The AI comes from the ai-gateway plugin's [AiGatewayAPI], resolved
  * lazily per request (load order across plugins is not guaranteed, so caching
  * a null at construction would disable the feature forever); every failure —
  * gateway absent, no provider, timeout, blank reply — is silence, never an
