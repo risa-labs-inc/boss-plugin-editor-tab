@@ -17,6 +17,8 @@ import ai.rever.bosseditor.features.NavigationFeedbackState
 import ai.rever.bosseditor.features.NavigationFailureReason
 import ai.rever.bosseditor.features.SearchManager
 import ai.rever.bosseditor.features.SearchOptions
+import ai.rever.bosseditor.features.EditorLineDecoration
+import ai.rever.bosseditor.features.EditorInlineSuggestion
 import ai.rever.bosseditor.ui.SearchBar
 import ai.rever.bosseditor.ui.GoToLineDialog
 import ai.rever.bosseditor.largefile.LargeFileDocument
@@ -38,6 +40,7 @@ import ai.rever.bosseditor.ui.ExtractVariableDialog
 import ai.rever.bosseditor.ui.ExtractMethodDialog
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import ai.rever.bosseditor.core.EditorPosition
 import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
@@ -96,6 +99,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
@@ -118,9 +122,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
@@ -517,7 +521,7 @@ class EditorTabComponent(
                 EditorState(initialContent, null)
             }
 
-        // AI tab completion (ghost text) and Cmd+K inline edit, from the
+        // AI tab completion (ghost text) and Cmd/Ctrl+I/K inline edit, from the
         // component-level services - see their declarations for why they are
         // not remembered per composition.
         val aiCompletion = this.aiCompletion
@@ -527,6 +531,7 @@ class EditorTabComponent(
         val aiInlineEdit = this.aiInlineEdit
         aiInlineEdit?.bind(editorBuffer, editorState)
         val aiEditSession = aiInlineEdit?.session?.collectAsState()?.value
+        var editorSurfaceSize by remember { mutableStateOf(IntSize.Zero) }
 
         // Get window ID for filtering navigation events (exactly like bundled editor)
         val windowId = context.windowId ?: ""
@@ -627,6 +632,51 @@ class EditorTabComponent(
         var editVersion by remember { mutableStateOf(0) }
         val autoSaveEnabled by autoSaveSettingsManager.enabled.collectAsState()
 
+        // Review uses a private, read-only EditorState. The shared live document remains byte-for-
+        // byte unchanged until Accept, so other splits, LSP, autosave and undo never observe a
+        // proposal. The shadow contains the old block followed by the proposed block as a unified
+        // red/green hunk.
+        val reviewIsStale = aiEditSession?.done == true &&
+            editorState.document.documentVersion != aiEditSession.bufferVersion
+        LaunchedEffect(reviewIsStale, aiEditSession?.replacement) {
+            if (reviewIsStale) aiInlineEdit?.markStale()
+        }
+        val aiReviewDocument = remember(
+            aiEditSession?.done,
+            aiEditSession?.replacement,
+            aiEditSession?.bufferVersion,
+            editorState.document.documentVersion,
+        ) {
+            aiEditSession?.takeIf { it.done && it.replacement.isNotEmpty() && !reviewIsStale }?.let { session ->
+                val start = editorState.document.positionToOffset(session.startLine, session.startCol)
+                val end = editorState.document.positionToOffset(session.endLine, session.endCol)
+                buildAiInlineReviewDocument(editorState.document.getText(), start, end, session.replacement)
+            }
+        }
+        val reviewEditorState = remember(aiReviewDocument?.text, filePath) {
+            aiReviewDocument?.let { review ->
+                EditorState(review.text, filePath).also { shadow ->
+                    shadow.moveCaret(EditorPosition(review.controlAnchorLine, 0))
+                    shadow.setScrollOffset(editorState.scrollOffset.value)
+                }
+            }
+        }
+        val displayedEditorState = reviewEditorState ?: editorState
+        val reviewRemovedColor = BossThemeColors.ErrorColor.copy(alpha = 0.20f)
+        val reviewAddedColor = BossThemeColors.SuccessColor.copy(alpha = 0.20f)
+        val reviewLineDecorations = remember(aiReviewDocument, reviewRemovedColor, reviewAddedColor) {
+            aiReviewDocument?.let { review ->
+                buildList {
+                    repeat(review.removedLineCount) { offset ->
+                        add(EditorLineDecoration(review.removedLineStart + offset, reviewRemovedColor))
+                    }
+                    repeat(review.addedLineCount) { offset ->
+                        add(EditorLineDecoration(review.addedLineStart + offset, reviewAddedColor))
+                    }
+                }
+            }.orEmpty()
+        }
+
         // Search state
         var showSearchBar by remember { mutableStateOf(false) }
         var showReplaceInSearchBar by remember { mutableStateOf(false) }
@@ -660,6 +710,22 @@ class EditorTabComponent(
         // Incrementing this causes `remember(tokenCache, filePath, semanticVersion)` to
         // recreate the lambda, which triggers the editor to re-render with semantic colors.
         var semanticVersion by remember { mutableStateOf(0) }
+
+        fun noteLiveTextChanged() {
+            editVersion++
+            if (isMarkdown) {
+                markdownText = editorState.document.getText()
+            }
+            if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
+                coroutineScope.launch {
+                    semanticTokens.analyzeFile(filePath, editorState.document.getText())
+                    semanticVersion++
+                }
+            }
+            if (!isLargeFile) {
+                aiCompletion?.schedule(editorState, filePath, language, completionSettings)
+            }
+        }
 
         // Bumped by every reload from disk. `initialContent` is a plain field rather than
         // snapshot state, so the two effects below would otherwise never re-run and the tab
@@ -778,6 +844,15 @@ class EditorTabComponent(
         // provided to this subtree, so the canvas and the popups around it cannot
         // disagree about which theme is active.
         val editorTheme = LocalEditorTheme.current
+        val editorInlineSuggestion = remember(ghostSuggestion, aiReviewDocument, editorTheme.colors.text) {
+            ghostSuggestion?.takeIf { aiReviewDocument == null }?.let { suggestion ->
+                EditorInlineSuggestion(
+                    position = suggestion.position,
+                    text = suggestion.text,
+                    color = editorTheme.colors.text.copy(alpha = 0.45f),
+                )
+            }
+        }
 
         // Parse minimap custom colors from settings (matches bundled editor exactly)
         val minimapBgColor = remember(settings.minimapBackgroundColor) {
@@ -912,6 +987,18 @@ class EditorTabComponent(
                 .fillMaxSize()
                 .focusRequester(editorFocusRequester)
                 .onPreviewKeyEvent { event ->
+                    // The focused EditorCanvas has its own key handler. AI
+                    // shortcuts must run in the tunnelling phase so they cannot
+                    // be consumed before this component's bubbling handler.
+                    val composeShortcut =
+                        event.type == KeyEventType.KeyDown &&
+                            (event.isMetaPressed || event.isCtrlPressed) &&
+                            !event.isShiftPressed && !event.isAltPressed &&
+                            (event.key == Key.I || event.key == Key.K) &&
+                            !isLargeFile
+                    if (composeShortcut) {
+                        return@onPreviewKeyEvent aiInlineEdit?.start(editorState, language) == true
+                    }
                     // Preview (tunneling) phase, so this runs before the editor's
                     // own handler: with a ghost suggestion showing, Tab must
                     // accept it instead of inserting an indent, Esc must dismiss
@@ -1000,8 +1087,8 @@ class EditorTabComponent(
                                 editorState.redo()
                                 true
                             }
-                            // Cmd+K: AI inline edit on the selection (or current line).
-                            // Not consumed when no AI gateway is available.
+                            // Cmd/Ctrl+I or Cmd/Ctrl+K: AI inline edit on the
+                            // selection (or current line).
                             EditorKeyAction.InlineAiEdit -> {
                                 aiInlineEdit?.start(editorState, language) == true
                             }
@@ -1167,13 +1254,26 @@ class EditorTabComponent(
                     // document, which has no buffer and so no file to compare.
                     val gitMarks: Map<Int, LineDiff.Mark> =
                         editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
+                    val displayedGutterIcons = remember(gitMarks, editorBuffer, aiReviewDocument != null) {
+                        if (aiReviewDocument == null) {
+                            reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
+                        } else {
+                            emptyList()
+                        }
+                    }
                     // A settings change must replace the resolver in already-open tabs. It also
                     // forces LspSettingsManager's synchronous load before consulting the registry.
                     val lspConfig by LspSettingsManager.instance.configuration.collectAsState()
-                    Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .then(editorSurfaceModifier)
+                            .onSizeChanged { editorSurfaceSize = it },
+                    ) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
-                    state = editorState,
+                    state = displayedEditorState,
                     modifier = Modifier.fillMaxSize(),
                     theme = editorTheme,
                     fontFamily = composeFontFamily,
@@ -1181,7 +1281,7 @@ class EditorTabComponent(
                     lineSpacing = settings.lineSpacing,
                     showLineNumbers = settings.showLineNumbers,
                     highlightCurrentLine = settings.highlightCurrentLine,
-                    readOnly = isLargeFile, // Large files are read-only
+                    readOnly = isLargeFile || aiReviewDocument != null,
                     filePath = filePath,
                     projectPath = projectPath,
                     showMinimap = settings.showMinimap,
@@ -1189,16 +1289,16 @@ class EditorTabComponent(
                     minimapUseEditorColors = settings.minimapUseEditorColors,
                     minimapBackgroundColor = minimapBgColor,
                     minimapForegroundColor = minimapFgColor,
-                    tokenProvider = tokenProvider,
+                    tokenProvider = if (aiReviewDocument == null) tokenProvider else ({ _: Int -> emptyList() }),
                     // Transparent, purely to make the editor reserve its gutter
                     // icon strip; GitGutterMarks draws the glyphs into it,
                     // because drawGutterIconForLine can paint a shape but never
                     // text.
-                    gutterIcons = remember(gitMarks, editorBuffer) {
-                        reserveGitGutter(gitMarks, reserveWhenEmpty = editorBuffer != null)
-                    },
-                    searchMatches = searchMatches,
-                    currentSearchMatchIndex = currentSearchMatchIndex,
+                    gutterIcons = displayedGutterIcons,
+                    searchMatches = if (aiReviewDocument == null) searchMatches else emptyList(),
+                    currentSearchMatchIndex = if (aiReviewDocument == null) currentSearchMatchIndex else -1,
+                    lineDecorations = reviewLineDecorations,
+                    inlineSuggestion = editorInlineSuggestion,
                     // Per FILE, not per editor. `navigationResolver` REPLACES the
                     // internal PSI NavigationManager rather than layering over it, so
                     // this is the only way to keep both: Kotlin stays on PSI, which is
@@ -1220,23 +1320,7 @@ class EditorTabComponent(
                         }
                     },
                     onTextChanged = {
-                        // Restarts the auto save debounce
-                        editVersion++
-                        // Feed the live markdown preview (debounced inside the pane)
-                        if (isMarkdown) {
-                            markdownText = editorState.document.getText()
-                        }
-                        // Re-trigger PSI semantic analysis after edits
-                        if (filePath.endsWith(".kt") || filePath.endsWith(".kts")) {
-                            coroutineScope.launch {
-                                semanticTokens.analyzeFile(filePath, editorState.document.getText())
-                                semanticVersion++
-                            }
-                        }
-                        // Debounced ghost-text request at the new caret position
-                        if (!isLargeFile) {
-                            aiCompletion?.schedule(editorState, filePath, language, completionSettings)
-                        }
+                        noteLiveTextChanged()
                     },
                     onCaretPositionChanged = { position ->
                         // Convert to 1-based line/column for compatibility
@@ -1423,20 +1507,8 @@ class EditorTabComponent(
                 // Uncommitted-change markers in the editor's own gutter strip.
                 // The diff tab draws its own gutter and never reaches this
                 // path, so the two cannot fight.
-                GitGutterMarks(gitMarks, editorState)
-
-                // AI ghost-text overlay. Plugin-side stand-in for a real inline
-                // suggestion mechanism (the bundled BossEditor has none);
-                // anchoring math mirrors the rename dialog and run gutter.
-                if (ghostSuggestion != null && !isLargeFile) {
-                    GhostTextOverlay(
-                        suggestion = ghostSuggestion,
-                        editorState = editorState,
-                        fallbackLineHeight = lineHeightPx,
-                        fontFamily = composeFontFamily,
-                        fontSize = settings.fontSize,
-                        editorTheme = editorTheme
-                    )
+                if (aiReviewDocument == null) {
+                    GitGutterMarks(gitMarks, editorState)
                 }
 
                 // Usages popup overlay (exactly like bundled editor)
@@ -1509,24 +1581,32 @@ class EditorTabComponent(
                     )
                 }
 
-                // AI inline edit (Cmd+K): one inline card over the editor,
-                // Cursor-style - prompt, generation and the accept/reject diff
-                // in the same place. It replaced an AlertDialog plus the
-                // library's RefactorPreviewDialog, which took focus off the
-                // editor and covered the code being edited.
+                // AI inline edit (Cmd/Ctrl+I/K): one inline card over the editor,
+                // Cursor-style prompt and compact accept/reject controls. Review code is the
+                // red/green shadow EditorState rendered in the main editor surface above.
                 if (aiEditSession != null) {
                     val inlineEditService = aiInlineEdit
-                    AiInlineEditBar(
+                    AnchoredAiInlineEditBar(
                         session = aiEditSession,
+                        editorState = displayedEditorState,
+                        editorSurfaceSize = editorSurfaceSize,
+                        fallbackLineHeight = lineHeightPx,
+                        anchorLine = aiReviewDocument?.controlAnchorLine,
+                        anchorCol = if (aiReviewDocument != null) 0 else null,
                         onPromptChange = { inlineEditService?.setPrompt(it) },
                         onSubmit = { inlineEditService?.submit() },
                         onAccept = {
-                            if (inlineEditService != null && !inlineEditService.applyAccepted()) {
-                                inlineEditService.markStale()
+                            if (inlineEditService != null) {
+                                if (inlineEditService.applyAccepted()) {
+                                    // While reviewing, BossEditor observes the shadow state. Notify
+                                    // the live-buffer side effects explicitly for this one edit.
+                                    noteLiveTextChanged()
+                                } else {
+                                    inlineEditService.markStale()
+                                }
                             }
                         },
                         onCancel = { inlineEditService?.cancel() },
-                        modifier = Modifier.align(Alignment.TopCenter),
                     )
                 }
 
@@ -1982,75 +2062,65 @@ private fun EditorStatusBar(
     }
 }
 
-// ========== AI Ghost Text Overlay ==========
-
 /**
- * Ghost-text overlay for AI tab completion. Continuation lines float over
- * whatever sits below the caret (on a translucent editor-background card
- * rather than pushing text down) — the accepted trade-off of the plugin-side
- * overlay until the BossEditor library grows inline-suggestion support.
+ * Keeps the inline-edit card attached to the active edge of the captured selection while the
+ * prompt owns focus. EditorCanvas and this overlay use the same visual-line and scroll metrics.
  */
 @Composable
-private fun GhostTextOverlay(
-    suggestion: GhostSuggestion,
+private fun AnchoredAiInlineEditBar(
+    session: AiInlineEditService.Session,
     editorState: EditorState,
+    editorSurfaceSize: IntSize,
     fallbackLineHeight: Float,
-    fontFamily: FontFamily,
-    fontSize: Float,
-    editorTheme: EditorTheme
+    anchorLine: Int? = null,
+    anchorCol: Int? = null,
+    onPromptChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onAccept: () -> Unit,
+    onCancel: () -> Unit,
 ) {
     val viewport by editorState.visibleViewport.collectAsState()
     val scrollOffset by editorState.scrollOffset.collectAsState()
     val visualLineMapper by editorState.visualLineMapper.collectAsState()
-
-    // Caret line hidden inside a collapsed fold: nothing to anchor to
-    val visualLine = visualLineMapper.documentToVisual(suggestion.position.line)
-    if (visualLine < 0) return
-    // Caret line scrolled out of the viewport: the Box doesn't clip, so an
-    // off-screen anchor would paint over the search bar / status bar
-    if (viewport.visibleLineCount > 0 &&
-        (visualLine < viewport.firstVisibleLine ||
-            visualLine >= viewport.firstVisibleLine + viewport.visibleLineCount)
-    ) {
-        return
-    }
+    val resolvedAnchorLine = anchorLine ?: session.anchorLine
+    val resolvedAnchorCol = anchorCol ?: session.anchorCol
+    var popupSize by remember(resolvedAnchorLine, resolvedAnchorCol) { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current
+    val marginPx = with(density) { AI_INLINE_MARGIN.roundToPx() }
+    val gapPx = with(density) { AI_INLINE_GAP.roundToPx() }
 
     val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
     val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
     val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
-
-    val x = (gutterWidth + suggestion.position.column * charWidth - scrollOffset.x).toInt()
-    val y = ((visualLine * lineHeight) - scrollOffset.y).toInt()
-
-    val style = TextStyle(
-        fontFamily = fontFamily,
-        fontSize = fontSize.sp,
-        fontStyle = FontStyle.Italic,
-        color = editorTheme.colors.text.copy(alpha = 0.45f)
+    val visualLine = visualLineMapper.documentToVisual(resolvedAnchorLine)
+    val anchorX = gutterWidth + resolvedAnchorCol * charWidth - scrollOffset.x
+    val anchorY = if (visualLine >= 0) visualLine * lineHeight - scrollOffset.y else marginPx.toFloat()
+    val placement = placeAiInlineEdit(
+        containerWidth = editorSurfaceSize.width,
+        containerHeight = editorSurfaceSize.height,
+        popupWidth = popupSize.width,
+        popupHeight = popupSize.height,
+        anchorX = anchorX,
+        anchorY = anchorY,
+        lineHeight = lineHeight,
+        margin = marginPx,
+        gap = gapPx,
     )
-    val lines = suggestion.text.lines()
 
-    // First line: inline at the caret, transparent background
-    Text(
-        text = lines.first(),
-        style = style,
-        maxLines = 1,
-        softWrap = false,
-        modifier = Modifier.offset { IntOffset(x, y) }
+    AiInlineEditBar(
+        session = session,
+        onPromptChange = onPromptChange,
+        onSubmit = onSubmit,
+        onAccept = onAccept,
+        onCancel = onCancel,
+        modifier = Modifier
+            .offset { IntOffset(placement.x, placement.y) }
+            .onSizeChanged { popupSize = it },
     )
-    if (lines.size > 1) {
-        Column(
-            modifier = Modifier
-                .offset { IntOffset((gutterWidth - scrollOffset.x).toInt(), (y + lineHeight).toInt()) }
-                .background(editorTheme.colors.background.copy(alpha = 0.92f))
-                .padding(horizontal = 4.dp)
-        ) {
-            lines.drop(1).forEach { line ->
-                Text(text = line, style = style, maxLines = 1, softWrap = false)
-            }
-        }
-    }
 }
+
+private val AI_INLINE_MARGIN = 8.dp
+private val AI_INLINE_GAP = 4.dp
 
 // ========== Settings ==========
 
@@ -3094,7 +3164,7 @@ internal fun editorShortcutFor(
         isMeta && key == Key.H -> EditorKeyAction.ShowFindReplace
         isMeta && (key == Key.G || key == Key.L) -> EditorKeyAction.GoToLine
         isMeta && key == Key.Y -> EditorKeyAction.Redo
-        isMeta && key == Key.K && !isLargeFile -> EditorKeyAction.InlineAiEdit
+        isMeta && (key == Key.I || key == Key.K) && !isLargeFile -> EditorKeyAction.InlineAiEdit
         isMeta && key == Key.S && !isLargeFile -> EditorKeyAction.Save
         key == Key.F3 && !isShift -> EditorKeyAction.FindNext
         key == Key.F3 && isShift -> EditorKeyAction.FindPrevious

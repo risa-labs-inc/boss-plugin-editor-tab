@@ -56,7 +56,7 @@ repositories {
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.87.jar")
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.88.jar")
     } else {
         // CI: use downloaded JAR
         files("build/downloaded-deps/boss-plugin-api.jar")
@@ -68,12 +68,13 @@ dependencies {
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
     //
-    // 1.0.13 is required, not merely preferred: LSP navigation cannot work on
-    // 1.0.12. Its ServerDiscovery rejects any command containing a path
-    // separator, so an absolute path to a server reads as "not installed" and
-    // no process is ever spawned; and its InitializeResult decodes union-typed
+    // 1.0.15 is required for EditorInlineSuggestion, used to render multiline ghost text as
+    // real virtual editor lines. 1.0.14 added EditorLineDecoration for the AI review hunk.
+    // 1.0.13 also fixed LSP navigation: ServerDiscovery previously rejected any command
+    // containing a path separator, so an absolute path to a server read as "not installed"
+    // and no process was ever spawned; and InitializeResult decoded union-typed
     // capabilities strictly, which failed the handshake for every server tried.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.13")
+    implementation("com.risaboss:bosseditor-compose-desktop:1.0.15")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,

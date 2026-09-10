@@ -8,10 +8,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlin.test.Test
 import kotlin.test.assertFalse
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Cmd+K must never apply a rewrite at offsets the document has moved past.
+ * Inline AI edit must never apply a rewrite at offsets the document has moved past.
  *
  * The guard read only the shared buffer's version, so a viewport with NO
  * shared buffer - an untitled document, or any viewport holding a private
@@ -54,6 +55,18 @@ class AiInlineEditStalenessTest {
 
         assertFalse(service.isStale())
         assertTrue(service.applyAccepted())
+    }
+
+    @Test
+    fun `rejecting a review candidate leaves the live document and undo history untouched`() {
+        val state = EditorState("val a = 1\n", null)
+        val service = serviceOver(state)
+        val undoCount = state.undoManager.undoCount
+
+        service.cancel()
+
+        assertEquals("val a = 1\n", state.document.getText())
+        assertEquals(undoCount, state.undoManager.undoCount)
     }
 
     @Test
