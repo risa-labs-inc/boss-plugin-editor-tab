@@ -1,7 +1,6 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.AiChunk
-import ai.rever.boss.plugin.api.AiAvailability
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
@@ -41,7 +40,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Cmd+K inline AI edit (IDE batch P4.2).
+ * Cmd/Ctrl+I or Cmd/Ctrl+K inline AI edit (IDE batch P4.2).
  *
  * The selection (or the caret's line when nothing is selected) is sent to the
  * active AI provider with a "rewrite only this code" prompt; the reply is
@@ -49,8 +48,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * shared buffer's document - one undo step, and refused with a stale error
  * when the buffer moved since the request started.
  *
- * Degrades to nothing without a gateway: the Cmd+K handler bails before
- * consuming the key when no AiGatewayAPI is registered.
+ * Opens even when AI is unavailable so the prompt can explain whether the
+ * shared provider or gateway needs configuration.
  */
 class AiInlineEditService(
     private val context: PluginContext,
@@ -95,10 +94,10 @@ class AiInlineEditService(
 
     /** @return true when a session was started (so the key event is consumed). */
     fun start(editorState: EditorState, language: String): Boolean {
-        // A missing gateway used to return false here, so Cmd+K did nothing at
+        // A missing gateway used to return false here, so the compose shortcut did nothing at
         // all - indistinguishable from a broken keybinding. Open the widget
         // either way and let it say which of the two things is actually wrong.
-        val unavailable = describeReadiness(AiAvailability.check(context))
+        val unavailable = describeReadiness(editorAiReadiness(context))
         val state = this.editorState ?: editorState
         val doc = state.document
         val selection = state.selection.value
@@ -139,7 +138,7 @@ class AiInlineEditService(
     fun submit() {
         val s = _session.value ?: return
         if (s.prompt.isBlank() || s.busy) return
-        describeReadiness(AiAvailability.check(context))?.let { reason ->
+        describeReadiness(editorAiReadiness(context))?.let { reason ->
             _session.value = s.copy(error = reason)
             return
         }
@@ -236,7 +235,7 @@ class AiInlineEditService(
      * there is one, the viewport's own document version when there is not.
      * Consulting only the buffer left every buffer-less viewport (an untitled
      * document, or any viewport holding a private EditorState) with NO
-     * staleness check at all, so a Cmd+K rewrite accepted after the user had
+     * staleness check at all, so an inline rewrite accepted after the user had
      * typed applied at pre-typing offsets.
      */
     private fun currentVersion(): Long? = buffer?.version ?: editorState?.document?.documentVersion
@@ -324,7 +323,6 @@ class AiInlineEditService(
                                 "Output only the rewritten selected code.",
                         ),
                     ),
-                temperature = 0f,
                 maxTokens = 4096,
                 timeoutMs = 45_000,
             )

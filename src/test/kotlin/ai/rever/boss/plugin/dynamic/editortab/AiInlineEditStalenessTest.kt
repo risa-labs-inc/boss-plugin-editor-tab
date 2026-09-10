@@ -11,7 +11,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * Cmd+K must never apply a rewrite at offsets the document has moved past.
+ * Inline AI edit must never apply a rewrite at offsets the document has moved past.
  *
  * The guard read only the shared buffer's version, so a viewport with NO
  * shared buffer - an untitled document, or any viewport holding a private

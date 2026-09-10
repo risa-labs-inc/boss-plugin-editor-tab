@@ -516,7 +516,7 @@ class EditorTabComponent(
                 EditorState(initialContent, null)
             }
 
-        // AI tab completion (ghost text) and Cmd+K inline edit, from the
+        // AI tab completion (ghost text) and Cmd/Ctrl+I/K inline edit, from the
         // component-level services - see their declarations for why they are
         // not remembered per composition.
         val aiCompletion = this.aiCompletion
@@ -999,8 +999,8 @@ class EditorTabComponent(
                                 editorState.redo()
                                 true
                             }
-                            // Cmd+K: AI inline edit on the selection (or current line).
-                            // Not consumed when no AI gateway is available.
+                            // Cmd/Ctrl+I or Cmd/Ctrl+K: AI inline edit on the
+                            // selection (or current line).
                             EditorKeyAction.InlineAiEdit -> {
                                 aiInlineEdit?.start(editorState, language) == true
                             }
@@ -1504,7 +1504,7 @@ class EditorTabComponent(
                     )
                 }
 
-                // AI inline edit (Cmd+K): one inline card over the editor,
+                // AI inline edit (Cmd/Ctrl+I/K): one inline card over the editor,
                 // Cursor-style - prompt, generation and the accept/reject diff
                 // in the same place. It replaced an AlertDialog plus the
                 // library's RefactorPreviewDialog, which took focus off the
@@ -3089,7 +3089,7 @@ internal fun editorShortcutFor(
         isMeta && key == Key.H -> EditorKeyAction.ShowFindReplace
         isMeta && (key == Key.G || key == Key.L) -> EditorKeyAction.GoToLine
         isMeta && key == Key.Y -> EditorKeyAction.Redo
-        isMeta && key == Key.K && !isLargeFile -> EditorKeyAction.InlineAiEdit
+        isMeta && (key == Key.I || key == Key.K) && !isLargeFile -> EditorKeyAction.InlineAiEdit
         isMeta && key == Key.S && !isLargeFile -> EditorKeyAction.Save
         key == Key.F3 && !isShift -> EditorKeyAction.FindNext
         key == Key.F3 && isShift -> EditorKeyAction.FindPrevious

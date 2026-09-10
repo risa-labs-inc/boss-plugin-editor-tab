@@ -74,16 +74,14 @@ class AiTabCompletionSanitizeTest {
     // ---- buildRequest ----
 
     @Test
-    fun `request carries the tuning knobs and omits the model hint when blank`() {
+    fun `request carries tuning knobs and uses the configured default model`() {
         val tuned = AiCompletionSettingsData(timeoutMs = 1234, maxTokens = 77)
         val request = AiTabCompletionService.buildRequest(ctx(prefix = "a", suffix = "b"), tuned)
         assertEquals(1234, request.timeoutMs)
         assertEquals(77, request.maxTokens)
-        assertEquals(0f, request.temperature)
+        assertNull(request.temperature)
         assertEquals(emptyMap(), request.extras)
 
-        val hinted = AiTabCompletionService.buildRequest(ctx(), tuned.copy(model = "fast-1"))
-        assertEquals(mapOf("model" to "fast-1"), hinted.extras)
     }
 }
 

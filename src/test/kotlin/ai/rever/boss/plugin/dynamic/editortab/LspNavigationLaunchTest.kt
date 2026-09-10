@@ -62,6 +62,46 @@ class LspNavigationLaunchTest {
     }
 
     @Test
+    fun `Windows resolves npm cmd launchers through PATHEXT`() {
+        val dir = tempDir()
+        val launcher = File(dir, "typescript-language-server.cmd").apply { writeText("@echo off\r\n") }
+        val launched = LspNavigation().launchConfig(
+            config("typescript-language-server", "--stdio"),
+            path = dir.absolutePath,
+            isWindows = true,
+            pathExtensions = ".EXE;.CMD;.BAT",
+            commandInterpreter = "C:\\Windows\\System32\\cmd.exe",
+        )
+        assertEquals(
+            listOf(
+                "C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c",
+                LspNavigation.windowsBatchCommand(launcher.absolutePath, listOf("--stdio")),
+            ),
+            launched?.command,
+        )
+    }
+
+    @Test
+    fun `Windows batch payload quotes launcher paths and arguments containing spaces`() {
+        assertEquals(
+            "call \"C:\\Program Files\\node\\server.cmd\" \"--stdio\" \"a b\"",
+            LspNavigation.windowsBatchCommand(
+                "C:\\Program Files\\node\\server.cmd",
+                listOf("--stdio", "a b"),
+            ),
+        )
+    }
+
+    @Test
+    fun `an explicit executable path is accepted without searching PATH`() {
+        val exe = serverOn(tempDir(), "custom-server")
+        assertEquals(
+            exe.absolutePath,
+            LspNavigation.findOnPath(exe.absolutePath, path = "", isWindows = false),
+        )
+    }
+
+    @Test
     fun `the resolved PATH is handed to the server process`() {
         val dir = tempDir()
         serverOn(dir, "srv")

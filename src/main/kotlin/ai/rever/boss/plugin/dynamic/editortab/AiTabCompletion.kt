@@ -1,6 +1,5 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
-import ai.rever.boss.plugin.api.AiAvailability
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
@@ -56,8 +55,6 @@ data class AiCompletionSettingsData(
     val maxPrefixChars: Int = 6_000,
     /** Context sent after the caret. */
     val maxSuffixChars: Int = 2_000,
-    /** Optional fast-model hint, forwarded as AiRequest.extras["model"]. */
-    val model: String = "",
 )
 
 /** Reactive settings from ~/.boss/ai-completion-settings.json (PluginEditorSettings pattern). */
@@ -189,7 +186,7 @@ class AiTabCompletionService(
             _unavailable.value = null
             return
         }
-        val readiness = AiAvailability.check(context)
+        val readiness = editorAiReadiness(context)
         _unavailable.value =
             AiInlineEditService.describeReadiness(readiness) ?: slowProviderNotice(timeouts)
         if (readiness != AiReadiness.READY) return
@@ -321,10 +318,11 @@ class AiTabCompletionService(
                             "Output only the completion to insert at the cursor.",
                     ),
                 ),
-                temperature = 0f,
                 maxTokens = settings.maxTokens,
                 timeoutMs = settings.timeoutMs,
-                extras = if (settings.model.isBlank()) emptyMap() else mapOf("model" to settings.model),
+                // The absent override makes the gateway use the shared provider's
+                // active/default model and its secret-manager-backed credential.
+                extras = emptyMap(),
             )
 
         /** Cleans a raw model reply; null means "show nothing". */

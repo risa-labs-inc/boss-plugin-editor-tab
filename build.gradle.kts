@@ -27,7 +27,7 @@ group = "ai.rever.boss.plugin.dynamic"
 // implemented over one shared buffer per path, "Open Diff" context-menu entry
 // (host diff tab via GitDataProvider.openDiff), and the editor MCP tools
 // (editor_read_buffer/editor_get_selection/editor_apply_edit/editor_open_split).
-version = "1.6.2"
+version = "1.6.3"
 
 java {
     toolchain {
@@ -55,7 +55,7 @@ repositories {
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.87.jar")
+        files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.88.jar")
     } else {
         // CI: use downloaded JAR
         files("build/downloaded-deps/boss-plugin-api.jar")

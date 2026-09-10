@@ -51,7 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Cmd+K, Cursor's way: one compact card layered over the top of the editor,
+ * Cmd/Ctrl+I or Cmd/Ctrl+K: one compact card layered over the top of the editor,
  * carrying the whole interaction — prompt, generation, then an inline red/green
  * diff you accept or reject. Not a modal.
  *
