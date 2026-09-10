@@ -142,25 +142,6 @@ tasks.named<Jar>("jar") {
     enabled = false
 }
 
-// Which checkout produced this jar. Worktrees of this repo can declare the same
-// `version` while holding different work, and a jar carries no other record of where
-// it came from - `unzip -p <jar> META-INF/MANIFEST.MF` is then the fastest way to
-// tell an installed build apart from the branch you are reading.
-fun gitDescribeNow(vararg args: String): String =
-    runCatching {
-        providers.exec {
-            commandLine("git", *args)
-            workingDir = rootDir
-        }.standardOutput.asText.get().trim()
-    }.getOrNull().orEmpty().ifEmpty { "unknown" }
-
-val buildBranch = providers.environmentVariable("GITHUB_HEAD_REF")
-    .orElse(providers.environmentVariable("GITHUB_REF_NAME"))
-    .orElse(providers.provider { gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD") })
-// On pull_request this deliberately identifies Actions' tested merge commit; local builds use HEAD.
-val buildCommit = providers.environmentVariable("GITHUB_SHA")
-    .orElse(providers.provider { gitDescribeNow("rev-parse", "--short", "HEAD") })
-
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {
     archiveFileName.set("boss-plugin-editor-tab-${version}.jar")
@@ -179,8 +160,6 @@ tasks.register<Jar>("buildPluginJar") {
         attributes(
             "Implementation-Title" to "BOSS Code Editor Tab Plugin",
             "Implementation-Version" to version,
-            "Implementation-Branch" to buildBranch,
-            "Implementation-Commit" to buildCommit,
             "Main-Class" to "ai.rever.boss.plugin.dynamic.editortab.EditorTabDynamicPlugin"
         )
     }
