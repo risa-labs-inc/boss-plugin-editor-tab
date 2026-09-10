@@ -49,6 +49,15 @@ class AiTabCompletionSanitizeTest {
 
     // ---- buildContext ----
 
+    @Test
+    fun `defaults keep inline requests small enough for interactive completion`() {
+        val defaults = AiCompletionSettingsData()
+        assertEquals(300, defaults.debounceMs)
+        assertEquals(1_600, defaults.maxPrefixChars)
+        assertEquals(400, defaults.maxSuffixChars)
+        assertEquals(96, defaults.maxTokens)
+    }
+
     private val settings = AiCompletionSettingsData(maxPrefixChars = 20, maxSuffixChars = 10)
 
     @Test

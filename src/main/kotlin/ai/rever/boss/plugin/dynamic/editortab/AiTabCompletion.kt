@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.boss.plugin.api.AiGatewayAPI
+import ai.rever.boss.plugin.api.AiChunk
 import ai.rever.boss.plugin.api.AiReadiness
 import ai.rever.boss.plugin.api.AiMessage
 import ai.rever.boss.plugin.api.AiRequest
@@ -33,14 +34,15 @@ data class AiCompletionSettingsData(
     /**
      * How long the typing has to stop before a request goes out.
      *
-     * 300ms suits a provider that answers in a few hundred ms. The CLI route
+     * 300ms keeps the editor responsive without issuing a request for every
+     * keystroke. The CLI route
      * measured 11.7-15.9s on a realistic 4KB completion prompt, and a request
      * abandoned by the next keystroke still runs to completion - cancelling the
      * coroutine cannot interrupt the blocking read, and it kills the watchdog
      * that would otherwise have killed the process. So the debounce, not the
      * timeout, is what bounds how many CLI processes a typing burst spawns.
      */
-    val debounceMs: Long = 1_200,
+    val debounceMs: Long = 300,
     /**
      * Per-request budget, passed as [AiRequest.timeoutMs] - which the gateway
      * hands to the CLI session as its IDLE timeout.
@@ -50,11 +52,11 @@ data class AiCompletionSettingsData(
      * that route. Set above the measured worst case with margin.
      */
     val timeoutMs: Long = 20_000,
-    val maxTokens: Int = 256,
+    val maxTokens: Int = 96,
     /** Context sent before the caret. */
-    val maxPrefixChars: Int = 6_000,
+    val maxPrefixChars: Int = 1_600,
     /** Context sent after the caret. */
-    val maxSuffixChars: Int = 2_000,
+    val maxSuffixChars: Int = 400,
 )
 
 /** Reactive settings from ~/.boss/ai-completion-settings.json (PluginEditorSettings pattern). */
@@ -200,14 +202,33 @@ class AiTabCompletionService(
             val caret = editorState.caretPosition.value
             val completionContext =
                 buildContext(document.getText(), editorState.caretOffset, language, filePath, settings)
-            val reply = withContext(Dispatchers.IO) {
-                // The gateway is documented to honor timeoutMs; the outer bound
-                // keeps a gateway bug from ever hanging this coroutine.
+            var terminalFailure: Throwable? = null
+            var completed = false
+            val streamed = StringBuilder()
+            val finishedInTime = withContext(Dispatchers.IO) {
+                // Streaming lets useful text appear as soon as the model emits
+                // it instead of hiding the whole completion until generation
+                // finishes. Providers without native streaming are handled by
+                // the gateway's documented Text + Completed fallback.
                 withTimeoutOrNull(settings.timeoutMs + 500) {
-                    gateway.complete(buildRequest(completionContext, settings))
+                    gateway.stream(buildRequest(completionContext, settings)).collect { chunk ->
+                        when (chunk) {
+                            is AiChunk.Text -> {
+                                streamed.append(chunk.text)
+                                publishIfFresh(editorState, document, version, caret, completionContext, streamed.toString())
+                            }
+                            is AiChunk.Completed -> {
+                                completed = true
+                                val finalText = chunk.reply.text.ifBlank { streamed.toString() }
+                                publishIfFresh(editorState, document, version, caret, completionContext, finalText)
+                            }
+                            is AiChunk.Failed -> terminalFailure = chunk.error
+                        }
+                    }
+                    true
                 }
             }
-            if (reply == null) {
+            if (finishedInTime == null) {
                 // Out of budget. Count it: enough of these in a row and the
                 // provider is simply too slow for this feature, which is worth
                 // saying rather than retrying in silence forever.
@@ -215,14 +236,8 @@ class AiTabCompletionService(
                 _unavailable.value = slowProviderNotice(timeouts)
                 return@launch
             }
+            if (terminalFailure != null || !completed) return@launch
             timeouts = 0
-            val replyValue = reply.getOrNull() ?: return@launch
-            val completion = postProcess(replyValue.text, completionContext) ?: return@launch
-            // Stale guard: the user kept typing or moved the caret while the
-            // request flew. MVP stand-in for the D3 document-version guard
-            // (IDE-FEATURES-SCOPE.md).
-            if (document.documentVersion != version || editorState.caretPosition.value != caret) return@launch
-            _suggestion.value = GhostSuggestion(completion, caret, version)
         }
     }
 
@@ -247,6 +262,7 @@ class AiTabCompletionService(
      */
     fun accept(editorState: EditorState): Boolean {
         val shown = _suggestion.value ?: return false
+        inFlight?.cancel()
         _suggestion.value = null
         if (editorState.document.documentVersion != shown.documentVersion ||
             editorState.caretPosition.value != shown.position
@@ -255,6 +271,21 @@ class AiTabCompletionService(
         }
         editorState.insertText(shown.text)
         return true
+    }
+
+    private fun publishIfFresh(
+        editorState: EditorState,
+        document: ai.rever.bosseditor.core.EditorDocument,
+        version: Long,
+        caret: EditorPosition,
+        completionContext: CompletionContext,
+        raw: String,
+    ) {
+        val completion = postProcess(raw, completionContext) ?: return
+        // The user may keep typing while tokens arrive. Never let an older
+        // stream overwrite the text at a new caret/document version.
+        if (document.documentVersion != version || editorState.caretPosition.value != caret) return
+        _suggestion.value = GhostSuggestion(completion, caret, version)
     }
 
     companion object {

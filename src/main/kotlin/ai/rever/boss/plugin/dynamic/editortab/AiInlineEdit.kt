@@ -69,6 +69,8 @@ class AiInlineEditService(
         val startCol: Int = 0,
         val endLine: Int = 0,
         val endCol: Int = 0,
+        val anchorLine: Int = startLine,
+        val anchorCol: Int = startCol,
         val bufferVersion: Long = 0,
         val language: String = "",
     )
@@ -101,6 +103,7 @@ class AiInlineEditService(
         val doc = state.document
         val selection = state.selection.value
         val hasSelection = state.hasSelection && selection != null
+        val caret = state.caretPosition.value
         val start = if (hasSelection) selection!!.start else state.caretPosition.value
         val end =
             if (hasSelection) {
@@ -118,6 +121,10 @@ class AiInlineEditService(
                 startCol = start.column,
                 endLine = end.line,
                 endCol = end.column,
+                // Anchor at the active edge of the selection, rather than assuming that its
+                // normalized end is where the user finished selecting.
+                anchorLine = caret.line,
+                anchorCol = caret.column,
                 bufferVersion = buffer?.version ?: doc.documentVersion,
                 language = language,
                 // Provider registration and credential loading are asynchronous.

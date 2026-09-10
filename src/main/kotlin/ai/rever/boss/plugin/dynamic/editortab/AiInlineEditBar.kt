@@ -86,7 +86,9 @@ fun AiInlineEditBar(
 
     Column(
         modifier = modifier
-            .fillMaxWidth()
+            // A compact anchored card on wide editors; Compose constrains this width to the
+            // available pane on narrow windows and split views.
+            .width(560.dp)
             .padding(horizontal = 8.dp, vertical = 6.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(InlineSurface)

@@ -37,6 +37,7 @@ import ai.rever.bosseditor.ui.ExtractVariableDialog
 import ai.rever.bosseditor.ui.ExtractMethodDialog
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import ai.rever.bosseditor.core.EditorPosition
 import ai.rever.bosseditor.core.EditorRange
 import ai.rever.bosseditor.core.EditorState
@@ -95,6 +96,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.material.CircularProgressIndicator
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
@@ -117,6 +119,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -526,6 +529,7 @@ class EditorTabComponent(
         val aiInlineEdit = this.aiInlineEdit
         aiInlineEdit?.bind(editorBuffer, editorState)
         val aiEditSession = aiInlineEdit?.session?.collectAsState()?.value
+        var editorSurfaceSize by remember { mutableStateOf(IntSize.Zero) }
 
         // Get window ID for filtering navigation events (exactly like bundled editor)
         val windowId = context.windowId ?: ""
@@ -1178,7 +1182,13 @@ class EditorTabComponent(
                     // document, which has no buffer and so no file to compare.
                     val gitMarks: Map<Int, LineDiff.Mark> =
                         editorBuffer?.gitMarks?.collectAsState()?.value ?: emptyMap()
-                    Box(modifier = Modifier.weight(1f).fillMaxHeight().then(editorSurfaceModifier)) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .then(editorSurfaceModifier)
+                            .onSizeChanged { editorSurfaceSize = it },
+                    ) {
                     // Main editor (matches bundled BossEditorIntegration exactly)
                     BossEditor(
                     state = editorState,
@@ -1523,8 +1533,11 @@ class EditorTabComponent(
                 // editor and covered the code being edited.
                 if (aiEditSession != null) {
                     val inlineEditService = aiInlineEdit
-                    AiInlineEditBar(
+                    AnchoredAiInlineEditBar(
                         session = aiEditSession,
+                        editorState = editorState,
+                        editorSurfaceSize = editorSurfaceSize,
+                        fallbackLineHeight = lineHeightPx,
                         onPromptChange = { inlineEditService?.setPrompt(it) },
                         onSubmit = { inlineEditService?.submit() },
                         onAccept = {
@@ -1533,7 +1546,6 @@ class EditorTabComponent(
                             }
                         },
                         onCancel = { inlineEditService?.cancel() },
-                        modifier = Modifier.align(Alignment.TopCenter),
                     )
                 }
 
@@ -1988,6 +2000,62 @@ private fun EditorStatusBar(
         }
     }
 }
+
+/**
+ * Keeps the inline-edit card attached to the active edge of the captured selection while the
+ * prompt owns focus. EditorCanvas and this overlay use the same visual-line and scroll metrics.
+ */
+@Composable
+private fun AnchoredAiInlineEditBar(
+    session: AiInlineEditService.Session,
+    editorState: EditorState,
+    editorSurfaceSize: IntSize,
+    fallbackLineHeight: Float,
+    onPromptChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onAccept: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val viewport by editorState.visibleViewport.collectAsState()
+    val scrollOffset by editorState.scrollOffset.collectAsState()
+    val visualLineMapper by editorState.visualLineMapper.collectAsState()
+    var popupSize by remember(session.anchorLine, session.anchorCol) { mutableStateOf(IntSize.Zero) }
+    val density = LocalDensity.current
+    val marginPx = with(density) { AI_INLINE_MARGIN.roundToPx() }
+    val gapPx = with(density) { AI_INLINE_GAP.roundToPx() }
+
+    val lineHeight = viewport.lineHeight.takeIf { it > 0f } ?: fallbackLineHeight
+    val charWidth = viewport.charWidth.takeIf { it > 0f } ?: 8f
+    val gutterWidth = viewport.gutterWidth.takeIf { it > 0f } ?: 60f
+    val visualLine = visualLineMapper.documentToVisual(session.anchorLine)
+    val anchorX = gutterWidth + session.anchorCol * charWidth - scrollOffset.x
+    val anchorY = if (visualLine >= 0) visualLine * lineHeight - scrollOffset.y else marginPx.toFloat()
+    val placement = placeAiInlineEdit(
+        containerWidth = editorSurfaceSize.width,
+        containerHeight = editorSurfaceSize.height,
+        popupWidth = popupSize.width,
+        popupHeight = popupSize.height,
+        anchorX = anchorX,
+        anchorY = anchorY,
+        lineHeight = lineHeight,
+        margin = marginPx,
+        gap = gapPx,
+    )
+
+    AiInlineEditBar(
+        session = session,
+        onPromptChange = onPromptChange,
+        onSubmit = onSubmit,
+        onAccept = onAccept,
+        onCancel = onCancel,
+        modifier = Modifier
+            .offset { IntOffset(placement.x, placement.y) }
+            .onSizeChanged { popupSize = it },
+    )
+}
+
+private val AI_INLINE_MARGIN = 8.dp
+private val AI_INLINE_GAP = 4.dp
 
 // ========== AI Ghost Text Overlay ==========
 
