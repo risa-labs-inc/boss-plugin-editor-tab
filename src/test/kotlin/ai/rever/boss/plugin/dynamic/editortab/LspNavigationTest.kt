@@ -99,6 +99,11 @@ class LspNavigationTest {
         assertNull(LspNavigation.uriToPath("untitled:Untitled-1"))
     }
 
+    @Test
+    fun `a malformed percent encoded uri resolves to null`() {
+        assertNull(LspNavigation.uriToPath("file:///tmp/bad%2name.ts"))
+    }
+
     // ---- findOnPath -----------------------------------------------------
     //
     // BOSS is Dock-launched, so its own PATH is /usr/bin:/bin:/usr/sbin:/sbin and
@@ -157,6 +162,31 @@ class LspNavigationTest {
         assertNull(LspNavigation.findOnPath("definitely-not-installed-xyz", "/usr/bin${File.pathSeparator}/bin"))
     }
 
+    @Test
+    fun `explicit relative executable path is resolved directly`() {
+        val dir = File("build/tmp/lspnav-relative-${System.nanoTime()}").apply { mkdirs() }
+        val exe = File(dir, "server").apply {
+            writeText("#!/bin/sh\n")
+            setExecutable(true)
+        }
+        val relative = exe.canonicalFile.relativeTo(File(".").canonicalFile).path
+        val found = LspNavigation.findOnPath(relative, "/missing")
+        assertEquals(exe.canonicalPath, found?.let { File(it).canonicalPath })
+    }
+
+    @Test
+    fun `mergePaths preserves precedence and removes duplicates and blanks`() {
+        val separator = File.pathSeparator
+        assertEquals(
+            listOf("/shell/bin", "/shared/bin", "/process/bin", "/fallback/bin").joinToString(separator),
+            LspNavigation.mergePaths(
+                fromShell = listOf("/shell/bin", "/shared/bin").joinToString(separator),
+                current = listOf("", "/process/bin", "/shared/bin").joinToString(separator),
+                fallbacks = listOf("/fallback/bin", "", "/shell/bin"),
+            ),
+        )
+    }
+
     private fun createTempDir(): File =
         java.nio.file.Files.createTempDirectory("lspnav").toFile().also { it.deleteOnExit() }
 
@@ -164,6 +194,7 @@ class LspNavigationTest {
 
     @Test
     fun `kotlin files stay on psi so ShowUsages survives`() {
+        assertTrue(LspNavigation.usesPsi(""))
         assertTrue(LspNavigation.usesPsi("/x/Main.kt"))
         assertTrue(LspNavigation.usesPsi("/x/build.gradle.kts"))
     }

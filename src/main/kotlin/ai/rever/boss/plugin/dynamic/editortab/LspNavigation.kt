@@ -22,6 +22,7 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.addJsonObject
 import java.io.File
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.net.URI
 
@@ -47,11 +48,14 @@ import java.net.URI
  */
 class LspNavigation {
 
-    private val manager = LanguageServerManager()
+    /** One manager per workspace root; each manager already reuses servers by language. */
+    private val managers = ConcurrentHashMap<String, LanguageServerManager>()
+    @Volatile
+    private var disposed = false
 
     /**
-     * Documents announced with didOpen, per language, together with the client
-     * they were announced to. Guarded by [mutex].
+     * Documents announced with didOpen, keyed by the client they were announced to.
+     * Each set is concurrent because different language/root locks may reach the same client.
      *
      * Keyed by the client and not only the URI, because a server that dies is
      * replaced: `LanguageServerManager.getOrStartServer` hands back a FRESH
@@ -60,7 +64,7 @@ class LspNavigation {
      * the rest of the session, and nothing is logged. Comparing identity means
      * a replacement is re-announced instead.
      */
-    private val opened = mutableMapOf<String, OpenDocuments>()
+    private val opened = ConcurrentHashMap<LspClient, MutableSet<String>>()
 
     /**
      * Monotonic document version, shared across documents.
@@ -73,12 +77,10 @@ class LspNavigation {
      */
     private val documentVersion = AtomicInteger(0)
 
-    /** Serialises start + sync so two fast clicks cannot open the same doc twice. */
-    private val mutex = Mutex()
+    /** Serialises start + sync per language/root without blocking unrelated servers. */
+    private val mutexes = ConcurrentHashMap<ServerKey, Mutex>()
 
-    private class OpenDocuments(val client: LspClient) {
-        val uris = mutableSetOf<String>()
-    }
+    private data class ServerKey(val languageId: String, val root: String)
 
     /**
      * Resolve the definition of the symbol at [offset], or [NavigationResolveResult.NotFound].
@@ -91,10 +93,8 @@ class LspNavigation {
      *
      * Never throws except to propagate cancellation: a click that cannot be
      * answered must fall through to the editor's "not found" affordance, not
-     * tear down the composable's coroutine. Every other failure is therefore a
-     * silent NotFound, so when navigation is "not working" the only way to see
-     * WHY is the LSP file log, which `LspSettingsManager` ships disabled
-     * (`logging.fileLoggingEnabled`).
+     * tear down the composable's coroutine. Other failures are logged to stderr
+     * before returning NotFound so a missing or failed server is diagnosable.
      */
     suspend fun resolveDefinition(
         content: String,
@@ -102,6 +102,7 @@ class LspNavigation {
         offset: Int,
         projectPath: String?,
     ): NavigationResolveResult = withContext(Dispatchers.IO) {
+        if (disposed) return@withContext NavigationResolveResult.NotFound
         try {
             resolve(content, filePath, offset, projectPath)
         } catch (cancellation: CancellationException) {
@@ -109,7 +110,10 @@ class LspNavigation {
             // would report NotFound to a caller that is already gone, and hide the
             // cancellation from the scope that raised it.
             throw cancellation
-        } catch (_: Throwable) {
+        } catch (error: Exception) {
+            System.err.println(
+                "[LspNavigation] ${error::class.simpleName} resolving '$filePath': ${error.message}",
+            )
             NavigationResolveResult.NotFound
         }
     }
@@ -121,10 +125,10 @@ class LspNavigation {
         projectPath: String?,
     ): NavigationResolveResult {
         if (!LspSettingsManager.instance.configuration.value.enabled) return NavigationResolveResult.NotFound
-        // No registered server for this extension: answer immediately rather
-        // than paying a process spawn to find out.
+        // LspSettingsManager applies both built-in enablement and enabled custom servers to
+        // the registry. Trust the selected, enabled config here; a separate disabled-language
+        // check would incorrectly reject a custom replacement for a disabled built-in server.
         val config = LanguageServerRegistry.getConfigForFile(filePath) ?: return NavigationResolveResult.NotFound
-        if (LspSettingsManager.instance.isBuiltInServerDisabled(config.languageId)) return NavigationResolveResult.NotFound
         // The server binary has to exist before we try to run it. Without this a
         // missing `pylsp`/`typescript-language-server` costs a failed spawn and
         // a 60s initialize timeout on every single click.
@@ -139,15 +143,24 @@ class LspNavigation {
             ?: return NavigationResolveResult.NotFound
 
         val uri = File(filePath).toURI().toString()
-        val client = mutex.withLock {
+        val key = ServerKey(config.languageId, canonicalRoot(root))
+        val manager = managers.computeIfAbsent(key.root) { LanguageServerManager() }
+        val client = mutexes.computeIfAbsent(key) { Mutex() }.withLock {
+            if (disposed) return@withLock null
             // Whether THIS call is the one that starts the server, asked before
             // starting it - the settle below is only owed on a cold start.
             val cold = !manager.isServerRunning(config.languageId)
             val c = manager.getOrStartServer(launchable, root)
+            // dispose() may have raced the suspend above after clearing the manager map.
+            // Dispose this retained manager too so a late start cannot orphan a process.
+            if (disposed) {
+                runCatching { manager.dispose() }
+                return@withLock null
+            }
             syncDocument(c, uri, config.languageId, content)
             if (cold) delay(COLD_START_SETTLE_MS)
             c
-        }
+        } ?: return NavigationResolveResult.NotFound
 
         val position = offsetToPosition(content, offset)
         val location = LspNavigationProvider(client)
@@ -176,9 +189,11 @@ class LspNavigation {
      * which would drag in a semantic-token provider this path has no use for.
      */
     internal fun syncDocument(client: LspClient, uri: String, languageId: String, content: String) {
-        val known = opened[languageId]?.takeIf { it.client === client }
-            ?: OpenDocuments(client).also { opened[languageId] = it }
-        if (known.uris.add(uri)) {
+        // Keep the document open for the lifetime of this shared client. Editor-tab does not
+        // own a global document reference count, so didClose from one tab could invalidate the
+        // same URI while another split/tab is still using it.
+        val known = opened.computeIfAbsent(client) { ConcurrentHashMap.newKeySet() }
+        if (known.add(uri)) {
             client.notify(LspMethods.DID_OPEN, didOpen(uri, languageId, content))
         } else {
             client.notify(LspMethods.DID_CHANGE, didChange(uri, content))
@@ -226,18 +241,32 @@ class LspNavigation {
     internal fun launchConfig(
         config: LanguageServerConfig,
         path: String = launchPath,
+        isWindows: Boolean = isWindowsPlatform(),
+        pathExtensions: String = System.getenv("PATHEXT").orEmpty(),
+        commandInterpreter: String = windowsCommandInterpreter(),
     ): LanguageServerConfig? {
         val name = config.command.firstOrNull() ?: return null
-        val exe = findOnPath(name, path) ?: return null
+        val exe = findOnPath(name, path, isWindows, pathExtensions) ?: return null
+        val arguments = config.command.drop(1)
+        val command =
+            if (isWindows && (exe.endsWith(".cmd", ignoreCase = true) || exe.endsWith(".bat", ignoreCase = true))) {
+                listOf(commandInterpreter, "/d", "/s", "/c", windowsBatchCommand(exe, arguments))
+            } else {
+                listOf(exe) + arguments
+            }
         return config.copy(
-            command = listOf(exe) + config.command.drop(1),
+            command = command,
             environment = config.environment + mapOf("PATH" to path),
         )
     }
 
     /** Free every server process. Called when the plugin is disposed. */
     fun dispose() {
-        runCatching { manager.dispose() }
+        disposed = true
+        managers.values.forEach { manager -> runCatching { manager.dispose() } }
+        managers.clear()
+        mutexes.clear()
+        opened.clear()
     }
 
     companion object {
@@ -281,32 +310,40 @@ class LspNavigation {
         fun disposeShared() {
             synchronized(this) {
                 sharedInstance?.dispose()
-                sharedInstance = null
+                // Keep the disposed instance installed. A stale tab coroutine reaching `shared`
+                // during unload then gets a fast NotFound instead of creating an orphan manager.
             }
         }
 
         /**
          * PATH as the user's shell sees it.
          *
-         * Asks the login shell rather than guessing, because the answer is whatever
-         * their profile builds - pyenv shims, bun, nvm, a Homebrew prefix that differs
-         * on Intel vs Apple silicon. The guessed directories are appended as a floor,
-         * not used as the answer, so an unusual setup still works and a missing shell
-         * is not fatal. Resolved once: it costs a shell spawn.
+         * Asks a non-interactive login shell rather than an interactive one. This reads login
+         * profiles while avoiding prompts and terminal setup from `.zshrc`; common tool folders
+         * are appended as a floor for tools configured only by interactive profiles.
          */
         private val launchPath: String by lazy { buildLaunchPath() }
 
         private fun buildLaunchPath(): String {
             val fromShell = runCatching {
-                val shell = System.getenv("SHELL")?.takeIf { File(it).canExecute() } ?: "/bin/zsh"
-                val p = ProcessBuilder(shell, "-lc", "printf %s \"\$PATH\"")
-                    .redirectErrorStream(false)
-                    .start()
-                if (!p.waitFor(5, TimeUnit.SECONDS)) {
-                    p.destroyForcibly()
-                    null
-                } else {
-                    p.inputStream.bufferedReader().readText().trim().takeIf { it.isNotBlank() }
+                val shell = System.getenv("SHELL")?.takeIf { File(it).canExecute() } ?: "/bin/sh"
+                val output = kotlin.io.path.createTempFile("boss-lsp-path", ".txt").toFile()
+                try {
+                    val p = ProcessBuilder(shell, "-lc", "printf '${PATH_SENTINEL}%s' \"\$PATH\"")
+                        .redirectError(ProcessBuilder.Redirect.DISCARD)
+                        .redirectOutput(output)
+                        .start()
+                    if (!p.waitFor(5, TimeUnit.SECONDS)) {
+                        p.destroyForcibly()
+                        null
+                    } else {
+                        output.readText()
+                            .substringAfterLast(PATH_SENTINEL, missingDelimiterValue = "")
+                            .trim()
+                            .takeIf { it.isNotBlank() }
+                    }
+                } finally {
+                    output.delete()
                 }
             }.getOrNull()
 
@@ -318,21 +355,67 @@ class LspNavigation {
                 System.getProperty("user.home") + "/go/bin",
             )
             val current = System.getenv("PATH").orEmpty()
-            return (listOfNotNull(fromShell, current) + fallbacks)
+            return mergePaths(fromShell, current, fallbacks)
+        }
+
+        internal fun mergePaths(fromShell: String?, current: String, fallbacks: List<String>): String =
+            (listOfNotNull(fromShell, current) + fallbacks)
                 .flatMap { it.split(File.pathSeparator) }
                 .filter { it.isNotBlank() }
                 .distinct()
                 .joinToString(File.pathSeparator)
+
+        /** First executable named [command] across [path], including PATHEXT launchers on Windows. */
+        internal fun findOnPath(
+            command: String,
+            path: String,
+            isWindows: Boolean = isWindowsPlatform(),
+            pathExtensions: String = System.getenv("PATHEXT").orEmpty(),
+        ): String? {
+            val extensions =
+                if (isWindows && File(command).extension.isEmpty()) {
+                    pathExtensions.ifBlank { ".COM;.EXE;.BAT;.CMD" }
+                        .split(';')
+                        .filter { it.isNotBlank() }
+                        .flatMap { listOf(it.lowercase(), it) }
+                        .distinct()
+                } else {
+                    emptyList()
+                }
+            val names = sequenceOf(command) + extensions.asSequence().map { command + it }
+            val direct = command.contains('/') || command.contains('\\')
+            val directories =
+                if (direct) sequenceOf<String?>(null)
+                else path.split(if (isWindows) ';' else File.pathSeparatorChar).asSequence()
+                    .filter { it.isNotBlank() }
+                    .map { it }
+
+            return directories
+                .flatMap { directory -> names.map { name -> if (directory == null) File(name) else File(directory, name) } }
+                .firstOrNull { it.isFile && (isWindows || it.canExecute()) }
+                ?.absolutePath
         }
 
-        /** First executable named [command] across [path], or null. */
-        internal fun findOnPath(command: String, path: String): String? =
-            path.split(File.pathSeparator)
-                .asSequence()
-                .filter { it.isNotBlank() }
-                .map { File(it, command) }
-                .firstOrNull { it.isFile && it.canExecute() }
-                ?.absolutePath
+        internal fun windowsBatchCommand(executable: String, arguments: List<String>): String =
+            (listOf("call", quoteForCmd(executable)) + arguments.map(::quoteForCmd)).joinToString(" ")
+
+        private fun quoteForCmd(value: String): String = "\"" + value.replace("\"", "\"\"") + "\""
+
+        private fun isWindowsPlatform(): Boolean =
+            System.getProperty("os.name").contains("windows", ignoreCase = true)
+
+        private fun windowsCommandInterpreter(): String =
+            System.getenv("ComSpec")
+                ?.takeIf { it.isNotBlank() && File(it).isFile }
+                ?: System.getenv("SystemRoot")
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { File(it, "System32/cmd.exe").absolutePath }
+                ?: "cmd.exe"
+
+        private fun canonicalRoot(root: String): String =
+            runCatching { File(root).canonicalPath }.getOrElse { File(root).absolutePath }
+
+        private const val PATH_SENTINEL = "__BOSS_PATH__"
 
         /**
          * Kotlin stays on PSI.
@@ -343,7 +426,7 @@ class LspNavigation {
          * find-usages popup for a definition jump. Deciding per file keeps both.
          */
         fun usesPsi(filePath: String): Boolean =
-            filePath.endsWith(".kt") || filePath.endsWith(".kts")
+            filePath.isBlank() || filePath.endsWith(".kt") || filePath.endsWith(".kts")
 
         /**
          * Offset -> zero-based line/character.
@@ -370,6 +453,5 @@ class LspNavigation {
         /** `file:///a/b.ts` -> `/a/b.ts`, with percent-escapes resolved. */
         internal fun uriToPath(uri: String): String? =
             runCatching { File(URI(uri)).absolutePath }.getOrNull()
-                ?: uri.removePrefix("file://").takeIf { it.startsWith("/") }
     }
 }

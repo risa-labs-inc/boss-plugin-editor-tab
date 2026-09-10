@@ -8,6 +8,7 @@ import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.boss.plugin.ui.ContextMenuItemData
 import ai.rever.bosseditor.compose.BossEditor
+import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.config.BossDirectories
 import ai.rever.bosseditor.features.UsagesPopup
 import ai.rever.bosseditor.features.UsagesPopupState
@@ -1201,11 +1202,16 @@ class EditorTabComponent(
                     // is Found/NotFound and has no variant for it), and every other
                     // language - where PSI returns Unavailable and Cmd+Click therefore
                     // did nothing at all - goes to LSP.
-                    navigationResolver = if (LspNavigation.usesPsi(filePath)) {
-                        null
-                    } else {
-                        { content, path, offset ->
-                            LspNavigation.shared.resolveDefinition(content, path, offset, projectPath)
+                    navigationResolver = remember<(suspend (String, String, Int) -> NavigationResolveResult)?>(
+                        filePath,
+                        projectPath,
+                    ) {
+                        if (LspNavigation.usesPsi(filePath)) {
+                            null
+                        } else {
+                            { content, path, offset ->
+                                LspNavigation.shared.resolveDefinition(content, path, offset, projectPath)
+                            }
                         }
                     },
                     onTextChanged = {

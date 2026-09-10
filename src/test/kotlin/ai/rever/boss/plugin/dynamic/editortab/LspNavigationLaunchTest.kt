@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
+import ai.rever.bosseditor.compose.NavigationResolveResult
 import ai.rever.bosseditor.lsp.client.LspClient
 import ai.rever.bosseditor.lsp.client.LspClientState
 import ai.rever.bosseditor.lsp.client.LspMethods
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -87,6 +89,64 @@ class LspNavigationLaunchTest {
     @Test
     fun `an empty command yields null`() {
         assertNull(LspNavigation().launchConfig(config(), tempDir().absolutePath))
+    }
+
+    @Test
+    fun `an explicit executable path does not require a PATH match`() {
+        val exe = serverOn(tempDir(), "custom-server")
+        val launched = LspNavigation().launchConfig(config(exe.absolutePath, "--stdio"), "/missing")
+        assertEquals(listOf(exe.absolutePath, "--stdio"), launched?.command)
+    }
+
+    @Test
+    fun `windows PATHEXT resolves and wraps a command script`() {
+        val dir = tempDir()
+        val script = File(dir, "typescript-language-server.cmd").apply { writeText("@echo off\n") }
+        val launched = LspNavigation().launchConfig(
+            config("typescript-language-server", "--stdio"),
+            path = dir.absolutePath,
+            isWindows = true,
+            pathExtensions = ".EXE;.CMD",
+            commandInterpreter = "C:\\Windows\\System32\\cmd.exe",
+        )
+
+        assertEquals(
+            listOf(
+                "C:\\Windows\\System32\\cmd.exe",
+                "/d",
+                "/s",
+                "/c",
+                "call \"${script.absolutePath}\" \"--stdio\"",
+            ),
+            launched?.command,
+        )
+    }
+
+    @Test
+    fun `windows batch quoting preserves spaces in executable and arguments`() {
+        val dir = File(tempDir(), "server folder").apply { mkdirs() }
+        val script = File(dir, "server.cmd").apply { writeText("@echo off\n") }
+        val launched = LspNavigation().launchConfig(
+            config(script.absolutePath, "--workspace", "C:\\My Project"),
+            path = "",
+            isWindows = true,
+            commandInterpreter = "cmd.exe",
+        )
+
+        assertEquals(
+            "call \"${script.absolutePath}\" \"--workspace\" \"C:\\My Project\"",
+            launched?.command?.last(),
+        )
+    }
+
+    @Test
+    fun `disposed navigation cannot start more work`() = runBlocking {
+        val navigation = LspNavigation()
+        navigation.dispose()
+        assertEquals(
+            NavigationResolveResult.NotFound,
+            navigation.resolveDefinition("const x = 1", "/tmp/a.ts", 0, "/tmp"),
+        )
     }
 
     // ---- document versions ----------------------------------------------

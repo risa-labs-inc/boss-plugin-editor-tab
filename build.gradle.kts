@@ -141,12 +141,11 @@ tasks.named<Jar>("jar") {
     enabled = false
 }
 
-// Task to build plugin JAR with compiled classes only
 // Which checkout produced this jar. Worktrees of this repo can declare the same
 // `version` while holding different work, and a jar carries no other record of where
 // it came from - `unzip -p <jar> META-INF/MANIFEST.MF` is then the fastest way to
 // tell an installed build apart from the branch you are reading.
-fun gitDescribe(vararg args: String): String =
+fun gitDescribeNow(vararg args: String): String =
     runCatching {
         providers.exec {
             commandLine("git", *args)
@@ -154,9 +153,18 @@ fun gitDescribe(vararg args: String): String =
         }.standardOutput.asText.get().trim()
     }.getOrNull().orEmpty().ifEmpty { "unknown" }
 
-val buildBranch: String = gitDescribe("rev-parse", "--abbrev-ref", "HEAD")
-val buildCommit: String = gitDescribe("rev-parse", "--short", "HEAD")
+val buildBranch = providers.provider {
+    sequenceOf(System.getenv("GITHUB_HEAD_REF"), System.getenv("GITHUB_REF_NAME"))
+        .filterNotNull()
+        .firstOrNull { it.isNotBlank() }
+        ?: gitDescribeNow("rev-parse", "--abbrev-ref", "HEAD")
+}
+val buildCommit = providers.provider {
+    System.getenv("GITHUB_SHA")?.takeIf { it.isNotBlank() }
+        ?: gitDescribeNow("rev-parse", "--short", "HEAD")
+}
 
+// Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {
     archiveFileName.set("boss-plugin-editor-tab-${version}.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
