@@ -97,7 +97,6 @@ class AiInlineEditService(
         // A missing gateway used to return false here, so the compose shortcut did nothing at
         // all - indistinguishable from a broken keybinding. Open the widget
         // either way and let it say which of the two things is actually wrong.
-        val unavailable = describeReadiness(editorAiReadiness(context))
         val state = this.editorState ?: editorState
         val doc = state.document
         val selection = state.selection.value
@@ -121,7 +120,9 @@ class AiInlineEditService(
                 endCol = end.column,
                 bufferVersion = buffer?.version ?: doc.documentVersion,
                 language = language,
-                error = unavailable,
+                // Provider registration and credential loading are asynchronous.
+                // Resolve when the user submits instead of showing a false error now.
+                error = null,
             )
         return true
     }
@@ -138,17 +139,20 @@ class AiInlineEditService(
     fun submit() {
         val s = _session.value ?: return
         if (s.prompt.isBlank() || s.busy) return
-        describeReadiness(editorAiReadiness(context))?.let { reason ->
-            _session.value = s.copy(error = reason)
-            return
-        }
-        val gateway = context.getPluginAPI(AiGatewayAPI::class.java) ?: return
         val state = editorState ?: return
         val doc = state.document
         job?.cancel()
         job =
             scope.launch {
                 _session.value = s.copy(busy = true, error = null)
+                val gateway = awaitEditorAiGateway(context)
+                if (gateway == null) {
+                    _session.value = _session.value?.copy(
+                        busy = false,
+                        error = describeReadiness(editorAiReadiness(context)) ?: "AI is unavailable",
+                    )
+                    return@launch
+                }
                 var text = ""
                 try {
                     withContext(Dispatchers.IO) {

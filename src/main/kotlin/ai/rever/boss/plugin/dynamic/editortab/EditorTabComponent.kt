@@ -911,6 +911,18 @@ class EditorTabComponent(
                 .fillMaxSize()
                 .focusRequester(editorFocusRequester)
                 .onPreviewKeyEvent { event ->
+                    // The focused EditorCanvas has its own key handler. AI
+                    // shortcuts must run in the tunnelling phase so they cannot
+                    // be consumed before this component's bubbling handler.
+                    val composeShortcut =
+                        event.type == KeyEventType.KeyDown &&
+                            (event.isMetaPressed || event.isCtrlPressed) &&
+                            !event.isShiftPressed && !event.isAltPressed &&
+                            (event.key == Key.I || event.key == Key.K) &&
+                            !isLargeFile
+                    if (composeShortcut) {
+                        return@onPreviewKeyEvent aiInlineEdit?.start(editorState, language) == true
+                    }
                     // Preview (tunneling) phase, so this runs before the editor's
                     // own handler: with a ghost suggestion showing, Tab must
                     // accept it instead of inserting an indent, Esc must dismiss

@@ -186,13 +186,14 @@ class AiTabCompletionService(
             _unavailable.value = null
             return
         }
-        val readiness = editorAiReadiness(context)
-        _unavailable.value =
-            AiInlineEditService.describeReadiness(readiness) ?: slowProviderNotice(timeouts)
-        if (readiness != AiReadiness.READY) return
-        val gateway = context.getPluginAPI(AiGatewayAPI::class.java) ?: return
         inFlight = scope.launch {
             delay(settings.debounceMs)
+            val gateway = awaitEditorAiGateway(context)
+            if (gateway == null) {
+                _unavailable.value = AiInlineEditService.describeReadiness(editorAiReadiness(context))
+                return@launch
+            }
+            _unavailable.value = slowProviderNotice(timeouts)
             if (editorState.multiCaretModel.hasMultipleCarets) return@launch
             val document = editorState.document
             val version = document.documentVersion
