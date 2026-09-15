@@ -120,9 +120,9 @@ dependencies {
     // Test-only scope: it stays out of runtimeClasspath, which is what
     // buildPluginJar bundles from.
     testImplementation(compose.ui)
-    // Reflection, for the test that compares PluginEditorSettingsData against
-    // bosseditor's EditorSettings property by property. kotlin-reflect is compileOnly
-    // for main (the host ships it), so the test classpath needs its own copy.
+    // EditorTabComponent reflectively reads the host's persisted tab config.
+    // kotlin-reflect is compileOnly for main (the host ships it), so tests that
+    // load the component need their own runtime copy.
     testImplementation(kotlin("reflect"))
 }
 
