@@ -170,7 +170,11 @@ fun isFontInstalled(fontName: String): Boolean {
 // rendering and typeface ownership stay with the host's Compose FontFamily API.
 private fun systemFontFamilies(): Set<String> = cachedSystemFamilies
 
+// These AWT aliases are not physical families understood by Compose's Skia
+// resolver. In particular "Monospaced" must use FontFamily.Monospace instead.
+private val awtLogicalFamilies = setOf("dialog", "dialoginput", "monospaced", "serif", "sansserif")
+
 private val cachedSystemFamilies: Set<String> by lazy {
     GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames
-        .filter { it.isNotEmpty() }.toSet()
+        .filter { it.isNotEmpty() && it.lowercase(java.util.Locale.ROOT) !in awtLogicalFamilies }.toSet()
 }

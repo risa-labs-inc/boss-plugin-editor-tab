@@ -12,6 +12,10 @@ import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.toPixelMap
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontListFontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.platform.FontLoader
 import java.net.URLClassLoader
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -120,15 +124,30 @@ class EditorRenderingCompatibilityTest {
         }
     }
 
+    @Suppress("DEPRECATION")
     @Test
     fun `font enumeration selection and missing font fallback work without Skia access`() {
         isolatedLoader().use { loader ->
             val fonts = loader.loadClass("ai.rever.bosseditor.settings.FontUtilsKt")
             val categorized = fonts.getMethod("getEditorCategorizedFonts").invoke(null) as Map<*, *>
             assertEquals(setOf("Recommended", "Fixed Pitch", "Variable Pitch"), categorized.keys)
-            val installed = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames.first()
+            val offered = categorized.values.flatMap { (it as List<*>).filterIsInstance<String>() }
+            for (logical in listOf("Dialog", "DialogInput", "Monospaced", "Serif", "SansSerif")) {
+                assertFalse(logical in offered)
+                assertEquals(false, fonts.getMethod("isFontInstalled", String::class.java).invoke(null, logical))
+                assertEquals(FontFamily.Monospace, fonts.getMethod("loadEditorFont", String::class.java).invoke(null, logical))
+            }
+            val installed = offered.first { name ->
+                // Pick a real physical family offered by the picker and supported by
+                // this test host. Loading it below must not silently resolve a fallback.
+                org.jetbrains.skia.FontMgr.default.matchFamilyStyle(name, org.jetbrains.skia.FontStyle.NORMAL)
+                    ?.familyName == name
+            }
             assertEquals(true, fonts.getMethod("isFontInstalled", String::class.java).invoke(null, installed))
-            assertIs<FontFamily>(fonts.getMethod("loadEditorFont", String::class.java).invoke(null, installed))
+            val selected = assertIs<FontListFontFamily>(fonts.getMethod("loadEditorFont", String::class.java)
+                .invoke(null, installed.lowercase(java.util.Locale.ROOT)))
+            val regular = selected.fonts.first { it.weight == FontWeight.Normal && it.style == FontStyle.Normal }
+            assertEquals(installed, FontLoader().load(regular).familyName)
             assertIs<FontFamily>(fonts.getMethod("loadEditorFont", String::class.java).invoke(null, null))
             val missing = "BOSS definitely missing font 3e3598a6"
             assertFalse(fonts.getMethod("isFontInstalled", String::class.java).invoke(null, missing) as Boolean)

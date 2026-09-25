@@ -25,3 +25,7 @@ the resolved dependency; only the paired renderer Canvas signature may change.
 
 The automatic BossEditor bump script pauses while this override README exists;
 remove that pause along with these overrides when adopting the upstream fix.
+
+When removing overrides, restore the literal BossEditor dependency declaration
+(and remove the version guard), or teach bump-bosseditor.sh to update the version
+variable before re-enabling automatic bumps.
