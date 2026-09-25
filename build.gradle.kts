@@ -31,7 +31,8 @@ group = "ai.rever.boss.plugin.dynamic"
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.13).
 // 1.6.6: auto-bumped bundled BossEditor to 1.0.26
 // (release: https://github.com/risa-labs-inc/BossEditor/releases/tag/v1.0.26).
-version = "1.6.8"
+// 1.6.9: Compose-only minimap/font boundary supports BOSS 9.5.25.
+version = "1.6.9"
 
 java {
     toolchain {
@@ -56,10 +57,10 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
-// Temporary source overrides for BossEditor 1.0.13 keep rendering behind the
+// Temporary source overrides for BossEditor 1.0.26 keep rendering behind the
 // shared Compose API on BOSS 9.5.25. Remove them after upgrading to a fixed release.
-val bossEditorVersion = "1.0.13"
-check(bossEditorVersion == "1.0.13") {
+val bossEditorVersion = "1.0.26"
+check(bossEditorVersion == "1.0.26") {
     "Review the minimap/font compatibility overrides before upgrading BossEditor"
 }
 
@@ -77,7 +78,7 @@ dependencies {
     // BossEditor is private to this plugin (bundled into the plugin JAR by
     // buildPluginJar) — the host no longer carries it. Bumping bosseditor only
     // requires re-releasing this plugin, not BossConsole.
-    implementation("com.risaboss:bosseditor-compose-desktop:1.0.26")
+    implementation("com.risaboss:bosseditor-compose-desktop:$bossEditorVersion")
 
     // PSI (org.jetbrains.kotlin.psi.*) used by PluginSemanticTokenProvider.
     // BossEditor's POM carries kotlin-compiler-embeddable at runtime scope only,
@@ -241,7 +242,10 @@ tasks.processResources {
 // the test JVM's working directory.
 tasks.test {
     dependsOn("buildPluginJar")
-    systemProperty("editor.plugin.jar", tasks.named<Jar>("buildPluginJar").get().archiveFile.get().asFile.absolutePath)
+    val pluginJar = tasks.named<Jar>("buildPluginJar").flatMap { it.archiveFile }
+    jvmArgumentProviders.add(CommandLineArgumentProvider {
+        listOf("-Deditor.plugin.jar=${pluginJar.get().asFile.absolutePath}")
+    })
     systemProperty(
         "preview.fixture.dir",
         layout.buildDirectory.dir("preview-fixture").get().asFile.absolutePath

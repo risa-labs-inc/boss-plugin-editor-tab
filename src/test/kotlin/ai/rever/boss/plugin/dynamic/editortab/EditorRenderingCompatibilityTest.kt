@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.editortab
 
 import ai.rever.bosseditor.core.EditorDocument
+import ai.rever.bosseditor.features.MinimapConfig
 import ai.rever.bosseditor.features.MinimapRenderer
 import ai.rever.bosseditor.features.MinimapState
 import ai.rever.bosseditor.fold.VisualLineMapper
@@ -40,8 +41,46 @@ class EditorRenderingCompatibilityTest {
     }
 
     @Test
+    fun `overrides preserve bundled public APIs except paired renderer canvas type`() {
+        val names = listOf("features.MinimapRenderer", "features.MinimapCanvasKt",
+            "features.MinimapState", "features.MinimapEditorState",
+            "features.BasicMinimapEditorState", "settings.FontUtilsKt")
+            .map { "ai.rever.bosseditor.$it" }
+        val dependency = EditorDocument::class.java.protectionDomain.codeSource.location
+        val upstream = object : URLClassLoader(arrayOf(dependency), javaClass.classLoader) {
+            override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                if (names.any { name == it || name.startsWith(it + "$") }) {
+                    return synchronized(getClassLoadingLock(name)) {
+                        (findLoadedClass(name) ?: findClass(name)).also { if (resolve) resolveClass(it) }
+                    }
+                }
+                return super.loadClass(name, resolve)
+            }
+        }
+        fun signatures(type: Class<*>): Set<String> {
+            fun parameterName(type: Class<*>) = if (type.name == "org.jetbrains.skia.Canvas")
+                "androidx.compose.ui.graphics.Canvas" else type.name
+            val methods = type.declaredMethods.filter {
+                java.lang.reflect.Modifier.isPublic(it.modifiers) && !it.isSynthetic
+            }.map { it.name + it.parameterTypes.joinToString(prefix = "(", postfix = ")") { p -> parameterName(p) } + it.returnType.name }
+            val constructors = type.constructors.filter { !it.isSynthetic }.map {
+                "<init>" + it.parameterTypes.joinToString { p -> p.name }
+            }
+            val fields = type.fields.map { it.name + ":" + it.type.name }
+            return (methods + constructors + fields).toSet()
+        }
+        upstream.use { loader ->
+            for (name in names) {
+                val original = signatures(loader.loadClass(name))
+                val replacement = signatures(javaClass.classLoader.loadClass(name))
+                assertTrue(replacement.containsAll(original), "$name missing APIs: ${original - replacement}")
+            }
+        }
+    }
+
+    @Test
     fun `packaged editor contains no direct Skia references or bundled runtime`() {
-        java.util.zip.ZipFile(System.getProperty("editor.plugin.jar")).use { jar ->
+        java.util.zip.ZipFile(requireNotNull(System.getProperty("editor.plugin.jar")) { "Run this artifact check using Gradle test so buildPluginJar supplies editor.plugin.jar" }).use { jar ->
             for (entry in jar.entries()) {
                 assertFalse(entry.name.startsWith("org/jetbrains/skia/") ||
                     entry.name.startsWith("org/jetbrains/skiko/"), entry.name)
@@ -67,15 +106,17 @@ class EditorRenderingCompatibilityTest {
                 EditorDocument::class.java, TokenProvider::class.java,
                 EditorColors::class.java, VisualLineMapper::class.java
             ).newInstance(document, null, colors, VisualLineMapper.noFolds(document.lineCount))
+            rendererClass.getMethod("setConfig", MinimapConfig::class.java)
+                .invoke(renderer, MinimapConfig(showSlider = false))
             val bitmap = ImageBitmap(80, 80)
             rendererClass.getMethod("render", Canvas::class.java, Float::class.javaPrimitiveType,
                 Float::class.javaPrimitiveType, Float::class.javaPrimitiveType,
                 Float::class.javaPrimitiveType, MinimapState::class.java
             ).invoke(renderer, Canvas(bitmap), 0f, 0f, 80f, 80f,
-                MinimapState(visibleLineCount = 1, currentLine = 0))
+                MinimapState(visibleLineCount = 0, currentLine = -1))
             val pixels = bitmap.toPixelMap()
             assertEquals(colors.background, pixels[40, 70])
-            assertTrue(pixels[3, 0] != colors.background, "Document content must be painted")
+            assertEquals(colors.text, pixels[3, 0], "Document content must be painted")
         }
     }
 

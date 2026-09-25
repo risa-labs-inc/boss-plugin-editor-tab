@@ -51,7 +51,7 @@ private val RECOMMENDED_FONTS = listOf(
 /**
  * Cache for categorized fonts to avoid repeated system font scanning.
  */
-private var cachedFonts: Map<String, List<String>>? = null
+private val cachedFonts: Map<String, List<String>> by lazy { categorizeEditorFonts() }
 
 /**
  * Get fonts organized by category (JetBrains IDE-style).
@@ -61,8 +61,9 @@ private var cachedFonts: Map<String, List<String>>? = null
  * Fixed Pitch contains all monospace fonts.
  * Variable Pitch contains proportional fonts (for those who prefer them).
  */
-fun getEditorCategorizedFonts(): Map<String, List<String>> {
-    cachedFonts?.let { return it }
+fun getEditorCategorizedFonts(): Map<String, List<String>> = cachedFonts
+
+private fun categorizeEditorFonts(): Map<String, List<String>> {
 
     val allFamilies = systemFontFamilies()
     val fontContext = FontRenderContext(AffineTransform(), true, true)
@@ -103,7 +104,6 @@ fun getEditorCategorizedFonts(): Map<String, List<String>> {
         FONT_SECTION_VARIABLE_PITCH to variablePitch.sorted()
     )
 
-    cachedFonts = result
     return result
 }
 
@@ -130,7 +130,9 @@ fun loadEditorFont(fontName: String? = null): FontFamily {
         return tryLoadSystemFont("JetBrains Mono") ?: FontFamily.Monospace
     }
 
-    return tryLoadSystemFont(fontName) ?: FontFamily.Monospace
+    return tryLoadSystemFont(fontName) ?: FontFamily.Monospace.also {
+        fontLogger.warn(LogCategory.GENERAL, "Configured font unavailable; using monospace", data = mapOf("font" to fontName))
+    }
 }
 
 /**
@@ -140,8 +142,9 @@ fun loadEditorFont(fontName: String? = null): FontFamily {
 @OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
 private fun tryLoadSystemFont(fontName: String): FontFamily? {
     return try {
-        if (systemFontFamilies().any { it.equals(fontName, ignoreCase = true) }) {
-            FontFamily(fontName)
+        val matchedFamily = systemFontFamilies().firstOrNull { it.equals(fontName, ignoreCase = true) }
+        if (matchedFamily != null) {
+            FontFamily(matchedFamily)
         } else {
             null
         }
@@ -165,6 +168,9 @@ fun isFontInstalled(fontName: String): Boolean {
 
 // AWT enumerates system fonts without requiring plugin access to Skia. Actual
 // rendering and typeface ownership stay with the host's Compose FontFamily API.
-private fun systemFontFamilies(): Set<String> =
+private fun systemFontFamilies(): Set<String> = cachedSystemFamilies
+
+private val cachedSystemFamilies: Set<String> by lazy {
     GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames
         .filter { it.isNotEmpty() }.toSet()
+}
