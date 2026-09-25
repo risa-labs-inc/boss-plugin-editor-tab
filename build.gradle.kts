@@ -56,6 +56,13 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
+// Temporary source overrides for BossEditor 1.0.13 keep rendering behind the
+// shared Compose API on BOSS 9.5.25. Remove them after upgrading to a fixed release.
+val bossEditorVersion = "1.0.13"
+check(bossEditorVersion == "1.0.13") {
+    "Review the minimap/font compatibility overrides before upgrading BossEditor"
+}
+
 dependencies {
     val bossPluginApi = if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
@@ -122,6 +129,7 @@ dependencies {
     // Test-only scope: it stays out of runtimeClasspath, which is what
     // buildPluginJar bundles from.
     testImplementation(compose.ui)
+    testImplementation(compose.desktop.currentOs)
     // Reflection, for the test that compares PluginEditorSettingsData against
     // bosseditor's EditorSettings property by property. kotlin-reflect is compileOnly
     // for main (the host ships it), so the test classpath needs its own copy.
@@ -198,7 +206,19 @@ tasks.register<Jar>("buildPluginJar") {
                 p.contains("/org.jetbrains.compose.material3/") ||
                 // Feather icon pack used by the editor UI (not host-shared)
                 p.contains("/br.com.devsrsouza")
-        }.map { zipTree(it) }
+        }.map { jar ->
+            zipTree(jar).matching {
+                if (jar.path.replace('\\', '/').contains("/com.risaboss/bosseditor-compose-desktop/")) {
+                    // Source overrides include Kotlin-generated companion/lambda classes.
+                    exclude("ai/rever/bosseditor/features/MinimapRenderer*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapCanvas*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapState*.class")
+                    exclude("ai/rever/bosseditor/features/MinimapEditorState*.class")
+                    exclude("ai/rever/bosseditor/features/BasicMinimapEditorState*.class")
+                    exclude("ai/rever/bosseditor/settings/FontUtilsKt*.class")
+                }
+            }
+        }
     })
 }
 
@@ -220,6 +240,8 @@ tasks.processResources {
 // destination explicitly rather than letting it resolve a relative path against
 // the test JVM's working directory.
 tasks.test {
+    dependsOn("buildPluginJar")
+    systemProperty("editor.plugin.jar", tasks.named<Jar>("buildPluginJar").get().archiveFile.get().asFile.absolutePath)
     systemProperty(
         "preview.fixture.dir",
         layout.buildDirectory.dir("preview-fixture").get().asFile.absolutePath
